@@ -1,1 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Logs
 logs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Testing
+.pytest_cache/
+.mypy_cache/
+
+# bin files (too large)
+bin/opening_books/UHO_Lichess_4852_v1.epd 

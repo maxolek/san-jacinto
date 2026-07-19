@@ -914,10 +914,11 @@ def main(args=None):
         f"option.log_dir={args.logroot}",
         f"option.uci_logging=true",
     ]
-    for name, value in getattr(args, "params", {}): # add tuning result param values
-        log_a_block.append(
-            f"option.{name}={value}"
-        )
+    if args.params:
+        for name, value in getattr(args, "params", {}): # add tuning result param values
+            log_a_block.append(
+                f"option.{name}={value}"
+            )
     log_b_block = [
         f"option.log_dir={args.logroot}",
         f"option.uci_logging={"true" if should_log else "false"}",
