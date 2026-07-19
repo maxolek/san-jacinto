@@ -1,6 +1,23 @@
+<div align="center">
+
 # San Jacinto
 
-Development, testing, tuning, and analytics framework for the **Tomahawk chess engine**.
+[![Python](https://img.shields.io/badge/Python-3.10+-green.svg)]()
+[![JavaScript](https://img.shields.io/badge/JavaScript-blue.svg)]()
+
+[![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux-lightgrey.svg)]()
+
+Development, testing, tuning, and analytics framework for the **Tomahawk chess engine**
+
+Tomahawk itself is maintained separately
+
+See `docs/` for more info.
+
+</div>
+
+---
+
+# Overview
 
 San Jacinto provides the infrastructure surrounding engine development:
 - SPRT strength testing
@@ -10,10 +27,6 @@ San Jacinto provides the infrastructure surrounding engine development:
 - game/search telemetry processing
 - database pipelines
 - analytics dashboards
-
-The **Tomahawk engine** itself is maintained separately.
-
-See `docs/` for more info.
 
 ---
 
