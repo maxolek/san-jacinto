@@ -50,6 +50,33 @@ San Jacinto communicates with Tomahawk through the UCI protocol and manages the 
 
 # Features
 
+## Data Pipeline
+
+Located in:
+
+```
+data/
+```
+
+The data pipeline handles engine statistics, game records, and analytics.
+
+Collected stats include: fail high rates, re-search rates, function call times, node counts, etc.
+
+OLTP --> OLAP framework with raw database collection of engine log files, and analytics database for advanced stats
+
+Structure:
+
+```
+data/
+├── databases/
+├── etl/
+├── transforms/
+├── dashboard/
+└── openings/
+```
+
+---
+
 ## Testing
 
 Located in:
@@ -88,29 +115,6 @@ Used for optimizing search parameters such as:
 - pruning margins
 - evaluation constants
 - move ordering parameters
-
----
-
-## Data Pipeline
-
-Located in:
-
-```
-data/
-```
-
-The data pipeline handles engine telemetry, game records, and analytics.
-
-Structure:
-
-```
-data/
-├── databases/
-├── etl/
-├── transforms/
-├── dashboard/
-└── openings/
-```
 
 ---
 
