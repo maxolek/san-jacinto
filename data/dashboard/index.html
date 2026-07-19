@@ -1,0 +1,26 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Chess Engine Analytics</title>
+  <link rel="stylesheet" href="/src/style.css" />
+</head>
+<body>
+  <div id="app">
+    <header id="header">
+      <h1>Chess Engine Analytics</h1>
+      <div style="display: flex; align-items: center; gap: 12px;">
+        <span id="db-freshness" style="display: none; font-size: 11px; color: var(--text-sec); opacity: 0.8;"></span>
+        <div id="db-status">Connecting...</div>
+      </div>
+    </header>
+    <nav id="tabs"></nav>
+    <aside id="filters"></aside>
+    <main id="content">
+      <div class="loading">Loading database...</div>
+    </main>
+  </div>
+  <script type="module" src="/src/main.js"></script>
+</body>
+</html>
