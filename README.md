@@ -1,5 +1,7 @@
 <div align="center">
 
+<img src="docs/logo.png" width="200">
+
 # San Jacinto
 
 [![Python](https://img.shields.io/badge/Python-3.10+-green.svg)]()
