@@ -597,8 +597,8 @@ class LivePlotter:
         self.ax_llr.set_ylim(min(self.lbound * 1.1, llr_lo), max(self.ubound * 1.1, llr_hi))
 
         # Elo: use full lo/hi series (skip games 1+2 as before, but no tail cut)
-        lo_tail = self.elo_lo_series[2:] or self.elo_lo_series
-        hi_tail = self.elo_hi_series[2:] or self.elo_hi_series
+        lo_tail = self.elo_lo_series[len(self.elo_lo_series)//5:] or self.elo_lo_series
+        hi_tail = self.elo_hi_series[len(self.elo_hi_series)//5:] or self.elo_hi_series
         elo_min = min(lo_tail)
         elo_max = max(hi_tail)
         elo_pad = max(5, (elo_max - elo_min) * 0.05)
@@ -607,7 +607,7 @@ class LivePlotter:
         self.ax_elo.set_ylim(plot_elo_lo, plot_elo_hi)
 
         # Score: use full series (skip games 1+2 as before, but no tail cut)
-        score_tail = self.score_series[2:] or self.score_series
+        score_tail = self.score_series[len(self.score_series)//5:] 
         s_min = min(score_tail)
         s_max = max(score_tail)
         s_lo, s_hi = min(0.495, s_min), max(0.505, s_max)

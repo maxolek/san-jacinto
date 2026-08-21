@@ -294,7 +294,7 @@ def get_engine_id(cnxn, version=None):
     if row is None:
         register_engine(
             cnxn,
-            {"engine_path": f"engines/dev/{version}.exe"}
+            {"engine_path": f"../tomahawk/engines/dev/{version}.exe"}
         )
 
         row = cnxn.execute(

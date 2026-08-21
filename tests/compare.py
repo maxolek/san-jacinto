@@ -276,7 +276,7 @@ def load_game_moves(path: str) -> list[str]:
 if __name__ == "__main__":
     engines     = ENGINES
     movetime_ms = MOVETIME_MS
-    depth = DEPTH
+    depth       = DEPTH
     runs        = RUNS_PER_POS
     game_path   = None
     side        = 0

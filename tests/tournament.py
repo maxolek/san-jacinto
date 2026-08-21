@@ -33,7 +33,8 @@ system = platform.system()
 
 TESTS_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = TESTS_DIR.parent
-ENGINES_DIR = PROJECT_ROOT / "engines"
+TOMAHAWK_ROOT = PROJECT_ROOT.parent / "tomahawk"
+ENGINES_DIR = TOMAHAWK_ROOT / "engines"
 ENGINES_DEV_DIR = ENGINES_DIR / "dev"
 ENGINES_PROD_DIR = ENGINES_DIR / "prod"
 LOGS_DIR = PROJECT_ROOT / "logs"
@@ -41,11 +42,11 @@ TOURNAMENT_LOG_DIR = LOGS_DIR / "tournament_logs"
 
 # Default time controls per category
 TC_DEFAULTS = {
-    "ultra_fast": "0:10+0.01",
-    "bullet":     "1:00+0.3",
-    "blitz":      "3:00+0.03",
-    "rapid":      "10:00+0.1",
-    "classical":  "30:00+0.6",
+    "ultra_fast": "0:10+0.1",
+    "bullet":     "1:00+0.6",
+    "blitz":      "3:00+1.8",
+    "rapid":      "10:00+5",
+    "classical":  "30:00+10",
 }
 
 # default elo for oldest engine to build each version off of
@@ -109,7 +110,7 @@ def get_engines_by_names(cnxn, names):
     if missing:
         print(f"[TOURNAMENT] WARNING: requested engine(s) not found in DB: {missing}")
         for _ in missing:
-            engine_filepath = f"engines/dev/{_}.exe"
+            engine_filepath = ENGINES_DEV_DIR / f"{_}.exe"
             print(f"[TOURNAMENT] Engine {_} not registered, registering now...")
             
             _id = etl.register_engine(cnxn, {"engine_path": engine_filepath})
