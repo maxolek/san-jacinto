@@ -110,7 +110,7 @@ def get_engines_by_names(cnxn, names):
     if missing:
         print(f"[TOURNAMENT] WARNING: requested engine(s) not found in DB: {missing}")
         for _ in missing:
-            engine_filepath = ENGINES_DEV_DIR / f"{_}.exe"
+            engine_filepath = ENGINES_PROD_DIR / f"{_}.exe"
             print(f"[TOURNAMENT] Engine {_} not registered, registering now...")
             
             _id = etl.register_engine(cnxn, {"engine_path": engine_filepath})
