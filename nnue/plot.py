@@ -30,6 +30,19 @@ from matplotlib.ticker import MaxNLocator
 Series = Dict[str, List[Tuple[float, float]]]
 
 
+# Fixed qualitative palette (matplotlib's "tab10" hex values) so stage
+# colors are stable and legible without needing to import a colormap
+# module before the Agg backend is configured.
+_STAGE_PALETTE = [
+    "#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd",
+    "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22", "#17becf",
+]
+
+
+def _stage_color(index: int) -> str:
+    return _STAGE_PALETTE[index % len(_STAGE_PALETTE)]
+
+
 @dataclass
 class PlotConfig:
     initial_lr: float | None = None
@@ -116,8 +129,11 @@ def load_metrics(path: str, include_archived: bool = False) -> Series:
     paths.append(path)
 
     rows: List[Tuple[str, int, int, float]] = []
+    offset = 0  # cumulative superbatch count from earlier stages
 
     for metrics_path in paths:
+        file_rows: List[Tuple[str, int, int, float]] = []
+
         try:
             with open(
                 metrics_path,
@@ -126,7 +142,7 @@ def load_metrics(path: str, include_archived: bool = False) -> Series:
             ) as f:
                 for r in csv.DictReader(f):
                     try:
-                        rows.append(
+                        file_rows.append(
                             (
                                 r["split"],
                                 int(r["superbatch"]),
@@ -139,6 +155,20 @@ def load_metrics(path: str, include_archived: bool = False) -> Series:
 
         except (FileNotFoundError, OSError):
             continue
+
+        if not file_rows:
+            continue
+
+        # Shift this file's superbatch numbers so they continue on from
+        # the previous stage instead of restarting at 1. Without this,
+        # a new stage's x-values collide with the previous stage's and
+        # get silently dropped as "duplicates" by _merge_series.
+        max_sb_in_file = max(sb for _, sb, _, _ in file_rows)
+
+        for split, sb, batch, loss in file_rows:
+            rows.append((split, offset + sb, batch, loss))
+
+        offset += max_sb_in_file
 
     if not rows:
         return {}
@@ -274,17 +304,27 @@ def _set_loss_scale(ax, series: Series) -> None:
 
 
 def _draw_stages(ax, stages) -> None:
+    """Shade and label each training stage with a stable per-stage color.
+
+    The on-chart label is kept short ("stage 1", "stage 2", ...) so it
+    doesn't clutter the plot; the stage -> dataset mapping is shown once,
+    separately, via _draw_stage_legend in the info panel.
+    """
+
     if not stages:
         return
 
-    for start, end, label in stages:
+    for i, (start, end, _label) in enumerate(stages):
+        color = _stage_color(i)
+
         # Stages are inclusive:
         # 1–5, 6–10, 11–15.
         left = start - 0.5
         right = end + 0.5
 
-        ax.axvline(left, linestyle="--", alpha=0.35)
-        ax.axvline(right, linestyle="--", alpha=0.35)
+        ax.axvspan(left, right, color=color, alpha=0.08, zorder=0)
+        ax.axvline(left, linestyle="--", alpha=0.35, color=color)
+        ax.axvline(right, linestyle="--", alpha=0.35, color=color)
 
         midpoint = (start + end) / 2
 
@@ -293,11 +333,51 @@ def _draw_stages(ax, stages) -> None:
         ax.text(
             midpoint,
             ymax,
-            label,
+            f"stage {i + 1}",
             ha="center",
             va="top",
             fontsize=9,
-            alpha=0.7,
+            alpha=0.85,
+            color=color,
+            fontweight="bold",
+        )
+
+
+def _draw_stage_legend(ax, stages) -> None:
+    """Render the "stage N -> dataset label" key into the info panel."""
+
+    if not stages:
+        return
+
+    x = 0.76
+    top = 0.92
+    line_height = 0.11
+
+    ax.text(
+        x,
+        top,
+        "Stages:",
+        ha="left",
+        va="top",
+        transform=ax.transAxes,
+        fontsize=9,
+        family="monospace",
+        fontweight="bold",
+    )
+
+    for i, (_start, _end, label) in enumerate(stages):
+        color = _stage_color(i)
+
+        ax.text(
+            x,
+            top - (i + 1) * line_height,
+            f"stage {i + 1}: {label}",
+            ha="left",
+            va="top",
+            transform=ax.transAxes,
+            fontsize=8,
+            family="monospace",
+            color=color,
         )
 
 
@@ -684,6 +764,7 @@ def _draw_info(
     ax,
     series: Series,
     config: PlotConfig | None,
+    stages=None,
     started_at: float | None = None,
 ) -> None:
     ax.clear()
@@ -760,6 +841,9 @@ def _draw_info(
                 f"Net: {config.net_id}"
             )
 
+        # Dataset paths are also captured per-stage in the stage legend
+        # (when stages are provided), so they're kept here too for the
+        # no-stages case.
         if config.train_data is not None:
             right_lines.append(
                 f"Train: {config.train_data}"
@@ -782,7 +866,7 @@ def _draw_info(
     )
 
     ax.text(
-        0.51,
+        0.31,
         0.92,
         "\n".join(right_lines),
         ha="left",
@@ -791,6 +875,8 @@ def _draw_info(
         fontsize=9,
         family="monospace",
     )
+
+    _draw_stage_legend(ax, stages)
 
     ax.set_title(
         "Training information",
@@ -868,6 +954,7 @@ def render(
         axes["info"],
         series,
         config,
+        stages,
         started_at,
     )
 
@@ -1005,9 +1092,10 @@ def watch(
     started_at = time.time()
 
     history: Series = {}
+    consecutive_errors = 0
 
-    try:
-        while True:
+    while True:
+        try:
             loaded = load_metrics(
                 path,
                 include_archived=True,
@@ -1030,32 +1118,54 @@ def watch(
             )
 
             fig.tight_layout(rect=(0, 0, 1, 0.94))
-
             fig.canvas.draw_idle()
-            plt.pause(interval)
 
-            if stop is not None and stop():
-                break
+            consecutive_errors = 0
 
-            if not plt.fignum_exists(fig.number):
-                break
+        except KeyboardInterrupt:
+            break
 
-    except KeyboardInterrupt:
-        pass
-
-    finally:
-        try:
-            fig.savefig(
-                out_png,
-                dpi=120,
-                bbox_inches="tight",
-            )
-            print(f"Wrote {out_png}")
         except Exception as e:
-            print(f"Could not save {out_png}: {e}")
+            # A single bad read/render -- metrics.csv mid-write, a
+            # transient matplotlib redraw glitch, a divide-by-zero from
+            # a not-yet-fully-populated config -- must never kill the
+            # whole live-plot loop. If it did, train.py exits entirely
+            # and you lose the plot AND the log tee for a run that's
+            # still training fine in the background.
+            consecutive_errors += 1
+            print(f"[plot] watch: render error ({e}); retrying "
+                  f"(consecutive_errors={consecutive_errors})")
 
-        plt.ioff()
-        plt.close(fig)
+            if consecutive_errors >= 20:
+                # Something is persistently broken, not transient --
+                # surface it loudly instead of spinning silently forever.
+                print("[plot] watch: too many consecutive errors, "
+                      "giving up on the live plot (training continues).")
+                break
+
+        try:
+            plt.pause(interval)
+        except Exception as e:
+            print(f"[plot] watch: pause/draw error ({e}); retrying")
+
+        if stop is not None and stop():
+            break
+
+        if not plt.fignum_exists(fig.number):
+            break
+
+    try:
+        fig.savefig(
+            out_png,
+            dpi=120,
+            bbox_inches="tight",
+        )
+        print(f"Wrote {out_png}")
+    except Exception as e:
+        print(f"Could not save {out_png}: {e}")
+
+    plt.ioff()
+    plt.close(fig)
 
 
 def main() -> None:

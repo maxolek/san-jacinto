@@ -47,7 +47,48 @@ NNUE_SJ_ROOT = os.path.join(SAN_JACINTO_ROOT, "nnue")
 # Bullet lives in Projects/libs/bullet/
 PROJECTS_ROOT = os.path.dirname(SAN_JACINTO_ROOT)
 BULLET_ROOT = os.path.join(PROJECTS_ROOT, "libs", "bullet")
-METRICS_ROOT = os.path.join(BULLET_ROOT, "checkpoints")
+DATA_ROOT = os.path.join(BULLET_ROOT, "data")
+
+DATASET_EXTENSIONS = (".binpack", ".bin")
+def expand_train_data(entries: list[str], data_root: str) -> list[str]:
+    """Resolve --train-data entries into a flat, ordered list of dataset
+    file paths. Each entry can be:
+      - a file path (used as-is, one stage)
+      - a folder path -- every dataset file inside becomes its own stage,
+        in sorted filename order (so e.g. 01_opening.binpack,
+        02_midgame.binpack, ... gives you explicit control over order;
+        otherwise plain alphabetical is used)
+
+    Bare names (no existing relative/absolute path) are also tried
+    relative to `data_root`, so `--train-data curriculum_v1` resolves to
+    `<bullet>/data/curriculum_v1` without needing the full path.
+    """
+    expanded: list[str] = []
+
+    for entry in entries:
+        candidate = entry
+
+        if not os.path.exists(candidate):
+            maybe = os.path.join(data_root, entry)
+            if os.path.exists(maybe):
+                candidate = maybe
+
+        if os.path.isdir(candidate):
+            files = sorted(
+                os.path.join(candidate, f)
+                for f in os.listdir(candidate)
+                if f.lower().endswith(DATASET_EXTENSIONS)
+            )
+
+            if not files:
+                print(f"[train] warning: no dataset files "
+                      f"({', '.join(DATASET_EXTENSIONS)}) found in {candidate}")
+
+            expanded.extend(files)
+        else:
+            expanded.append(candidate)
+
+    return expanded
 
 def build_plot_config(args, train_data, val_data, final_superbatch):
     import plot
@@ -98,6 +139,7 @@ def build_env(
         train_data: str, 
         val_data: str | None, 
         start_superbatch: int,
+        out_dir: str,
     ) -> dict:
     env = os.environ.copy()
     # only set overrides the user actually passed, so example defaults remain
@@ -110,9 +152,9 @@ def build_env(
         "wdl_end": args.wdl_end,
 
         "net_id": args.net_id,
-        "output_dir": args.output_dir,
+        "output_dir": out_dir,
         "train_data": train_data,
-        "val_data": val_data,
+        "val_data": os.path.join(DATA_ROOT, val_data),
 
         "save_rate": args.save_rate,
         "batch_size": args.batch_size,
@@ -159,11 +201,13 @@ def run_stage(
     stage_boundaries: list[tuple[int, int, str]],
 ) -> int:
     """Launch one cargo training run and return its exit code."""
-    cmd = build_command(args)
-    env = build_env(args, train_data, val_data, start_superbatch)
-
     out_dir = os.path.join(NNUE_SJ_ROOT, args.output_dir)
-    metrics_csv = os.path.join(METRICS_ROOT, "metrics.csv")
+    os.makedirs(out_dir, exist_ok=True)
+
+    cmd = build_command(args)
+    env = build_env(args, train_data, val_data, start_superbatch, out_dir)
+
+    metrics_csv = os.path.join(out_dir, "metrics.csv")
     out_png = os.path.join(out_dir, "loss.png")
     log_path = os.path.join(out_dir, f"train{stage_label}.log")
 
@@ -288,9 +332,13 @@ def main() -> int:
         "--train-data",
         nargs="+",
         default=None,
-        help="one or more dataset paths. With >1 path, each is run as a "
-        "sequential stage, chained via checkpoints (is_later_run=1 from "
-        "stage 2 onward).",
+        help="one or more dataset paths, OR a folder (path or bare name "
+        "resolved under data/) whose dataset files are used as sequential "
+        "stages in sorted-filename order. Each resulting stage is chained "
+        "via checkpoints (is_later_run=1 from stage 2 onward). Prefix "
+        "filenames like 01_, 02_ to control stage order explicitly."
+        "Call folders via  /data/folder1/  and files via  /data/file1.binpack  "
+        "with as many files as you want.",
     )
     p.add_argument(
         "--val-data",
@@ -325,7 +373,15 @@ def main() -> int:
     sys.path.insert(0, HERE)
 
     stage_boundaries = []
-    train_stages = args.train_data or [None]
+    train_stages = (
+        expand_train_data(args.train_data, DATA_ROOT)
+        if args.train_data
+        else [None]
+    )
+
+    if not train_stages:
+        print("[train] no dataset files resolved from --train-data")
+        return 2
 
     start_superbatch = args.superbatch_start or 1
     total_superbatches = len(train_stages) * args.superbatches

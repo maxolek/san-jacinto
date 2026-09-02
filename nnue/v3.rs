@@ -183,7 +183,7 @@ fn main() {
             &train_path,
             1024,
             _threads,
-            filter,
+            |_| true, //filter,
         );
 
     let val_loader =
@@ -191,7 +191,7 @@ fn main() {
             &val_path,
             256,
             _threads/2,
-            filter,
+            |_| true, //filter,
         );
 
     // ========================================================
