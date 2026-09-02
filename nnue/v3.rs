@@ -167,7 +167,7 @@ fn main() {
 
     use loader::sfbinpack::SfBinpackLoader;
 
-    
+    /* DOWNLOAD v2.v6 FILTERED BINPACKS TO AVOID NEEDING THIS
     fn filter(entry: &loader::sfbinpack::TrainingDataEntry) -> bool {
         use loader::sfbinpack::{MoveType,PieceType,};
         entry.ply >= 16
@@ -176,6 +176,7 @@ fn main() {
             && entry.mv.mtype() == MoveType::Normal
             && entry.pos.piece_at(entry.mv.to()).piece_type()== PieceType::None
     }
+    */
 
     let train_loader =
         SfBinpackLoader::new(
@@ -202,7 +203,7 @@ fn main() {
         test_set: Some(
             TestDataset::at(&val_path)
             .freq(_batches) // once per superbatch
-            .batches(256), // ~ 4 million validation positions (64 * _batch_size)
+            .batches(256), // ~ 4 million validation positions (x * _batch_size)
         ),
         output_directory: &output_dir,
         batch_queue_size: 64,

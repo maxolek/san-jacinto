@@ -5,6 +5,10 @@ __pycache__/
 
 # Logs
 logs/
+*.log
+
+# nnue training
+/nnue/checkpoints/
 
 # Virtual environments
 .venv/

@@ -41,7 +41,13 @@ import sys
 import threading
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-REPO_ROOT = os.path.dirname(HERE)
+# train.py lives in Projects/san-jacinto/nnue/
+SAN_JACINTO_ROOT = os.path.dirname(HERE)
+NNUE_SJ_ROOT = os.path.join(SAN_JACINTO_ROOT, "nnue")
+# Bullet lives in Projects/libs/bullet/
+PROJECTS_ROOT = os.path.dirname(SAN_JACINTO_ROOT)
+BULLET_ROOT = os.path.join(PROJECTS_ROOT, "libs", "bullet")
+METRICS_ROOT = os.path.join(BULLET_ROOT, "checkpoints")
 
 def build_plot_config(args, train_data, val_data, final_superbatch):
     import plot
@@ -156,22 +162,25 @@ def run_stage(
     cmd = build_command(args)
     env = build_env(args, train_data, val_data, start_superbatch)
 
-    out_dir = os.path.join(REPO_ROOT, args.output_dir)
-    metrics_csv = os.path.join(out_dir, "metrics.csv")
+    out_dir = os.path.join(NNUE_SJ_ROOT, args.output_dir)
+    metrics_csv = os.path.join(METRICS_ROOT, "metrics.csv")
     out_png = os.path.join(out_dir, "loss.png")
     log_path = os.path.join(out_dir, f"train{stage_label}.log")
+
+    if os.path.exists(metrics_csv):
+        os.remove(metrics_csv)
 
     print(f"\n{'=' * 60}")
     print(f"[train] stage{stage_label or ' (single run)'}: {train_data}")
     print(f"[train] superbatch_start={env['superbatch_start']}")
     print(f"{'=' * 60}")
     print(f"Running: {' '.join(cmd)}")
-    print(f"Working dir: {REPO_ROOT}")
+    print(f"Working dir: {BULLET_ROOT}")
     print(f"Metrics: {metrics_csv}\n")
 
     proc = subprocess.Popen(
         cmd,
-        cwd=REPO_ROOT,
+        cwd=BULLET_ROOT,
         env=env,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
