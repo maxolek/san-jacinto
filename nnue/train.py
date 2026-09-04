@@ -19,6 +19,21 @@ Multi-dataset (curriculum) runs:
     archived as e.g. `train_stage2.log`, `metrics_stage2.csv`, `loss_stage2.png`
     so nothing gets clobbered when the next stage starts writing metrics.csv.
 
+    LR scheduling across stages: bullet's own cosine scheduler is local to
+    each cargo run -- given `lr_start`/`lr_final`/`superbatches` it always
+    decays fully from `lr_start` to `lr_final` over that run, with no idea
+    it's one leg of a longer curriculum. Left alone, that means the LR jumps
+    back up to the full initial value at the start of every stage instead of
+    continuing to decay. To avoid that, each stage's `lr_start`/`lr_final`
+    env vars are computed from a single continuous cosine schedule spanning
+    the *entire* curriculum (--lr_start at superbatch 1 down to --lr_final at
+    the final superbatch), evaluated at that stage's first and last
+    superbatch. bullet still runs its own local cosine within the stage, but
+    since it starts and ends at the values the global schedule would have
+    had there, the LR is continuous across stage boundaries instead of
+    resetting. This mirrors the single continuous curve the live dashboard
+    (plot.py) already draws.
+
 Examples:
     python python/train.py --example halfka_deep --features cuda
     python python/train.py --example halfka_deep --superbatches 400 --lr_start 0.0008 \
@@ -34,6 +49,7 @@ Examples:
 from __future__ import annotations
 
 import argparse
+import math
 import os
 import shutil
 import subprocess
@@ -90,17 +106,46 @@ def expand_train_data(entries: list[str], data_root: str) -> list[str]:
 
     return expanded
 
+
+def resolve_lr_bounds(args) -> tuple[float, float]:
+    """The (initial_lr, final_lr) pair for the *whole* curriculum.
+
+    Shared by the plot config and the per-stage LR schedule slicing so
+    both always agree on the same global endpoints.
+    """
+    initial_lr = args.lr_start if args.lr_start is not None else 0.001
+    final_lr = args.lr_final if args.lr_final is not None else initial_lr * 0.3 ** 5
+    return initial_lr, final_lr
+
+
+def _cosine_lr(
+    superbatch: float,
+    initial_lr: float,
+    final_lr: float,
+    final_superbatch: int,
+) -> float:
+    """Value of the single, curriculum-wide cosine schedule at `superbatch`.
+
+    Deliberately mirrors plot._cosine_lr (same formula, same clamping) so
+    the LR bounds we hand each stage line up exactly with the curve the
+    dashboard draws. Kept as a plain-math duplicate rather than importing
+    plot.py, since plot.py pulls in matplotlib at import time and this
+    needs to work even in --no-plot / no-matplotlib setups.
+    """
+    if final_superbatch <= 0:
+        return final_lr
+
+    progress = min(1.0, max(0.0, superbatch / final_superbatch))
+
+    return final_lr + 0.5 * (initial_lr - final_lr) * (
+        1.0 + math.cos(math.pi * progress)
+    )
+
+
 def build_plot_config(args, train_data, val_data, final_superbatch):
     import plot
 
-    initial_lr = args.lr_start
-    final_lr = args.lr_final
-
-    if initial_lr is None:
-        initial_lr = 0.001
-
-    if final_lr is None:
-        final_lr = initial_lr * 0.3 ** 5
+    initial_lr, final_lr = resolve_lr_bounds(args)
 
     return plot.PlotConfig(
         initial_lr=initial_lr,
@@ -140,14 +185,22 @@ def build_env(
         val_data: str | None, 
         start_superbatch: int,
         out_dir: str,
+        lr_start: float | None = None,
+        lr_final: float | None = None,
     ) -> dict:
     env = os.environ.copy()
     # only set overrides the user actually passed, so example defaults remain
     mapping = {
         "superbatch_start": start_superbatch,
         "superbatches": args.superbatches,
-        "lr_start": args.lr_start,
-        "lr_final": args.lr_final,
+        # lr_start/lr_final default to the flat global CLI values, but a
+        # curriculum stage passes in the slice of the global cosine
+        # schedule that applies to it (see resolve_lr_bounds / _cosine_lr
+        # and the call site in main()), so bullet's own per-run cosine
+        # decay picks up where the previous stage left off instead of
+        # resetting to the full initial LR each time.
+        "lr_start": lr_start if lr_start is not None else args.lr_start,
+        "lr_final": lr_final if lr_final is not None else args.lr_final,
         "wdl_start": args.wdl_start,
         "wdl_end": args.wdl_end,
 
@@ -199,13 +252,23 @@ def run_stage(
     start_superbatch: int,
     final_superbatch: int,
     stage_boundaries: list[tuple[int, int, str]],
+    stage_lr_start: float | None = None,
+    stage_lr_final: float | None = None,
 ) -> int:
     """Launch one cargo training run and return its exit code."""
     out_dir = os.path.join(NNUE_SJ_ROOT, args.output_dir)
     os.makedirs(out_dir, exist_ok=True)
 
     cmd = build_command(args)
-    env = build_env(args, train_data, val_data, start_superbatch, out_dir)
+    env = build_env(
+        args,
+        train_data,
+        val_data,
+        start_superbatch,
+        out_dir,
+        lr_start=stage_lr_start,
+        lr_final=stage_lr_final,
+    )
 
     metrics_csv = os.path.join(out_dir, "metrics.csv")
     out_png = os.path.join(out_dir, "loss.png")
@@ -217,6 +280,7 @@ def run_stage(
     print(f"\n{'=' * 60}")
     print(f"[train] stage{stage_label or ' (single run)'}: {train_data}")
     print(f"[train] superbatch_start={env['superbatch_start']}")
+    print(f"[train] lr_start={env.get('lr_start')} lr_final={env.get('lr_final')}")
     print(f"{'=' * 60}")
     print(f"Running: {' '.join(cmd)}")
     print(f"Working dir: {BULLET_ROOT}")
@@ -400,6 +464,39 @@ def main() -> int:
                 )
             )
 
+    multi_stage = len(train_stages) > 1
+
+    # Slice the single, curriculum-wide cosine LR schedule at each stage's
+    # boundaries so consecutive cargo runs hand off the LR continuously
+    # instead of each one resetting to the full initial value. Only
+    # possible once we know the full schedule's shape, i.e. once
+    # --superbatches (a fixed per-stage length) is known.
+    stage_lr_bounds: list[tuple[float, float]] = []
+
+    if args.superbatches is not None:
+        initial_lr, final_lr = resolve_lr_bounds(args)
+
+        for stage_start, stage_end, _label in stage_boundaries:
+            stage_lr_bounds.append(
+                (
+                    _cosine_lr(stage_start, initial_lr, final_lr, final_superbatch),
+                    _cosine_lr(stage_end, initial_lr, final_lr, final_superbatch),
+                )
+            )
+
+        if multi_stage:
+            print(
+                f"[train] curriculum LR schedule: {initial_lr:g} -> {final_lr:g} "
+                f"over superbatches 1-{final_superbatch} (continuous across stages)"
+            )
+    elif multi_stage:
+        print(
+            "[train] warning: --superbatches not set, so the per-stage LR "
+            "schedule can't be sliced from a single curriculum-wide cosine; "
+            "each stage will use the flat --lr_start/--lr_final and bullet "
+            "will reset its cosine decay at every stage boundary."
+        )
+
     val_stages: list
     if args.val_data is None:
         val_stages = [None] * len(train_stages)
@@ -415,10 +512,19 @@ def main() -> int:
         )
         return 2
 
-    multi_stage = len(train_stages) > 1
-
     for i, (train_data, val_data) in enumerate(zip(train_stages, val_stages)):
         stage_label = f"_stage{i + 1}" if multi_stage else ""
+
+        stage_lr_start = None
+        stage_lr_final = None
+        if i < len(stage_lr_bounds):
+            stage_lr_start, stage_lr_final = stage_lr_bounds[i]
+            if multi_stage:
+                print(
+                    f"[train] stage {i + 1} LR window: "
+                    f"{stage_lr_start:.3g} -> {stage_lr_final:.3g} "
+                    f"(slice of the full curriculum cosine)"
+                )
 
         code = run_stage(
             args,
@@ -428,6 +534,8 @@ def main() -> int:
             start_superbatch=start_superbatch,
             final_superbatch=final_superbatch,
             stage_boundaries=stage_boundaries,
+            stage_lr_start=stage_lr_start,
+            stage_lr_final=stage_lr_final,
         )
 
         if code != 0:
