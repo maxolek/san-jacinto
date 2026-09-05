@@ -885,8 +885,6 @@ def main(args=None):
     if sum(x is not None for x in (args.depth, args.time, args.tc)) != 1:
         raise ValueError("Specify exactly one of --depth, --time, or --tc")
 
-    print(f"[SPRT] Log directory: {args.logroot}")
-
     engine_a = os.path.abspath(args.engine_a)
     engine_b = os.path.abspath(args.engine_b)
 
@@ -897,7 +895,7 @@ def main(args=None):
 
     if args.time is not None:
         fast_tc = args.time <= 0.5
-    else:  # args.tc must exist
+    elif args.tc is not None: 
         base_sec = 60*int(re.split(":", args.tc)[0]) + int(re.split(":", args.tc)[1][:2])
         fast_tc = base_sec <= 30
     should_log = args.log #(args.log and fast_tc) 
@@ -926,7 +924,7 @@ def main(args=None):
 
     # Time control
     if args.depth is not None:
-        each_block.append(f"depth={args.depth}")
+        each_block += [f"depth={args.depth}", "tc=inf"]
     elif args.time is not None:
         each_block += [f"st={args.time}", "timemargin=30"]
     else:
