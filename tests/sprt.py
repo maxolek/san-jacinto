@@ -150,6 +150,15 @@ def compute_bayes_elo_with_ci(W, D, L, CI=0.95):
     """
     BayesElo estimate + CI, using the same draw-adjusted scale as compute_llr.
     This is the number your SPRT pass/fail is actually computed against.
+
+    The CI bounds are derived through the SAME BayesElo transform as the
+    point estimate (holding the observed draw rate fixed and shifting only
+    the win/loss split to hit each score bound), rather than the plain
+    logistic model used by compute_elo_with_ci. Mixing the two models --
+    BayesElo for the center, plain logistic for the bounds -- meant the
+    reported point estimate could (and often did) fall outside its own
+    confidence interval, since the two models diverge whenever the draw
+    rate is high or win/loss counts are asymmetric.
     """
     N = W + D + L
     if N == 0:
@@ -163,6 +172,7 @@ def compute_bayes_elo_with_ci(W, D, L, CI=0.95):
 
     p_win = wins / total
     p_loss = losses / total
+    p_draw = 1.0 - p_win - p_loss
 
     bayes_elo, draw_elo = _bayes_elo_from_probs(p_win, p_loss)
     s = _scale(draw_elo)
@@ -170,9 +180,9 @@ def compute_bayes_elo_with_ci(W, D, L, CI=0.95):
     # convert BayesElo back to "normalized" 400-scale elo for display
     elo = bayes_elo * s
 
-    # CI via score variance, then map through the same scale
-    score = p_win + draws / (2 * total)
-    m2 = p_win + draws / (4 * total)
+    # CI via score variance
+    score = p_win + p_draw / 2.0
+    m2 = p_win + p_draw / 4.0
     var = (m2 - score ** 2) / total
     if var <= 0:
         return elo, elo, elo
@@ -181,8 +191,21 @@ def compute_bayes_elo_with_ci(W, D, L, CI=0.95):
     s_lo = max(0.001, score - ci)
     s_hi = min(0.999, score + ci)
 
-    elo_lo = score_to_elo(s_lo) * s
-    elo_hi = score_to_elo(s_hi) * s
+    def _score_to_bayes_elo(target_score):
+        # Hold the draw probability fixed at the observed rate and move
+        # win/loss probability to hit the target score, then apply the
+        # exact same BayesElo formula (and scale) used for the point
+        # estimate. This map is monotonic in score for a fixed draw rate,
+        # so [elo_lo, elo_hi] is guaranteed to bracket `elo`.
+        pw = target_score - p_draw / 2.0
+        pl = 1.0 - p_draw - pw
+        pw = min(max(pw, 1e-6), 1.0 - 1e-6)
+        pl = min(max(pl, 1e-6), 1.0 - 1e-6)
+        b_elo, _ = _bayes_elo_from_probs(pw, pl)
+        return b_elo * s
+
+    elo_lo = _score_to_bayes_elo(s_lo)
+    elo_hi = _score_to_bayes_elo(s_hi)
 
     return elo, elo_lo, elo_hi
 

@@ -38,6 +38,11 @@ _STAGE_PALETTE = [
     "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22", "#17becf",
 ]
 
+# Fixed colors for train vs. validation, used consistently across every
+# panel now that they can live on independent y-axes.
+_TRAIN_COLOR = "tab:blue"
+_VAL_COLOR = "tab:orange"
+
 
 def _stage_color(index: int) -> str:
     return _STAGE_PALETTE[index % len(_STAGE_PALETTE)]
@@ -273,12 +278,26 @@ def _best_validation(series: Series) -> Tuple[float, float] | None:
     return min(points, key=lambda p: p[1])
 
 
-def _set_loss_scale(ax, series: Series) -> None:
-    ys: List[float] = []
+def _set_percentile_ylim(
+    ax,
+    points: List[Tuple[float, float]],
+    skip_warmup: bool = True,
+) -> None:
+    """Clip an axis's y-range to the 1st-99th percentile of loss values.
 
-    for x, y in _all_points(series):
-        if x >= 1.0:
-            ys.append(y)
+    A handful of early/noisy outliers (e.g. the very first eval, or the
+    first few batches before the model has settled) can otherwise set the
+    axis ceiling/floor and squash all the later, more informative detail
+    into a thin band. Shared by every panel that plots a single split's
+    loss curve so each gets an appropriately zoomed-in range instead of
+    relying on plain autoscale (or another split's range).
+    """
+
+    ys = [
+        y
+        for x, y in points
+        if not skip_warmup or x >= 1.0
+    ]
 
     if len(ys) < 20:
         ax.relim()
@@ -400,6 +419,21 @@ def _cosine_lr(
     )
 
 
+def _remove_stale_twin(ax) -> None:
+    """Remove a twin y-axis created by a previous render() call.
+
+    ax.clear() only clears the axes it's given -- it doesn't know about
+    (or clear) any twinx() axes layered on top of it from an earlier
+    frame. In watch() mode the same Figure/Axes are reused across many
+    redraws, so without this a stray twin axis (and its lines/labels)
+    would silently accumulate on every refresh.
+    """
+
+    for other in list(ax.figure.axes):
+        if getattr(other, "_bullet_twin_of", None) is ax:
+            other.remove()
+
+
 def _draw_loss(
     ax,
     series: Series,
@@ -409,44 +443,38 @@ def _draw_loss(
     stages,
 ) -> None:
     ax.clear()
+    _remove_stale_twin(ax)
 
-    for split in ("train", "val"):
-        points = series.get(split)
+    train_points = series.get("train", [])
+    val_points = series.get("val", [])
 
-        if not points:
-            continue
+    handles: List = []
+    labels: List[str] = []
 
-        xs = [x for x, _ in points]
-        ys = [y for _, y in points]
+    if train_points:
+        xs = [x for x, _ in train_points]
+        ys = [y for _, y in train_points]
 
-        if split == "train":
-            ax.plot(
-                xs,
-                ys,
-                alpha=0.20,
-                linewidth=0.8,
-                label="train raw",
-            )
+        ax.plot(
+            xs,
+            ys,
+            alpha=0.20,
+            linewidth=0.8,
+            color=_TRAIN_COLOR,
+        )
 
-            ax.plot(
-                xs,
-                _moving_average(ys, smooth),
-                linewidth=1.8,
-                label=f"train ({smooth}-point MA)",
-            )
+        (h_train,) = ax.plot(
+            xs,
+            _moving_average(ys, smooth),
+            linewidth=1.8,
+            color=_TRAIN_COLOR,
+            label=f"train ({smooth}-point MA)",
+        )
 
-        else:
-            ax.plot(
-                xs,
-                ys,
-                marker="o",
-                markersize=3,
-                linewidth=1.5,
-                label="validation",
-            )
+        handles.append(h_train)
+        labels.append(f"train ({smooth}-point MA)")
 
-        last_x = xs[-1]
-        last_y = ys[-1]
+        last_x, last_y = xs[-1], ys[-1]
 
         ax.annotate(
             f"{last_y:.5f}",
@@ -455,34 +483,85 @@ def _draw_loss(
             textcoords="offset points",
             fontsize=9,
             va="center",
+            color=_TRAIN_COLOR,
         )
 
-    best = _best_validation(series)
+    # Train and validation loss are frequently on very different scales
+    # (different batch composition, different loss weighting, etc). A
+    # shared y-axis then flattens whichever series has the smaller
+    # range, so validation gets its own axis instead.
+    ax2 = None
 
-    if best is not None:
-        bx, by = best
+    if val_points:
+        ax2 = ax.twinx()
+        ax2._bullet_twin_of = ax
 
-        ax.scatter(
-            [bx],
-            [by],
-            marker="*",
-            s=100,
-            zorder=5,
-            label=f"best val ({by:.5f})",
+        xs = [x for x, _ in val_points]
+        ys = [y for _, y in val_points]
+
+        (h_val,) = ax2.plot(
+            xs,
+            ys,
+            marker="o",
+            markersize=3,
+            linewidth=1.5,
+            color=_VAL_COLOR,
+            label="validation",
         )
+
+        handles.append(h_val)
+        labels.append("validation")
+
+        last_x, last_y = xs[-1], ys[-1]
+
+        ax2.annotate(
+            f"{last_y:.5f}",
+            xy=(last_x, last_y),
+            xytext=(6, 0),
+            textcoords="offset points",
+            fontsize=9,
+            va="center",
+            color=_VAL_COLOR,
+        )
+
+        best = _best_validation(series)
+
+        if best is not None:
+            bx, by = best
+
+            h_best = ax2.scatter(
+                [bx],
+                [by],
+                marker="*",
+                s=100,
+                zorder=5,
+                color=_VAL_COLOR,
+                label=f"best val ({by:.5f})",
+            )
+
+            handles.append(h_best)
+            labels.append(f"best val ({by:.5f})")
+
+        _set_percentile_ylim(ax2, val_points)
+        ax2.set_ylabel("validation loss", color=_VAL_COLOR)
+        ax2.tick_params(axis="y", labelcolor=_VAL_COLOR)
+
+        if log_y:
+            ax2.set_yscale("log")
 
     if log_y:
         ax.set_yscale("log")
 
     ax.set_xlabel("superbatch")
-    ax.set_ylabel("loss")
+    ax.set_ylabel("training loss", color=_TRAIN_COLOR)
+    ax.tick_params(axis="y", labelcolor=_TRAIN_COLOR)
     ax.set_title("Training / validation loss")
     ax.grid(True, alpha=0.3)
 
-    if series:
-        ax.legend(loc="best", fontsize=8)
+    if handles:
+        ax.legend(handles, labels, loc="best", fontsize=8)
 
-    _set_loss_scale(ax, series)
+    _set_percentile_ylim(ax, train_points)
     _draw_stages(ax, stages)
     _set_global_x_scale(ax, stages, series, config)
 
@@ -689,6 +768,11 @@ def _draw_validation(ax, series: Series, config: PlotConfig | None, stages) -> N
     ax.set_title("Validation loss")
     ax.grid(True, alpha=0.3)
     ax.legend(loc="best", fontsize=8)
+
+    # Clip to the 1st-99th percentile of validation loss instead of plain
+    # autoscale, so an early noisy/high eval point doesn't set the axis
+    # ceiling and flatten the rest of the curve.
+    _set_percentile_ylim(ax, points)
 
     _draw_stages(ax, stages)
     _set_global_x_scale(ax, stages, series, config)
