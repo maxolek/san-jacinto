@@ -167,7 +167,7 @@ fn main() {
 
     use loader::sfbinpack::SfBinpackLoader;
 
-    /* DOWNLOAD v2.v6 FILTERED BINPACKS TO AVOID NEEDING THIS
+    /*
     fn filter(entry: &loader::sfbinpack::TrainingDataEntry) -> bool {
         use loader::sfbinpack::{MoveType,PieceType,};
         entry.ply >= 16
@@ -183,7 +183,7 @@ fn main() {
             &train_path,
             1024,
             _threads,
-            |_| true, //filter,
+            |_| true, //|_| true, //filter,
         );
 
     let val_loader =
@@ -191,7 +191,7 @@ fn main() {
             &val_path,
             256,
             _threads/2,
-            |_| true, //filter,
+            |_| true, //|_| true, //filter,
         );
 
     // ========================================================
