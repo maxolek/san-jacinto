@@ -254,6 +254,8 @@ def run_stage(
     stage_boundaries: list[tuple[int, int, str]],
     stage_lr_start: float | None = None,
     stage_lr_final: float | None = None,
+    fig=None,
+    axes=None,
 ) -> int:
     """Launch one cargo training run and return its exit code."""
     out_dir = os.path.join(NNUE_SJ_ROOT, args.output_dir)
@@ -309,12 +311,14 @@ def run_stage(
             import plot  # local module (python/plot.py)
 
             plot_config = build_plot_config(
-                args, 
-                train_data, 
-                val_data, 
+                args,
+                train_data,
+                val_data,
                 final_superbatch
             )
 
+            # fig/axes is the one shared dashboard built once in main();
+            # close_on_exit=False keeps it alive for the next stage.
             plot.watch(
                 metrics_csv,
                 out_png,
@@ -323,7 +327,10 @@ def run_stage(
                 interval=args.interval,
                 stop=lambda: proc.poll() is not None,
                 stages=stage_boundaries,
-                config=plot_config
+                config=plot_config,
+                fig=fig,
+                axes=axes,
+                close_on_exit=False,
             )
         except ImportError as e:
             print(f"[train] matplotlib unavailable ({e}); running without live plot.")
@@ -335,28 +342,11 @@ def run_stage(
 
     tee.join(timeout=5)
 
-    # one final static render for the record
-    if not args.no_plot:
-        try:
-            import plot
-
-            plot_config = build_plot_config(
-                args, 
-                train_data, 
-                val_data, 
-                final_superbatch
-            )
-
-            plot.one_shot(
-                metrics_csv, 
-                out_png, 
-                smooth=args.smooth, 
-                log_y=args.log_y, 
-                stages=stage_boundaries,
-                config=plot_config
-            )
-        except Exception:  # noqa: BLE001
-            pass
+    # (No separate final-render step here anymore -- plot.watch() already
+    # does a fresh reload + render + save right before it returns, using
+    # the same shared figure. Calling plot.one_shot() here used to force
+    # a matplotlib backend switch mid-run and silently kill the live plot
+    # at every stage boundary.)
 
     code = proc.returncode or 0
     print(f"\n[train] stage{stage_label or ''} cargo exited with code {code}")
@@ -436,6 +426,22 @@ def main() -> int:
 
     sys.path.insert(0, HERE)
 
+    # plotting
+
+    dashboard_fig = None
+    dashboard_axes = None
+
+    if not args.no_plot:
+        try:
+            import plot  # local module (python/plot.py)
+            dashboard_fig, dashboard_axes = plot.create_dashboard()
+        except ImportError as e:
+            print(f"[train] matplotlib unavailable ({e}); running without live plot.")
+            print("[train] install with: pip install -r python/requirements.txt")
+            args.no_plot = True
+
+    # cirriculum learning
+
     stage_boundaries = []
     train_stages = (
         expand_train_data(args.train_data, DATA_ROOT)
@@ -446,6 +452,8 @@ def main() -> int:
     if not train_stages:
         print("[train] no dataset files resolved from --train-data")
         return 2
+
+    # stage lengths
 
     start_superbatch = args.superbatch_start or 1
     total_superbatches = len(train_stages) * args.superbatches
@@ -512,43 +520,52 @@ def main() -> int:
         )
         return 2
 
-    for i, (train_data, val_data) in enumerate(zip(train_stages, val_stages)):
-        stage_label = f"_stage{i + 1}" if multi_stage else ""
+    try:
+        for i, (train_data, val_data) in enumerate(zip(train_stages, val_stages)):
+            stage_label = f"_stage{i + 1}" if multi_stage else ""
 
-        stage_lr_start = None
-        stage_lr_final = None
-        if i < len(stage_lr_bounds):
-            stage_lr_start, stage_lr_final = stage_lr_bounds[i]
-            if multi_stage:
-                print(
-                    f"[train] stage {i + 1} LR window: "
-                    f"{stage_lr_start:.3g} -> {stage_lr_final:.3g} "
-                    f"(slice of the full curriculum cosine)"
-                )
+            stage_lr_start = None
+            stage_lr_final = None
+            if i < len(stage_lr_bounds):
+                stage_lr_start, stage_lr_final = stage_lr_bounds[i]
+                if multi_stage:
+                    print(
+                        f"[train] stage {i + 1} LR window: "
+                        f"{stage_lr_start:.3g} -> {stage_lr_final:.3g} "
+                        f"(slice of the full curriculum cosine)"
+                    )
 
-        code = run_stage(
-            args,
-            train_data=train_data,
-            val_data=val_data,
-            stage_label=stage_label,
-            start_superbatch=start_superbatch,
-            final_superbatch=final_superbatch,
-            stage_boundaries=stage_boundaries,
-            stage_lr_start=stage_lr_start,
-            stage_lr_final=stage_lr_final,
-        )
-
-        if code != 0:
-            print(
-                f"[train] stage {i + 1}/{len(train_stages)} failed "
-                f"(exit {code}); stopping curriculum."
+            code = run_stage(
+                args,
+                train_data=train_data,
+                val_data=val_data,
+                stage_label=stage_label,
+                start_superbatch=start_superbatch,
+                final_superbatch=final_superbatch,
+                stage_boundaries=stage_boundaries,
+                stage_lr_start=stage_lr_start,
+                stage_lr_final=stage_lr_final,
+                fig=dashboard_fig,
+                axes=dashboard_axes,
             )
-            return code
 
-        if args.superbatches is not None:
-            start_superbatch += args.superbatches  # +1 to avoid overlap
+            if code != 0:
+                print(
+                    f"[train] stage {i + 1}/{len(train_stages)} failed "
+                    f"(exit {code}); stopping curriculum."
+                )
+                return code
 
-    return 0
+            if args.superbatches is not None:
+                start_superbatch += args.superbatches
+
+        return 0
+    finally:
+        if dashboard_fig is not None:
+            import matplotlib.pyplot as plt
+
+            plt.ioff()
+            plt.close(dashboard_fig)
 
 
 if __name__ == "__main__":

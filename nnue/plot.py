@@ -74,6 +74,51 @@ class PlotConfig:
     qc: int | None = None
 
 
+def create_dashboard(figsize: Tuple[float, float] = (16, 10)):
+    """Build the fig + axes dict shared by one_shot() and watch().
+
+    Pulled out so train.py can build this exactly once per program run
+    and hand the same fig/axes into watch() for every curriculum stage,
+    instead of each stage getting its own figure (and window).
+    """
+    import matplotlib.pyplot as plt
+
+    fig = plt.figure(figsize=figsize)
+
+    gs = fig.add_gridspec(
+        3, 2,
+        height_ratios=[1, 1, 0.28],
+        hspace=0.32,
+        wspace=0.18,
+    )
+
+    axes = {
+        "loss": fig.add_subplot(gs[0, 0]),
+        "validation": fig.add_subplot(gs[0, 1]),
+        "lr": fig.add_subplot(gs[1, 0]),
+        "wdl": fig.add_subplot(gs[1, 1]),
+        "info": fig.add_subplot(gs[2, :]),
+    }
+
+    return fig, axes
+
+
+def save_figure(fig, out_png: str) -> None:
+    os.makedirs(
+        os.path.dirname(os.path.abspath(out_png)),
+        exist_ok=True,
+    )
+
+    fig.savefig(
+        out_png,
+        dpi=120,
+        bbox_inches="tight",
+    )
+
+    print(f"Wrote {out_png}")
+
+
+
 def _moving_average(ys: List[float], k: int) -> List[float]:
     if k <= 1 or len(ys) < 2:
         return ys
@@ -1069,34 +1114,28 @@ def one_shot(
     log_y: bool = False,
     stages=None,
     config: PlotConfig | None = None,
+    fig=None,
+    axes=None,
 ) -> None:
-    import matplotlib
+    """Render a single static frame and save it to `out_png`.
 
-    matplotlib.use("Agg")
+    If `fig`/`axes` are not supplied, this builds its own headless
+    (Agg-backend) figure -- the standalone-CLI / one-off-render path.
+    When called with an existing `fig`/`axes`, it reuses them and never
+    touches the matplotlib backend: forcing `matplotlib.use("Agg")` on a
+    figure that's currently on an interactive backend detaches/kills that
+    live window. (This used to be called from train.py's run_stage() after
+    every curriculum stage, which is what was silently switching the
+    backend and killing the live plot mid-run.)
+    """
+    owns_fig = fig is None
 
-    import matplotlib.pyplot as plt
+    if owns_fig:
+        import matplotlib
 
-    fig = plt.figure(figsize=(16, 10))
-    gs = fig.add_gridspec(
-        3, 2,
-        height_ratios=[1, 1, 0.28],
-        hspace=0.32,
-        wspace=0.18,
-    )
+        matplotlib.use("Agg")
 
-    ax_loss = fig.add_subplot(gs[0, 0])
-    ax_val = fig.add_subplot(gs[0, 1])
-    ax_lr = fig.add_subplot(gs[1, 0])
-    ax_wdl = fig.add_subplot(gs[1, 1])
-    ax_info = fig.add_subplot(gs[2, :])
-
-    axes = {
-        "loss": ax_loss,
-        "validation": ax_val,
-        "lr": ax_lr,
-        "wdl": ax_wdl,
-        "info": ax_info,
-    }
+        fig, axes = create_dashboard()
 
     started_at = time.time()
 
@@ -1116,20 +1155,12 @@ def one_shot(
 
     fig.tight_layout(rect=(0, 0, 1, 0.94))
 
-    os.makedirs(
-        os.path.dirname(os.path.abspath(out_png)),
-        exist_ok=True,
-    )
+    save_figure(fig, out_png)
 
-    fig.savefig(
-        out_png,
-        dpi=120,
-        bbox_inches="tight",
-    )
+    if owns_fig:
+        import matplotlib.pyplot as plt
 
-    print(f"Wrote {out_png}")
-
-    plt.close(fig)
+        plt.close(fig)
 
 
 def watch(
@@ -1141,36 +1172,29 @@ def watch(
     stop=None,
     stages=None,
     config: PlotConfig | None = None,
+    fig=None,
+    axes=None,
+    close_on_exit: bool = True,
 ) -> None:
-    """Live-refresh the dashboard until stop() returns True."""
+    """Live-refresh the dashboard until stop() returns True.
+
+    Pass an existing `fig`/`axes` (built once via `create_dashboard()`) to
+    keep reusing the same window across multiple calls -- this is how
+    train.py keeps one persistent plot alive across curriculum stages
+    instead of tearing down and rebuilding a figure at every stage
+    boundary. When reusing a caller-owned figure, pass
+    `close_on_exit=False` so this function doesn't close it out from under
+    the caller; the caller closes it once, after the *last* stage.
+    """
 
     import matplotlib.pyplot as plt
 
     plt.ion()
 
-    fig = plt.figure(figsize=(16, 10))
+    owns_fig = fig is None
 
-    gs = fig.add_gridspec(
-        3,
-        2,
-        height_ratios=[1, 1, 0.28],
-        hspace=0.32,
-        wspace=0.18,
-    )
-
-    ax_loss = fig.add_subplot(gs[0, 0])
-    ax_val = fig.add_subplot(gs[0, 1])
-    ax_lr = fig.add_subplot(gs[1, 0])
-    ax_wdl = fig.add_subplot(gs[1, 1])
-    ax_info = fig.add_subplot(gs[2, :])
-
-    axes = {
-        "loss": ax_loss,
-        "validation": ax_val,
-        "lr": ax_lr,
-        "wdl": ax_wdl,
-        "info": ax_info,
-    }
+    if owns_fig:
+        fig, axes = create_dashboard()
 
     title = _title_for(path)
     started_at = time.time()
@@ -1185,7 +1209,6 @@ def watch(
                 include_archived=True,
             )
 
-            # Never throw away history we've already observed.
             history = _merge_series(history, loaded)
             series = history
 
@@ -1210,19 +1233,11 @@ def watch(
             break
 
         except Exception as e:
-            # A single bad read/render -- metrics.csv mid-write, a
-            # transient matplotlib redraw glitch, a divide-by-zero from
-            # a not-yet-fully-populated config -- must never kill the
-            # whole live-plot loop. If it did, train.py exits entirely
-            # and you lose the plot AND the log tee for a run that's
-            # still training fine in the background.
             consecutive_errors += 1
             print(f"[plot] watch: render error ({e}); retrying "
                   f"(consecutive_errors={consecutive_errors})")
 
             if consecutive_errors >= 20:
-                # Something is persistently broken, not transient --
-                # surface it loudly instead of spinning silently forever.
                 print("[plot] watch: too many consecutive errors, "
                       "giving up on the live plot (training continues).")
                 break
@@ -1238,18 +1253,41 @@ def watch(
         if not plt.fignum_exists(fig.number):
             break
 
+    # One more refresh + save after the loop exits, so the persisted PNG
+    # (and the on-screen window, if still open) reflect the very latest
+    # metrics even if the last write raced the interval/stop check.
     try:
-        fig.savefig(
-            out_png,
-            dpi=120,
-            bbox_inches="tight",
+        loaded = load_metrics(path, include_archived=True)
+        history = _merge_series(history, loaded)
+
+        render(
+            history,
+            fig,
+            axes,
+            title,
+            smooth=smooth,
+            log_y=log_y,
+            stages=stages,
+            config=config,
+            started_at=started_at,
         )
-        print(f"Wrote {out_png}")
+
+        fig.tight_layout(rect=(0, 0, 1, 0.94))
+
+        if plt.fignum_exists(fig.number):
+            fig.canvas.draw_idle()
+
+    except Exception as e:
+        print(f"[plot] watch: final refresh failed ({e})")
+
+    try:
+        save_figure(fig, out_png)
     except Exception as e:
         print(f"Could not save {out_png}: {e}")
 
-    plt.ioff()
-    plt.close(fig)
+    if close_on_exit:
+        plt.ioff()
+        plt.close(fig)
 
 
 def main() -> None:

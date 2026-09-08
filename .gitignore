@@ -3,8 +3,9 @@ __pycache__/
 *.py[cod]
 *.pyo
 
-# mac
+# etc
 .DS_Store
+*.aider*
 
 # Logs
 logs/
