@@ -167,7 +167,6 @@ fn main() {
 
     use loader::sfbinpack::SfBinpackLoader;
 
-    /*
     fn filter(entry: &loader::sfbinpack::TrainingDataEntry) -> bool {
         use loader::sfbinpack::{MoveType,PieceType,};
         entry.ply >= 16
@@ -176,14 +175,13 @@ fn main() {
             && entry.mv.mtype() == MoveType::Normal
             && entry.pos.piece_at(entry.mv.to()).piece_type()== PieceType::None
     }
-    */
 
     let train_loader =
         SfBinpackLoader::new(
             &train_path,
             1024,
             _threads,
-            |_| true, //|_| true, //filter,
+            filter, //|_| true, //filter,
         );
 
     let val_loader =
