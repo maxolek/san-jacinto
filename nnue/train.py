@@ -54,6 +54,7 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -242,6 +243,33 @@ def stream_output(proc: subprocess.Popen, log_path: str) -> None:
             sys.stdout.flush()
             log.write(line)
             log.flush()
+
+
+def archive_previous_plot(out_dir: str) -> None:
+    """Start a new plot history while retaining the previous run's files."""
+    if not os.path.isdir(out_dir):
+        return
+
+    paths = []
+    for name in os.listdir(out_dir):
+        if any(
+            name == f"{base}{suffix}"
+            or (name.startswith(f"{base}_stage") and name.endswith(suffix))
+            for base, suffix in (("metrics", ".csv"), ("loss", ".png"))
+        ):
+            path = os.path.join(out_dir, name)
+            if os.path.isfile(path):
+                paths.append(path)
+
+    if not paths:
+        return
+
+    history_dir = os.path.join(out_dir, "plot_history")
+    os.makedirs(history_dir, exist_ok=True)
+    backup_dir = tempfile.mkdtemp(prefix="run_", dir=history_dir)
+    for path in paths:
+        shutil.move(path, os.path.join(backup_dir, os.path.basename(path)))
+    print(f"[train] previous plot history saved to {backup_dir}")
 
 
 def run_stage(
@@ -521,6 +549,7 @@ def main() -> int:
         return 2
 
     try:
+        archive_previous_plot(os.path.join(NNUE_SJ_ROOT, args.output_dir))
         for i, (train_data, val_data) in enumerate(zip(train_stages, val_stages)):
             stage_label = f"_stage{i + 1}" if multi_stage else ""
 
