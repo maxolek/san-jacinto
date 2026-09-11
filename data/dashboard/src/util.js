@@ -120,6 +120,8 @@ export function nativeSelect(options, onChange, defaultValue) {
 export function fmt(n) {
   if (n == null) return '—';
   const num = Number(n);
+  // Summary callers may already have formatted a percentage or unit suffix.
+  if (typeof n === 'string' && n.trim() && isNaN(num)) return n;
   if (isNaN(num)) return '—';
   if (Math.abs(num) >= 1e6) return (num / 1e6).toFixed(1) + 'M';
   if (Math.abs(num) >= 1e3) return (num / 1e3).toFixed(1) + 'K';
@@ -147,12 +149,17 @@ export async function hasTable(name) {
 }
 
 /**
- * Get the search table name (search_features or search_stats).
+ * Get a focused analytics view. Legacy feature tables are a fallback for old files.
  */
-export function getSearchTable() {
+export function getSearchTable(kind = 'metrics') {
   const tables = window.__tables || [];
+  const views = {
+    metrics: 'search_metrics',
+    context: 'search_context',
+    positions: 'search_position_metrics',
+  };
+  if (tables.includes(views[kind])) return views[kind];
   if (tables.includes('search_features')) return 'search_features';
-  if (tables.includes('search_stats')) return 'search_stats';
   return null;
 }
 
@@ -161,8 +168,8 @@ export function getSearchTable() {
  */
 export function getIterTable() {
   const tables = window.__tables || [];
+  if (tables.includes('search_iteration_metrics')) return 'search_iteration_metrics';
   if (tables.includes('search_iteration_features')) return 'search_iteration_features';
-  if (tables.includes('iterative_deepening_stats')) return 'iterative_deepening_stats';
   return null;
 }
 
@@ -172,6 +179,5 @@ export function getIterTable() {
 export function getTreeTable() {
   const tables = window.__tables || [];
   if (tables.includes('search_tree_features')) return 'search_tree_features';
-  if (tables.includes('search_tree_stats')) return 'search_tree_stats';
   return null;
 }

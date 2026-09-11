@@ -173,10 +173,21 @@ def validate_tree(cnxn, result):
 
 
 def validate_features(cnxn, result):
-    """Validate computed feature tables for ratio bounds."""
-    if not _table_exists(cnxn, 'search_features'):
-        result.warn("features", "search_features not yet built — skipping feature checks")
+    """Validate focused views without repeatedly executing the compatibility join."""
+    if not _table_exists(cnxn, 'search_metrics'):
+        result.error("features", "search_metrics missing — run data.transforms.transform_search")
         return
+
+    # One-to-one joins require unique keys; CTAS imports do not retain constraints.
+    for table, key in [('search_stats', 'id'), ('engines', 'id'), ('game_stats', 'id'),
+                       ('sts_runs', 'id'), ('position_features', 'search_id')]:
+        duplicates = _count(cnxn, f"""
+            SELECT COUNT(*) FROM (
+                SELECT {key} FROM {table} GROUP BY {key} HAVING COUNT(*) > 1
+            )
+        """)
+        if duplicates:
+            result.error('join_grain', f'{table}.{key} is not unique; metadata joins multiply searches', duplicates)
 
     # Ratios should be in [0, 1] (with some tolerance for floating point)
     ratio_cols = [
@@ -185,19 +196,19 @@ def validate_features(cnxn, result):
     ]
     for col in ratio_cols:
         try:
-            bad = _count(cnxn, f"SELECT COUNT(*) FROM search_features WHERE {col} < -0.01 OR {col} > 1.01")
+            bad = _count(cnxn, f"SELECT COUNT(*) FROM search_metrics WHERE {col} < -0.01 OR {col} > 1.01")
             if bad > 0:
-                result.warn(f"ratio_{col}", f"search_features.{col} outside [0,1]", bad)
-        except Exception:
-            pass  # column may not exist
+                result.warn(f"ratio_{col}", f"search_metrics.{col} outside [0,1]", bad)
+        except duckdb.Error as exc:
+            result.error('feature_query', str(exc))
 
     # EBF should be > 0 (where not null)
     try:
-        bad_ebf = _count(cnxn, "SELECT COUNT(*) FROM search_features WHERE avg_ebf < 0")
+        bad_ebf = _count(cnxn, "SELECT COUNT(*) FROM search_iteration_summary WHERE avg_ebf < 0")
         if bad_ebf > 0:
-            result.warn("ebf_negative", "search_features.avg_ebf < 0", bad_ebf)
-    except Exception:
-        pass
+            result.warn("ebf_negative", "search_iteration_summary.avg_ebf < 0", bad_ebf)
+    except duckdb.Error as exc:
+        result.error('feature_query', str(exc))
 
 
 def validate_timing(cnxn, result):

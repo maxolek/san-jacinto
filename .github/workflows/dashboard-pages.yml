@@ -1,0 +1,66 @@
+name: Publish analytics dashboard
+
+on:
+  workflow_dispatch:
+    inputs:
+      data_release:
+        description: 'Release tag containing analytics-public.tar.gz'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dashboard-pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: data/dashboard/package-lock.json
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install and check dashboard
+        working-directory: data/dashboard
+        run: |
+          npm ci
+          npm test
+      - name: Download the selected data release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          DATA_RELEASE: ${{ inputs.data_release }}
+        run: gh release download --pattern analytics-public.tar.gz --dir "$RUNNER_TEMP/dashboard-data" -- "$DATA_RELEASE"
+      - name: Extract and verify the data bundle
+        env:
+          BUNDLE_PATH: ${{ runner.temp }}/dashboard-data/analytics-public.tar.gz
+        run: python3 data/dashboard/scripts/prepare_public_data.py "$BUNDLE_PATH" data/dashboard/public
+      - name: Build static site
+        working-directory: data/dashboard
+        run: npm run build
+      - uses: actions/upload-pages-artifact@v4
+        with:
+          path: data/dashboard/dist
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/configure-pages@v5
+      - name: Deploy
+        id: deployment
+        uses: actions/deploy-pages@v4

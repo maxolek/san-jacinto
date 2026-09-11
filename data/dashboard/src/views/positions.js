@@ -14,7 +14,7 @@ const METRIC_OPTIONS = [
 ];
 
 export async function renderPositions() {
-  const searchTable = getSearchTable();
+  const searchTable = getSearchTable('positions');
   if (!searchTable) {
     return el('div', { class: 'panel' }, el('p', {}, 'No search data table found.'));
   }
@@ -29,7 +29,7 @@ export async function renderPositions() {
   if (!check || check.n === 0) {
     container.appendChild(panel('Position Analysis',
       el('p', { style: { color: 'var(--text-sec)' } },
-        'No position feature data available. Ensure position_features table is populated and search_features is rebuilt.'
+        'No position feature data available. Run the position analysis step of the analytics pipeline.'
       )
     ));
     return container;

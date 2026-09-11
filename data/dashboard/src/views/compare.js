@@ -42,8 +42,8 @@ export async function renderCompare() {
 
   // Engine filter
   const engineSelect = vg.menu({
-    from: 'engines',
-    column: 'id',
+    from: searchTable,
+    column: 'engine_id',
     label: 'Filter Engine',
     as: $filter,
   });

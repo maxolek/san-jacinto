@@ -24,5 +24,10 @@ env/
 .pytest_cache/
 .mypy_cache/
 
+# Dashboard dependencies and build output
+data/dashboard/node_modules/
+data/dashboard/dist/
+data/dashboard/public/data/
+
 # bin files (too large)
-bin/opening_books/UHO_Lichess_4852_v1.epd 
+bin/opening_books/UHO_Lichess_4852_v1.epd

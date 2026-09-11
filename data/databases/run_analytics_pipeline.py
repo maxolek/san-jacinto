@@ -45,12 +45,11 @@ def main():
 
     print(f"Running pipeline from: {cwd}")
     modules_to_run = MODULES[1:] if args.skip_load else MODULES
-    #if args.full: modules_to_run.append("data.databases.migrate_schema")
     if args.skip_load:
         print("Skipping data.load_analytics (use --skip-load to enable)")
     for m in modules_to_run:
-        # Pass --full to load_analytics and transform_search if requested
-        extra = ['--full'] if args.full and m in ('data.databases.load_analytics', 'data.transforms.transform_search') else None
+        # Only the fact loader has a full/incremental distinction; views are live.
+        extra = ['--full'] if args.full and m == 'data.databases.load_analytics' else None
         run_module(m, extra_args=extra)
     print("\nPipeline completed successfully.")
 

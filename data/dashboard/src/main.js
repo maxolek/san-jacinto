@@ -9,7 +9,8 @@ import mvp_worker from '@duckdb/duckdb-wasm/dist/duckdb-browser-mvp.worker.js?ur
 import duckdb_wasm_eh from '@duckdb/duckdb-wasm/dist/duckdb-eh.wasm?url';
 import eh_worker from '@duckdb/duckdb-wasm/dist/duckdb-browser-eh.worker.js?url';
 import * as vg from '@uwdata/vgplot';
-import { getCount, getTables, tableExists } from './connection.js';
+import { useAnalyticsDatabase } from './connection.js';
+import { resolveDataSource } from './data-source.js';
 import { renderOverview } from './views/overview.js';
 import { renderSearch } from './views/search.js';
 import { renderGames } from './views/games.js';
@@ -51,6 +52,7 @@ const TABS = [
 ];
 
 let activeTab = 'overview';
+let publishedSnapshot = null;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // INITIALIZATION
@@ -60,7 +62,7 @@ async function init() {
   const status = document.getElementById('db-status');
   
   try {
-    status.textContent = 'Initializing DuckDB-WASM...';
+    status.textContent = 'Loading dashboard...';
     
     // Manually instantiate DuckDB-WASM so we have access to the db handle
     const bundle = await duckdb.selectBundle({
@@ -82,14 +84,18 @@ async function init() {
     
     status.textContent = 'Loading database...';
     
-    // Try to load from the default path (configure this for your setup)
-    const dbPath = getDbPath();
+    const source = await resolveDataSource(window.location.href,
+      new URL(import.meta.env.BASE_URL, window.location.href),
+      { development: import.meta.env.DEV });
+    const dbPath = source?.url;
+    publishedSnapshot = source?.manifest ?? null;
     
     if (dbPath) {
-      await coordinator().exec(`ATTACH '${dbPath}' AS db (READ_ONLY)`);
-      await coordinator().exec(`USE db`);
+      await coordinator().exec(`ATTACH '${dbPath.replaceAll("'", "''")}' AS db (READ_ONLY)`);
+      await useAnalyticsDatabase();
     } else {
       // Show file picker
+      status.textContent = 'Choose a local database';
       showFilePicker(status);
       return;
     }
@@ -102,14 +108,24 @@ async function init() {
     console.error('Init failed:', e);
     status.textContent = `Error: ${e.message}`;
     status.className = 'error';
-    showFilePicker(status);
+    showLoadError(e.message);
   }
 }
 
-function getDbPath() {
-  // Check URL params for db path
-  const params = new URLSearchParams(window.location.search);
-  return params.get('db') || null;
+function showLoadError(message) {
+  const panel = document.createElement('div');
+  panel.className = 'panel';
+  const text = document.createElement('p');
+  text.textContent = message;
+  const retry = document.createElement('button');
+  retry.textContent = 'Try again';
+  retry.addEventListener('click', () => window.location.reload());
+  const local = document.createElement('a');
+  local.href = `${import.meta.env.BASE_URL}?local=1`;
+  local.textContent = 'Open a local database';
+  local.style.marginLeft = '16px';
+  panel.append(text, retry, local);
+  document.getElementById('content').replaceChildren(panel);
 }
 
 function showFilePicker(status) {
@@ -120,7 +136,7 @@ function showFilePicker(status) {
       <p style="color: var(--text-sec); margin-bottom: 16px; font-size: 13px;">
         Select your DuckDB analytics file, or pass <code>?db=path/to/file.duckdb</code> in the URL.
       </p>
-      <input type="file" id="db-file-input" accept=".duckdb,.db,.parquet" 
+      <input type="file" id="db-file-input" accept=".duckdb,.db"
              style="margin: 16px 0;" />
       <p style="color: var(--text-sec); font-size: 11px; margin-top: 12px;">
         Supports .duckdb files. All processing happens in your browser — no data is uploaded.
@@ -131,6 +147,7 @@ function showFilePicker(status) {
   document.getElementById('db-file-input').addEventListener('change', async (e) => {
     const file = e.target.files[0];
     if (!file) return;
+    publishedSnapshot = null;
     
     status.textContent = `Loading ${file.name}...`;
     try {
@@ -140,8 +157,8 @@ function showFilePicker(status) {
       // Register buffer with the DuckDB instance directly
       const db = window.__duckdb;
       await db.registerFileBuffer(file.name, uint8);
-      await coordinator().exec(`ATTACH '${file.name}' AS db (READ_ONLY)`);
-      await coordinator().exec(`USE db`);
+      await coordinator().exec(`ATTACH '${file.name.replaceAll("'", "''")}' AS db (READ_ONLY)`);
+      await useAnalyticsDatabase();
       
       status.textContent = 'Connected';
       status.className = 'connected';
@@ -184,6 +201,10 @@ async function showFreshness() {
     const row = Array.from(result)[0];
     if (row) {
       indicator.textContent = `${Number(row.searches).toLocaleString()} searches | latest id: ${row.latest_id}`;
+      if (publishedSnapshot) {
+        const published = new Date(publishedSnapshot.exported_at).toLocaleString();
+        indicator.textContent = `${Number(row.searches).toLocaleString()} searches | Published ${published}`;
+      }
       indicator.style.display = 'inline';
     }
   } catch {
