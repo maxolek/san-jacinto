@@ -66,7 +66,12 @@ fn main() {
     let initial_lr          = env_f32("lr_start", 0.001);
     let final_lr            = env_f32("lr_final", initial_lr * 0.3f32.powi(5));
     let superbatches        = env_usize("superbatches", 800);
-    let superbatch_start    = env_usize("superbatch_start", 0);
+    let superbatch_start    = env_usize("superbatch_start", 1);
+    assert!(superbatch_start > 0 && superbatches > 0, "Training steps must be positive");
+    let stage_end          = superbatch_start + superbatches - 1;
+    // Bullet indexes LR by global superbatch, including after checkpoint loads.
+    let lr_final_superbatch = env_usize("lr_final_superbatch", stage_end);
+    assert!(lr_final_superbatch >= stage_end, "LR schedule must cover the entire stage");
     let wdl_start           = env_f32("wdl_start", 0.25);
     let wdl_end             = env_f32("wdl_end", 0.25);
 
@@ -120,7 +125,7 @@ fn main() {
         .build(|builder, stm_inputs, ntm_inputs, output_buckets| {
             let l0f = builder.new_weights("l0f", Shape::new(l1_size, 768), InitSettings::Zeroed);
             let mut l0 = builder.new_affine("l0", 768 * NUM_INPUT_BUCKETS, l1_size);
-            //l0.init_with_effective_input_size(l3);
+            l0.init_with_effective_input_size(32); // at most 32 active features
             l0.weights = l0.weights + l0f.repeat(NUM_INPUT_BUCKETS);
 
             let l1 = builder.new_affine("l1", l1_size, NUM_OUTPUT_BUCKETS * l2_size);
@@ -154,10 +159,13 @@ fn main() {
             batch_size: _batch_size,
             batches_per_superbatch: _batches,
             start_superbatch: superbatch_start,
-            end_superbatch: superbatch_start + superbatches - 1,
+            end_superbatch: stage_end,
         },
         wdl_scheduler: wdl::LinearWDL { start: wdl_start, end: wdl_end },
-        lr_scheduler: lr::CosineDecayLR { initial_lr, final_lr, final_superbatch: superbatches },
+        lr_scheduler:lr::Warmup{
+            inner: lr::CosineDecayLR { initial_lr, final_lr, final_superbatch: lr_final_superbatch },
+            warmup_batches: 10
+        }
         save_rate: _save_rate,
     };
 
@@ -167,7 +175,6 @@ fn main() {
 
     use loader::sfbinpack::SfBinpackLoader;
 
-    /*
     fn filter(entry: &loader::sfbinpack::TrainingDataEntry) -> bool {
         use loader::sfbinpack::{MoveType,PieceType,};
         entry.ply >= 16
@@ -176,14 +183,13 @@ fn main() {
             && entry.mv.mtype() == MoveType::Normal
             && entry.pos.piece_at(entry.mv.to()).piece_type()== PieceType::None
     }
-    */
 
     let train_loader =
         SfBinpackLoader::new(
             &train_path,
             1024,
             _threads,
-            |_| true, //|_| true, //filter,
+            filter, //|_| true, //filter,
         );
 
     let val_loader =

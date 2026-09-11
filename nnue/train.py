@@ -12,27 +12,19 @@ forwarded to the example via env variables (currently wired up in
 
 Multi-dataset (curriculum) runs:
     Pass --train-data with more than one path and each one is run as its own
-    sequential stage: stage 1 trains from scratch, stage 2+ set
-    `is_later_run=1` in the environment so the Rust side loads the checkpoint
+    sequential stage: stage 1 trains from scratch, stage 2+ advance
+    `superbatch_start` so the Rust side loads the checkpoint
     left behind by the previous stage (same --output-dir / --net-id) and
     continues training on the new dataset. Per-stage logs/metrics/plots are
     archived as e.g. `train_stage2.log`, `metrics_stage2.csv`, `loss_stage2.png`
     so nothing gets clobbered when the next stage starts writing metrics.csv.
 
-    LR scheduling across stages: bullet's own cosine scheduler is local to
-    each cargo run -- given `lr_start`/`lr_final`/`superbatches` it always
-    decays fully from `lr_start` to `lr_final` over that run, with no idea
-    it's one leg of a longer curriculum. Left alone, that means the LR jumps
-    back up to the full initial value at the start of every stage instead of
-    continuing to decay. To avoid that, each stage's `lr_start`/`lr_final`
-    env vars are computed from a single continuous cosine schedule spanning
-    the *entire* curriculum (--lr_start at superbatch 1 down to --lr_final at
-    the final superbatch), evaluated at that stage's first and last
-    superbatch. bullet still runs its own local cosine within the stage, but
-    since it starts and ends at the values the global schedule would have
-    had there, the LR is continuous across stage boundaries instead of
-    resetting. This mirrors the single continuous curve the live dashboard
-    (plot.py) already draws.
+    LR scheduling across stages: Bullet indexes its cosine by the global
+    superbatch number. Every stage receives the same `lr_start`, `lr_final`,
+    and `lr_final_superbatch` (the final superbatch of the curriculum).
+    `superbatches` accepts one shared length or one length per dataset stage. This gives one
+    global cosine matching the dashboard, without restarting or clamping
+    the decay at stage boundaries. Supported by nnue/v2.rs and nnue/v3.rs.
 
 Examples:
     python python/train.py --example halfka_deep --features cuda
@@ -55,6 +47,7 @@ import shutil
 import subprocess
 import sys
 import threading
+from datetime import datetime
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 # train.py lives in Projects/san-jacinto/nnue/
@@ -110,12 +103,34 @@ def expand_train_data(entries: list[str], data_root: str) -> list[str]:
 def resolve_lr_bounds(args) -> tuple[float, float]:
     """The (initial_lr, final_lr) pair for the *whole* curriculum.
 
-    Shared by the plot config and the per-stage LR schedule slicing so
+    Shared by the plot config and the trainer environment so
     both always agree on the same global endpoints.
     """
     initial_lr = args.lr_start if args.lr_start is not None else 0.001
     final_lr = args.lr_final if args.lr_final is not None else initial_lr * 0.3 ** 5
     return initial_lr, final_lr
+
+
+def resolve_stage_lengths(superbatches, stage_count):
+    """Broadcast a single stage length, or validate one per expanded dataset."""
+    lengths = [superbatches] if isinstance(superbatches, int) else list(superbatches)
+    if not lengths or any(n < 1 for n in lengths):
+        raise ValueError("--superbatches values must be positive")
+    if len(lengths) == 1:
+        return lengths * stage_count
+    if len(lengths) != stage_count:
+        raise ValueError(f"--superbatches has {len(lengths)} values for {stage_count} "
+                         "resolved dataset stages; pass one value or one per stage")
+    return lengths
+
+
+def build_stage_boundaries(train_stages, lengths, start=1, example="training"):
+    boundaries = []
+    for dataset, length in zip(train_stages, lengths):
+        end = start + length - 1
+        boundaries.append((start, end, os.path.basename(dataset) if dataset else example))
+        start = end + 1
+    return boundaries
 
 
 def _cosine_lr(
@@ -127,8 +142,8 @@ def _cosine_lr(
     """Value of the single, curriculum-wide cosine schedule at `superbatch`.
 
     Deliberately mirrors plot._cosine_lr (same formula, same clamping) so
-    the LR bounds we hand each stage line up exactly with the curve the
-    dashboard draws. Kept as a plain-math duplicate rather than importing
+    the per-stage diagnostic rates line up with the curve the dashboard
+    draws. Kept as a plain-math duplicate rather than importing
     plot.py, since plot.py pulls in matplotlib at import time and this
     needs to work even in --no-plot / no-matplotlib setups.
     """
@@ -185,29 +200,26 @@ def build_env(
         val_data: str | None, 
         start_superbatch: int,
         out_dir: str,
-        lr_start: float | None = None,
-        lr_final: float | None = None,
+        final_superbatch: int,
     ) -> dict:
     env = os.environ.copy()
-    # only set overrides the user actually passed, so example defaults remain
+    initial_lr, final_lr = resolve_lr_bounds(args)
+    # Set the resolved schedule explicitly; leave other unspecified settings
+    # to the example's defaults.
     mapping = {
         "superbatch_start": start_superbatch,
         "superbatches": args.superbatches,
-        # lr_start/lr_final default to the flat global CLI values, but a
-        # curriculum stage passes in the slice of the global cosine
-        # schedule that applies to it (see resolve_lr_bounds / _cosine_lr
-        # and the call site in main()), so bullet's own per-run cosine
-        # decay picks up where the previous stage left off instead of
-        # resetting to the full initial LR each time.
-        "lr_start": lr_start if lr_start is not None else args.lr_start,
-        "lr_final": lr_final if lr_final is not None else args.lr_final,
+        # These global schedule parameters stay identical across stages.
+        "lr_start": initial_lr,
+        "lr_final": final_lr,
+        "lr_final_superbatch": final_superbatch,
         "wdl_start": args.wdl_start,
         "wdl_end": args.wdl_end,
 
         "net_id": args.net_id,
         "output_dir": out_dir,
         "train_data": train_data,
-        "val_data": os.path.join(DATA_ROOT, val_data),
+        "val_data": os.path.join(DATA_ROOT, val_data) if val_data is not None else None,
 
         "save_rate": args.save_rate,
         "batch_size": args.batch_size,
@@ -244,6 +256,39 @@ def stream_output(proc: subprocess.Popen, log_path: str) -> None:
             log.flush()
 
 
+def net_output_dir(args) -> str:
+    """Keep checkpoints, metrics, and logs together for each net."""
+    return os.path.join(NNUE_SJ_ROOT, args.output_dir, args.net_id)
+
+
+def archive_previous_plot(out_dir: str, history_dir: str) -> None:
+    """Start a new plot history while retaining the previous run's files."""
+    if not os.path.isdir(out_dir):
+        return
+
+    paths = []
+    for name in os.listdir(out_dir):
+        if any(
+            name == f"{base}{suffix}"
+            or (name.startswith(f"{base}_stage") and name.endswith(suffix))
+            for base, suffix in (("metrics", ".csv"), ("loss", ".png"))
+        ):
+            path = os.path.join(out_dir, name)
+            if os.path.isfile(path):
+                paths.append(path)
+
+    if not paths:
+        return
+
+    os.makedirs(history_dir, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S_%f")
+    backup_dir = os.path.join(history_dir, timestamp)
+    os.makedirs(backup_dir)
+    for path in paths:
+        shutil.move(path, os.path.join(backup_dir, os.path.basename(path)))
+    print(f"[train] previous plot history saved to {backup_dir}")
+
+
 def run_stage(
     args,
     train_data: str,
@@ -252,13 +297,11 @@ def run_stage(
     start_superbatch: int,
     final_superbatch: int,
     stage_boundaries: list[tuple[int, int, str]],
-    stage_lr_start: float | None = None,
-    stage_lr_final: float | None = None,
     fig=None,
     axes=None,
 ) -> int:
     """Launch one cargo training run and return its exit code."""
-    out_dir = os.path.join(NNUE_SJ_ROOT, args.output_dir)
+    out_dir = net_output_dir(args)
     os.makedirs(out_dir, exist_ok=True)
 
     cmd = build_command(args)
@@ -268,8 +311,7 @@ def run_stage(
         val_data,
         start_superbatch,
         out_dir,
-        lr_start=stage_lr_start,
-        lr_final=stage_lr_final,
+        final_superbatch=final_superbatch,
     )
 
     metrics_csv = os.path.join(out_dir, "metrics.csv")
@@ -283,6 +325,7 @@ def run_stage(
     print(f"[train] stage{stage_label or ' (single run)'}: {train_data}")
     print(f"[train] superbatch_start={env['superbatch_start']}")
     print(f"[train] lr_start={env.get('lr_start')} lr_final={env.get('lr_final')}")
+    print(f"[train] lr_final_superbatch={env['lr_final_superbatch']}")
     print(f"{'=' * 60}")
     print(f"Running: {' '.join(cmd)}")
     print(f"Working dir: {BULLET_ROOT}")
@@ -372,16 +415,19 @@ def main() -> int:
     p.add_argument("--features", default=None, help="cargo features, e.g. cuda / rocm / metal")
 
     # tuning control
-    p.add_argument("--superbatch-start", type=int, default=None)
-    p.add_argument("--superbatches", type=int, default=None)
+    p.add_argument("--superbatch-start", type=int, default=1)
+    p.add_argument("--superbatches", type=int, nargs="+", default=[800], metavar="N",
+                   help="one length for all stages or one per resolved dataset, "
+                        "e.g. 200 400 800 (default: 800 per stage)")
     p.add_argument("--lr_start", type=float, default=None)
     p.add_argument("--lr_final", type=float, default=None)
     p.add_argument("--wdl-start", type=float, default=None)
     p.add_argument("--wdl-end", type=float, default=None)
 
     # data
-    p.add_argument("--net-id", default=None)
-    p.add_argument("--output-dir", default="checkpoints")
+    p.add_argument("--net-id", default=os.environ.get("net_id", "1024x16x32_25wdl"))
+    p.add_argument("--output-dir", default="checkpoints",
+                   help="output root; each net writes to <output-dir>/<net-id>/")
     p.add_argument(
         "--train-data",
         nargs="+",
@@ -389,7 +435,7 @@ def main() -> int:
         help="one or more dataset paths, OR a folder (path or bare name "
         "resolved under data/) whose dataset files are used as sequential "
         "stages in sorted-filename order. Each resulting stage is chained "
-        "via checkpoints (is_later_run=1 from stage 2 onward). Prefix "
+        "via checkpoints (global superbatch numbering). Prefix "
         "filenames like 01_, 02_ to control stage order explicitly."
         "Call folders via  /data/folder1/  and files via  /data/file1.binpack  "
         "with as many files as you want.",
@@ -423,6 +469,12 @@ def main() -> int:
     p.add_argument("--smooth", type=int, default=15, help="train-curve moving-average window")
     p.add_argument("--log-y", action="store_true", help="logarithmic loss axis")
     args = p.parse_args()
+    if args.superbatch_start < 1 or any(n < 1 for n in args.superbatches):
+        p.error("--superbatch-start and --superbatches must be positive")
+    if (not args.net_id or args.net_id in (".", "..", "plot_history")
+            or any(c in args.net_id for c in '/\\<>:"|?*')
+            or args.net_id.endswith((" ", "."))):
+        p.error("--net-id must be a single folder name other than plot_history")
 
     sys.path.insert(0, HERE)
 
@@ -431,16 +483,7 @@ def main() -> int:
     dashboard_fig = None
     dashboard_axes = None
 
-    if not args.no_plot:
-        try:
-            import plot  # local module (python/plot.py)
-            dashboard_fig, dashboard_axes = plot.create_dashboard()
-        except ImportError as e:
-            print(f"[train] matplotlib unavailable ({e}); running without live plot.")
-            print("[train] install with: pip install -r python/requirements.txt")
-            args.no_plot = True
-
-    # cirriculum learning
+    # Curriculum learning
 
     stage_boundaries = []
     train_stages = (
@@ -455,55 +498,26 @@ def main() -> int:
 
     # stage lengths
 
-    start_superbatch = args.superbatch_start or 1
-    total_superbatches = len(train_stages) * args.superbatches
+    start_superbatch = args.superbatch_start
+    try:
+        stage_lengths = resolve_stage_lengths(args.superbatches, len(train_stages))
+    except ValueError as exc:
+        p.error(str(exc))
+    total_superbatches = sum(stage_lengths)
     final_superbatch = start_superbatch + total_superbatches - 1
 
-    if args.superbatches is not None:
-        for i, train_data in enumerate(train_stages):
-            stage_start = start_superbatch + i * args.superbatches
-            stage_end = stage_start + args.superbatches - 1
-
-            stage_boundaries.append(
-                (
-                    stage_start,
-                    stage_end,
-                    os.path.basename(train_data),
-                )
-            )
+    stage_boundaries = build_stage_boundaries(
+        train_stages, stage_lengths, start_superbatch, args.example)
+    for i, (start, end, label) in enumerate(stage_boundaries, 1):
+        print(f"[train] stage {i}: {label} | superbatches {start}-{end} ({end - start + 1})")
 
     multi_stage = len(train_stages) > 1
 
-    # Slice the single, curriculum-wide cosine LR schedule at each stage's
-    # boundaries so consecutive cargo runs hand off the LR continuously
-    # instead of each one resetting to the full initial value. Only
-    # possible once we know the full schedule's shape, i.e. once
-    # --superbatches (a fixed per-stage length) is known.
-    stage_lr_bounds: list[tuple[float, float]] = []
-
-    if args.superbatches is not None:
-        initial_lr, final_lr = resolve_lr_bounds(args)
-
-        for stage_start, stage_end, _label in stage_boundaries:
-            stage_lr_bounds.append(
-                (
-                    _cosine_lr(stage_start, initial_lr, final_lr, final_superbatch),
-                    _cosine_lr(stage_end, initial_lr, final_lr, final_superbatch),
-                )
-            )
-
-        if multi_stage:
-            print(
-                f"[train] curriculum LR schedule: {initial_lr:g} -> {final_lr:g} "
-                f"over superbatches 1-{final_superbatch} (continuous across stages)"
-            )
-    elif multi_stage:
-        print(
-            "[train] warning: --superbatches not set, so the per-stage LR "
-            "schedule can't be sliced from a single curriculum-wide cosine; "
-            "each stage will use the flat --lr_start/--lr_final and bullet "
-            "will reset its cosine decay at every stage boundary."
-        )
+    initial_lr, final_lr = resolve_lr_bounds(args)
+    print(
+        f"[train] global LR schedule: {initial_lr:g} -> {final_lr:g} "
+        f"over superbatches 1-{final_superbatch} (continuous across stages)"
+    )
 
     val_stages: list
     if args.val_data is None:
@@ -520,31 +534,39 @@ def main() -> int:
         )
         return 2
 
+    if not args.no_plot:
+        try:
+            import plot
+            dashboard_fig, dashboard_axes = plot.create_dashboard()
+        except ImportError as e:
+            print(f"[train] matplotlib unavailable ({e}); running without live plot.")
+            args.no_plot = True
+
     try:
+        archive_previous_plot(
+            net_output_dir(args),
+            os.path.join(NNUE_SJ_ROOT, args.output_dir, "plot_history", args.net_id),
+        )
         for i, (train_data, val_data) in enumerate(zip(train_stages, val_stages)):
             stage_label = f"_stage{i + 1}" if multi_stage else ""
 
-            stage_lr_start = None
-            stage_lr_final = None
-            if i < len(stage_lr_bounds):
-                stage_lr_start, stage_lr_final = stage_lr_bounds[i]
-                if multi_stage:
-                    print(
-                        f"[train] stage {i + 1} LR window: "
-                        f"{stage_lr_start:.3g} -> {stage_lr_final:.3g} "
-                        f"(slice of the full curriculum cosine)"
-                    )
+            stage_start, stage_end, _ = stage_boundaries[i]
+            stage_args = argparse.Namespace(**vars(args))
+            stage_args.superbatches = stage_lengths[i]
+            print(
+                f"[train] stage {i + 1} scheduled LR: "
+                f"{_cosine_lr(stage_start, initial_lr, final_lr, final_superbatch):.6g} -> "
+                f"{_cosine_lr(stage_end, initial_lr, final_lr, final_superbatch):.6g}"
+            )
 
             code = run_stage(
-                args,
+                stage_args,
                 train_data=train_data,
                 val_data=val_data,
                 stage_label=stage_label,
-                start_superbatch=start_superbatch,
+                start_superbatch=stage_start,
                 final_superbatch=final_superbatch,
                 stage_boundaries=stage_boundaries,
-                stage_lr_start=stage_lr_start,
-                stage_lr_final=stage_lr_final,
                 fig=dashboard_fig,
                 axes=dashboard_axes,
             )
@@ -555,9 +577,6 @@ def main() -> int:
                     f"(exit {code}); stopping curriculum."
                 )
                 return code
-
-            if args.superbatches is not None:
-                start_superbatch += args.superbatches
 
         return 0
     finally:
