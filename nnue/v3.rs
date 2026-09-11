@@ -161,11 +161,14 @@ fn main() {
             start_superbatch: superbatch_start,
             end_superbatch: stage_end,
         },
-        wdl_scheduler: wdl::LinearWDL { start: wdl_start, end: wdl_end },
+        wdl_scheduler: wdl::LinearWDL { 
+            start: wdl_start, 
+            end: wdl_end 
+        },
         lr_scheduler:lr::Warmup{
             inner: lr::CosineDecayLR { initial_lr, final_lr, final_superbatch: lr_final_superbatch },
             warmup_batches: 10
-        }
+        },
         save_rate: _save_rate,
     };
 
