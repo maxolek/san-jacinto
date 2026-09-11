@@ -8,14 +8,15 @@ Interactive analytics dashboard powered by [Mosaic](https://uwdata.github.io/mos
 # Install Node.js (v18+) if not already installed:
 # https://nodejs.org/
 
-cd dashboard
+cd data/dashboard
 npm install
 npm run dev
 ```
 
-Then open `http://localhost:3000?db=path/to/chess_analytics.duckdb`
+Then open `http://localhost:3000`. Published snapshots load automatically when present.
 
-Or open the dashboard and use the file picker to load `.duckdb` file.
+Use `?local=1` for the file picker, or `?db=https://example.org/file.duckdb`
+to load another HTTP URL. A path on your computer is loaded through the file picker.
 
 ## Architecture
 
@@ -23,15 +24,28 @@ Or open the dashboard and use the file picker to load `.duckdb` file.
 - **Mosaic**: Cross-filtering framework — brush one chart, all linked charts update instantly
 - **Vite**: Dev server and bundler (fast HMR in development, optimized static build)
 
-All queries run in-browser against the analytics file. No data leaves the machine.
+All queries run in-browser. Local files are not uploaded; public snapshots are
+downloaded from the website and can be accessed by its visitors.
 
 ## Building for deployment
+
+First export the data from the repository root:
+
+```bash
+python3 -m data.databases.export_public --archive /tmp/analytics-public.tar.gz
+```
+
+Then build from `data/dashboard`:
 
 ```bash
 npm run build
 ```
 
-Produces a `dist/` folder that can be hosted anywhere (GitHub Pages, Vercel, Netlify, etc).
+Produces a `dist/` folder containing the frontend and exported snapshots.
+The manually triggered GitHub Pages workflow consumes the export as a repository
+release asset. See [public deployment and updates](../../docs/public-dashboard.md).
+Generated snapshots are excluded from Git. Keep the data output directory between
+exports so previous snapshot URLs remain available across updates.
 
 ## Tabs
 

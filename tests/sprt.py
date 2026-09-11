@@ -29,6 +29,20 @@ SEARCH_JSON = SPRT_LOG_DIR / "search.jsonl"
 TIMING_JSON = SPRT_LOG_DIR / "timing.jsonl"
 ROOT_MOVES_JSON = SPRT_LOG_DIR / "root_moves.jsonl"
 
+# cutechess-cli
+
+if system == "Windows": 
+    CUTECHESS_CLI = r"C:\Program Files (x86)\Cute Chess\cutechess-cli.exe" 
+elif system == "Darwin": 
+    CUTECHESS_CLI = (
+        PROJECT_ROOT.parent
+        / "libs"
+        / "cutechess-1.5.1"
+        / "build"
+        / "cutechess-cli"
+    )
+
+
 ######################
 #       MATH         
 ######################
@@ -866,7 +880,7 @@ def parse_args():
     # cutechess
     p.add_argument(
         "--cutechess-cli",
-        default=r"C:\Program Files (x86)\Cute Chess\cutechess-cli.exe",
+        default=str(CUTECHESS_CLI),
         help="Path to cutechess-cli.exe"
     )
 
