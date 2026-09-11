@@ -6,7 +6,7 @@ metrics.csv:
     unix_time,superbatch,batch,split,loss
 
 Dashboard:
-    1. Train / validation loss
+    1. Training loss
     2. Learning-rate schedule
     3. Validation loss / best validation
     4. Validation - training loss gap
@@ -20,28 +20,25 @@ import argparse
 import csv
 import math
 import os
+import textwrap
 import time
+import sys
+from pathlib import Path
 from collections import deque
 from dataclasses import dataclass
 from typing import Dict, List, Tuple
 from matplotlib.ticker import MaxNLocator
 
+# Also support direct execution: python nnue/plot.py ...
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from utils.plotting import PALETTE, TEAL, enable_hover, style_dashboard
+
 
 Series = Dict[str, List[Tuple[float, float]]]
 
 
-# Fixed qualitative palette (matplotlib's "tab10" hex values) so stage
-# colors are stable and legible without needing to import a colormap
-# module before the Agg backend is configured.
-_STAGE_PALETTE = [
-    "#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd",
-    "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22", "#17becf",
-]
-
-# Fixed colors for train vs. validation, used consistently across every
-# panel now that they can live on independent y-axes.
-_TRAIN_COLOR = "tab:blue"
-_VAL_COLOR = "tab:orange"
+_STAGE_PALETTE = PALETTE
+_TRAIN_COLOR = TEAL
 
 
 def _stage_color(index: int) -> str:
@@ -83,13 +80,13 @@ def create_dashboard(figsize: Tuple[float, float] = (16, 10)):
     """
     import matplotlib.pyplot as plt
 
-    fig = plt.figure(figsize=figsize)
+    fig = plt.figure(figsize=figsize, layout="constrained")
 
     gs = fig.add_gridspec(
         3, 2,
-        height_ratios=[1, 1, 0.28],
-        hspace=0.32,
-        wspace=0.18,
+        height_ratios=[1, 1, 0.65],
+        hspace=0.12,
+        wspace=0.12,
     )
 
     axes = {
@@ -100,6 +97,7 @@ def create_dashboard(figsize: Tuple[float, float] = (16, 10)):
         "info": fig.add_subplot(gs[2, :]),
     }
 
+    style_dashboard(fig, axes.values())
     return fig, axes
 
 
@@ -139,8 +137,12 @@ def _moving_average(ys: List[float], k: int) -> List[float]:
     return out
 
 
-def load_metrics(path: str, include_archived: bool = False) -> Series:
-    """Return {split: [(superbatch_fraction, loss), ...]}."""
+def load_metrics(
+    path: str,
+    include_archived: bool = False,
+    batches_per_superbatch: int | None = None,
+) -> Series:
+    """Load global superbatch coordinates, deduplicating stage copies."""
 
     paths = []
 
@@ -178,12 +180,9 @@ def load_metrics(path: str, include_archived: bool = False) -> Series:
     # Current metrics.csv goes last.
     paths.append(path)
 
-    rows: List[Tuple[str, int, int, float]] = []
-    offset = 0  # cumulative superbatch count from earlier stages
+    rows: Dict[Tuple[str, int, int], float] = {}
 
     for metrics_path in paths:
-        file_rows: List[Tuple[str, int, int, float]] = []
-
         try:
             with open(
                 metrics_path,
@@ -192,46 +191,28 @@ def load_metrics(path: str, include_archived: bool = False) -> Series:
             ) as f:
                 for r in csv.DictReader(f):
                     try:
-                        file_rows.append(
-                            (
-                                r["split"],
-                                int(r["superbatch"]),
-                                int(r["batch"]),
-                                float(r["loss"]),
-                            )
-                        )
-                    except (ValueError, KeyError):
+                        key = (r["split"], int(r["superbatch"]), int(r["batch"]))
+                        loss = float(r["loss"])
+                    except (ValueError, KeyError, TypeError):
                         continue
+                    if math.isfinite(loss):
+                        rows[key] = loss
 
         except (FileNotFoundError, OSError):
             continue
 
-        if not file_rows:
-            continue
-
-        # Shift this file's superbatch numbers so they continue on from
-        # the previous stage instead of restarting at 1. Without this,
-        # a new stage's x-values collide with the previous stage's and
-        # get silently dropped as "duplicates" by _merge_series.
-        max_sb_in_file = max(sb for _, sb, _, _ in file_rows)
-
-        for split, sb, batch, loss in file_rows:
-            rows.append((split, offset + sb, batch, loss))
-
-        offset += max_sb_in_file
-
     if not rows:
         return {}
 
-    max_batch = max(
-        batch
-        for _, _, batch, _ in rows
-    ) or 1
+    # Rust already emits global superbatches (stage 2 starts at 601).
+    # Use the configured batch count so old x-values stay fixed as the
+    # first superbatch fills. Standalone plots can infer an approximate scale.
+    batch_count = batches_per_superbatch or (max(batch for _, _, batch in rows) + 1)
 
     series: Series = {}
 
-    for split, sb, batch, loss in rows:
-        x = sb + batch / (max_batch + 1)
+    for (split, sb, batch), loss in rows.items():
+        x = sb + batch / batch_count
 
         series.setdefault(
             split,
@@ -305,7 +286,7 @@ def _set_global_x_scale(
 ) -> None:
     end = _global_stage_end(stages, series, config)
 
-    ax.set_xlim(0.5, end + 0.5)
+    ax.set_xlim(0.5, end + 1)
     _set_integer_x_axis(ax)
 
 
@@ -381,16 +362,16 @@ def _draw_stages(ax, stages) -> None:
     for i, (start, end, _label) in enumerate(stages):
         color = _stage_color(i)
 
-        # Stages are inclusive:
-        # 1–5, 6–10, 11–15.
-        left = start - 0.5
-        right = end + 0.5
+        # Metrics use x = superbatch + batch_fraction, so the final
+        # superbatch occupies [end, end + 1), including its last batches.
+        left = start
+        right = end + 1
 
         ax.axvspan(left, right, color=color, alpha=0.08, zorder=0)
         ax.axvline(left, linestyle="--", alpha=0.35, color=color)
         ax.axvline(right, linestyle="--", alpha=0.35, color=color)
 
-        midpoint = (start + end) / 2
+        midpoint = (left + right) / 2
 
         ymin, ymax = ax.get_ylim()
 
@@ -413,9 +394,11 @@ def _draw_stage_legend(ax, stages) -> None:
     if not stages:
         return
 
-    x = 0.76
+    x = 0.62
     top = 0.92
-    line_height = 0.11
+    labels = [textwrap.wrap(f"stage {i + 1}: {label}", width=56)
+              for i, (_, _, label) in enumerate(stages)]
+    line_height = min(0.14, 0.78 / (1 + sum(len(lines) for lines in labels)))
 
     ax.text(
         x,
@@ -429,20 +412,23 @@ def _draw_stage_legend(ax, stages) -> None:
         fontweight="bold",
     )
 
-    for i, (_start, _end, label) in enumerate(stages):
+    line = 1
+    for i, lines in enumerate(labels):
         color = _stage_color(i)
 
-        ax.text(
-            x,
-            top - (i + 1) * line_height,
-            f"stage {i + 1}: {label}",
-            ha="left",
-            va="top",
-            transform=ax.transAxes,
-            fontsize=8,
-            family="monospace",
-            color=color,
-        )
+        for label in lines:
+            ax.text(
+                x,
+                top - line * line_height,
+                label,
+                ha="left",
+                va="top",
+                transform=ax.transAxes,
+                fontsize=8,
+                family="monospace",
+                color=color,
+            )
+            line += 1
 
 
 def _cosine_lr(
@@ -464,21 +450,6 @@ def _cosine_lr(
     )
 
 
-def _remove_stale_twin(ax) -> None:
-    """Remove a twin y-axis created by a previous render() call.
-
-    ax.clear() only clears the axes it's given -- it doesn't know about
-    (or clear) any twinx() axes layered on top of it from an earlier
-    frame. In watch() mode the same Figure/Axes are reused across many
-    redraws, so without this a stray twin axis (and its lines/labels)
-    would silently accumulate on every refresh.
-    """
-
-    for other in list(ax.figure.axes):
-        if getattr(other, "_bullet_twin_of", None) is ax:
-            other.remove()
-
-
 def _draw_loss(
     ax,
     series: Series,
@@ -488,10 +459,8 @@ def _draw_loss(
     stages,
 ) -> None:
     ax.clear()
-    _remove_stale_twin(ax)
 
     train_points = series.get("train", [])
-    val_points = series.get("val", [])
 
     handles: List = []
     labels: List[str] = []
@@ -506,6 +475,7 @@ def _draw_loss(
             alpha=0.20,
             linewidth=0.8,
             color=_TRAIN_COLOR,
+            label="train (raw)",
         )
 
         (h_train,) = ax.plot(
@@ -531,76 +501,13 @@ def _draw_loss(
             color=_TRAIN_COLOR,
         )
 
-    # Train and validation loss are frequently on very different scales
-    # (different batch composition, different loss weighting, etc). A
-    # shared y-axis then flattens whichever series has the smaller
-    # range, so validation gets its own axis instead.
-    ax2 = None
-
-    if val_points:
-        ax2 = ax.twinx()
-        ax2._bullet_twin_of = ax
-
-        xs = [x for x, _ in val_points]
-        ys = [y for _, y in val_points]
-
-        (h_val,) = ax2.plot(
-            xs,
-            ys,
-            marker="o",
-            markersize=3,
-            linewidth=1.5,
-            color=_VAL_COLOR,
-            label="validation",
-        )
-
-        handles.append(h_val)
-        labels.append("validation")
-
-        last_x, last_y = xs[-1], ys[-1]
-
-        ax2.annotate(
-            f"{last_y:.5f}",
-            xy=(last_x, last_y),
-            xytext=(6, 0),
-            textcoords="offset points",
-            fontsize=9,
-            va="center",
-            color=_VAL_COLOR,
-        )
-
-        best = _best_validation(series)
-
-        if best is not None:
-            bx, by = best
-
-            h_best = ax2.scatter(
-                [bx],
-                [by],
-                marker="*",
-                s=100,
-                zorder=5,
-                color=_VAL_COLOR,
-                label=f"best val ({by:.5f})",
-            )
-
-            handles.append(h_best)
-            labels.append(f"best val ({by:.5f})")
-
-        _set_percentile_ylim(ax2, val_points)
-        ax2.set_ylabel("validation loss", color=_VAL_COLOR)
-        ax2.tick_params(axis="y", labelcolor=_VAL_COLOR)
-
-        if log_y:
-            ax2.set_yscale("log")
-
     if log_y:
         ax.set_yscale("log")
 
     ax.set_xlabel("superbatch")
     ax.set_ylabel("training loss", color=_TRAIN_COLOR)
     ax.tick_params(axis="y", labelcolor=_TRAIN_COLOR)
-    ax.set_title("Training / validation loss")
+    ax.set_title("Training loss")
     ax.grid(True, alpha=0.3)
 
     if handles:
@@ -656,7 +563,7 @@ def _draw_lr(ax, series: Series, config: PlotConfig | None, stages) -> None:
         for x in xs
     ]
 
-    ax.plot(xs, ys, linewidth=2, label="cosine LR")
+    ax.plot(xs, ys, linewidth=2, label="planned global cosine")
 
     latest = max_x
 
@@ -672,15 +579,16 @@ def _draw_lr(ax, series: Series, config: PlotConfig | None, stages) -> None:
         [current_lr],
         s=45,
         zorder=5,
-        label=f"current: {current_lr:.3g}",
+        label=f"planned at current SB: {current_lr:.3g}",
     )
 
-    ax.set_xlim(0.5, final_sb + 0.5)
+    ax.set_xlim(0.5, final_sb + 1)
     _set_integer_x_axis(ax)
 
     ax.set_xlabel("superbatch")
     ax.set_ylabel("learning rate")
-    ax.set_title("Learning-rate schedule")
+    ax.set_ylim(bottom=0)
+    ax.set_title("Planned learning-rate schedule (not measured)")
     ax.grid(True, alpha=0.3)
     ax.legend(loc="best", fontsize=8)
 
@@ -748,7 +656,7 @@ def _draw_wdl(ax, series: Series, config: PlotConfig | None, stages) -> None:
         label=f"current: {current:.4f}",
     )
 
-    ax.set_xlim(0.5, final_sb + 0.5)
+    ax.set_xlim(0.5, final_sb + 1)
     _set_integer_x_axis(ax)
 
     ax.set_xlabel("superbatch")
@@ -970,17 +878,14 @@ def _draw_info(
                 f"Net: {config.net_id}"
             )
 
-        # Dataset paths are also captured per-stage in the stage legend
-        # (when stages are provided), so they're kept here too for the
-        # no-stages case.
         if config.train_data is not None:
             right_lines.append(
-                f"Train: {config.train_data}"
+                f"Train: {os.path.basename(config.train_data)}"
             )
 
         if config.val_data is not None:
             right_lines.append(
-                f"Val: {config.val_data}"
+                f"Val: {os.path.basename(config.val_data)}"
             )
 
     ax.text(
@@ -995,9 +900,10 @@ def _draw_info(
     )
 
     ax.text(
-        0.31,
+        0.28,
         0.92,
-        "\n".join(right_lines),
+        "\n".join(textwrap.fill(line, width=44, subsequent_indent="  ")
+                  for line in right_lines),
         ha="left",
         va="top",
         transform=ax.transAxes,
@@ -1092,6 +998,21 @@ def render(
         fontsize=15,
         fontweight="bold",
     )
+    style_dashboard(fig, axes.values())
+    chart_axes = [ax for key, ax in axes.items() if key != "info"]
+    formatters = {}
+    for ax in chart_axes:
+        for line in ax.lines:
+            if line.get_transform() != ax.transData:
+                continue
+            def tooltip(index, line=line):
+                x, y = line.get_xdata()[index], line.get_ydata()[index]
+                stage = next((f"Stage {i + 1}: {label}\nSuperbatches {start}-{end}"
+                              for i, (start, end, label) in enumerate(stages or [])
+                              if start <= x < end + 1), "")
+                return f"{line.get_label()}\nSuperbatch: {x:.6g}\nValue: {y:.8g}" + (f"\n{stage}" if stage else "")
+            formatters[line] = tooltip
+    enable_hover(fig, chart_axes, formatters)
 
 
 def _title_for(path: str) -> str:
@@ -1139,7 +1060,10 @@ def one_shot(
 
     started_at = time.time()
 
-    series = load_metrics(path, include_archived=True)
+    series = load_metrics(
+        path, include_archived=True,
+        batches_per_superbatch=config.batches_per_superbatch if config else None,
+    )
 
     render(
         series,
@@ -1152,8 +1076,6 @@ def one_shot(
         config=config,
         started_at=started_at,
     )
-
-    fig.tight_layout(rect=(0, 0, 1, 0.94))
 
     save_figure(fig, out_png)
 
@@ -1207,9 +1129,15 @@ def watch(
             loaded = load_metrics(
                 path,
                 include_archived=True,
+                batches_per_superbatch=config.batches_per_superbatch if config else None,
             )
 
-            history = _merge_series(history, loaded)
+            # Without a fixed batch count, inferred fractions can change.
+            # Replace the snapshot instead of retaining obsolete x-values.
+            if config and config.batches_per_superbatch:
+                history = _merge_series(history, loaded)
+            elif loaded:
+                history = loaded
             series = history
 
             render(
@@ -1224,7 +1152,6 @@ def watch(
                 started_at=started_at,
             )
 
-            fig.tight_layout(rect=(0, 0, 1, 0.94))
             fig.canvas.draw_idle()
 
             consecutive_errors = 0
@@ -1257,8 +1184,14 @@ def watch(
     # (and the on-screen window, if still open) reflect the very latest
     # metrics even if the last write raced the interval/stop check.
     try:
-        loaded = load_metrics(path, include_archived=True)
-        history = _merge_series(history, loaded)
+        loaded = load_metrics(
+            path, include_archived=True,
+            batches_per_superbatch=config.batches_per_superbatch if config else None,
+        )
+        if config and config.batches_per_superbatch:
+            history = _merge_series(history, loaded)
+        elif loaded:
+            history = loaded
 
         render(
             history,
@@ -1271,8 +1204,6 @@ def watch(
             config=config,
             started_at=started_at,
         )
-
-        fig.tight_layout(rect=(0, 0, 1, 0.94))
 
         if plt.fignum_exists(fig.number):
             fig.canvas.draw_idle()

@@ -30,6 +30,13 @@ fn env_i16(key: &str, default: i16) -> i16 {
         .unwrap_or(default)
 }
 
+fn env_f32(key: &str, default: f32) -> f32 {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
+}
+
 fn env_string(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.to_string())
 }
@@ -46,7 +53,12 @@ fn main() {
     let initial_lr          = env_f32("lr_start", 0.001);
     let final_lr            = env_f32("lr_final", initial_lr * 0.3f32.powi(5));
     let superbatches        = env_usize("superbatches", 800);
-    let superbatch_start    = env_usize("superbatch_start", 0);
+    let superbatch_start    = env_usize("superbatch_start", 1);
+    assert!(superbatch_start > 0 && superbatches > 0, "Training steps must be positive");
+    let stage_end          = superbatch_start + superbatches - 1;
+    // Bullet indexes LR by global superbatch, including after checkpoint loads.
+    let lr_final_superbatch = env_usize("lr_final_superbatch", stage_end);
+    assert!(lr_final_superbatch >= stage_end, "LR schedule must cover the entire stage");
     let wdl_start           = env_f32("wdl_start", 0.25);
     let wdl_end             = env_f32("wdl_end", 0.25);
 
@@ -90,7 +102,7 @@ fn main() {
                 .quantise::<i16>(qa),
             SavedFormat::id("l0b").round().quantise::<i16>(qa),
             SavedFormat::id("l1w").round().quantise::<i8>(qb),
-            SavedFormat::id("l1b").round().quantise::<i32>(qa * qb),
+            SavedFormat::id("l1b").round().quantise::<i32>(i32::from(qa) * i32::from(qb)),
         ])
         .loss_fn(|output, target| output.sigmoid().squared_error(target))
         .build(|builder, stm_inputs, ntm_inputs, output_buckets| {
@@ -119,10 +131,10 @@ fn main() {
             batch_size: _batch_size,
             batches_per_superbatch: _batches,
             start_superbatch: superbatch_start,
-            end_superbatch: superbatch_start + superbatches - 1,
+            end_superbatch: stage_end,
         },
         wdl_scheduler: wdl::LinearWDL { start: wdl_start, end: wdl_end },
-        lr_scheduler: lr::CosineDecayLR { initial_lr, final_lr, final_superbatch: superbatches },
+        lr_scheduler: lr::CosineDecayLR { initial_lr, final_lr, final_superbatch: lr_final_superbatch },
         save_rate: _save_rate,
     };
 
