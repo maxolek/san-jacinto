@@ -75,76 +75,56 @@ Arrows indicate foreign-key direction (parent → child).
 
 ## Analytics Layer — DuckDB (`chess_analytics.duckdb`)
 
+Stored facts remain at their original grain. SQL views calculate metrics and
+join metadata when queried; the pipeline no longer builds a wide fact table.
+
 ```mermaid
-graph TD
-    subgraph Analytics["chess_analytics.duckdb — DuckDB"]
-
-        subgraph Dims["Dimension Tables"]
-            ENG2["<b>engines</b><br/><i>Copy from raw</i>"]
-            EXP2["<b>experiments</b><br/><i>Copy from raw</i>"]
-            RAT2["<b>engine_ratings</b><br/><i>+ engine_name, engine_version</i>"]
-            GS["<b>game_stats</b><br/><i>Games with text result/termination, ECO</i>"]
-            DIM["<b>dim_positions</b><br/><i>Unique (search_id, fen)</i>"]
-            SPRT2["<b>sprt_runs</b><br/><i>SPRT results</i>"]
-            STS3["<b>sts_runs</b><br/><i>STS results</i>"]
-        end
-
-        subgraph Facts["Fact Tables"]
-            SS["<b>search_stats</b><br/><i>Searches + Stockfish eval columns</i>"]
-            IDS["<b>iterative_deepening_stats</b><br/><i>Per-iteration raw stats</i>"]
-            STS2["<b>search_tree_stats</b><br/><i>Per-tree-ply raw stats</i>"]
-            ST["<b>search_timings</b><br/><i>Function-level timing</i>"]
-            RM2["<b>root_moves</b><br/><i>Per-move root scores</i>"]
-        end
-
-        subgraph Features["Feature Tables (transforms)"]
-            PF["<b>position_features</b><br/><i>Position analysis & Stockfish eval comparison</i>"]
-            SIF["<b>search_iteration_features</b><br/><i>Derived per-iteration metrics<br/>(nps, ebf, qratio, stability)</i>"]
-            STF["<b>search_tree_features</b><br/><i>Derived per-ply metrics<br/>(ratios, ebf per tree depth)</i>"]
-        end
-
-        subgraph Wide["Wide Fact Table"]
-            SF["<b>search_features</b><br/><i>Main denormalized wide table<br/>for dashboarding & analysis</i>"]
-        end
-
-        MIG2["<b>schema_migrations</b><br/><i>Applied migrations</i>"]
-
-        SS --> SIF
-        IDS --> SIF
-
-        STS2 --> STF
-
-        SS --> PF
-        DIM --> PF
-
-        SS --> SF
-        SIF --> SF
-        ST --> SF
-        PF --> SF
-        ENG2 --> SF
-        GS --> SF
-    end
-
-    style SF fill:#1a0a2e,stroke:#ff6b35,stroke-width:3px,color:#fff
-    style SS fill:#1a1f2e,stroke:#00d2ff,stroke-width:2px,color:#fff
-    style IDS fill:#1a1f2e,stroke:#00d2ff,stroke-width:2px,color:#fff
-    style STS2 fill:#1a1f2e,stroke:#00d2ff,stroke-width:2px,color:#fff
-    style ST fill:#1a1f2e,stroke:#00d2ff,stroke-width:2px,color:#fff
-    style RM2 fill:#1a1f2e,stroke:#00d2ff,stroke-width:2px,color:#fff
-    style PF fill:#1a2e1a,stroke:#7fff6b,stroke-width:2px,color:#fff
-    style SIF fill:#1a2e1a,stroke:#7fff6b,stroke-width:2px,color:#fff
-    style STF fill:#1a2e1a,stroke:#7fff6b,stroke-width:2px,color:#fff
-    style ENG2 fill:#2d1b00,stroke:#f7b731,stroke-width:2px,color:#fff
-    style GS fill:#2d1b00,stroke:#f7b731,stroke-width:2px,color:#fff
-    style DIM fill:#2d1b00,stroke:#f7b731,stroke-width:2px,color:#fff
-    style MIG2 fill:#1a1f2e,stroke:#8892a4,stroke-width:1px,color:#aaa
+flowchart TD
+    S[(search_stats)] --> M[search_metrics]
+    M --> C[search_context]
+    E[(engines / game_stats / sts_runs)] --> C
+    M --> P[search_position_metrics]
+    PF[(position_features)] --> P
+    I[(iterative_deepening_stats)] --> IM[search_iteration_metrics]
+    IM --> IF[search_iteration_features]
+    IF --> IS[search_iteration_summary]
+    T[(search_tree_stats)] --> TF[search_tree_features]
+    ST[(search_timings)] --> TS[search_timing_summary]
+    C --> COMP[search_features: compatibility view]
+    PF --> COMP
+    IS --> COMP
+    TS --> COMP
+    M --> DASH[Dashboard queries and aggregations]
+    C --> DASH
+    P --> DASH
+    IM --> DASH
+    TF --> DASH
+    ST --> DASH
 ```
 
-| Layer | Tables | Purpose |
-|-------|--------|---------|
-| Dimensions (7) | `engines`, `experiments`, `engine_ratings`, `game_stats`, `dim_positions`, `sprt_runs`, `sts_runs` | Context/lookup tables |
-| Facts (5) | `search_stats`, `iterative_deepening_stats`, `search_tree_stats`, `search_timings`, `root_moves` | Raw search measurement data |
-| Features (3) | `position_features`, `search_iteration_features`, `search_tree_features` | Derived metrics via Python + SQL transforms |
-| Wide Fact (1) | `search_features` | Denormalized join of all above — primary dashboard source |
+| Relation | Storage / grain | Purpose |
+|---|---|---|
+| `search_stats` | Table: search ID | Search facts and stored Stockfish evaluations |
+| `iterative_deepening_stats` | Table: search ID + iteration depth | Iteration facts |
+| `search_tree_stats` | Table: search ID + tree depth | Tree facts |
+| `search_timings` | Table: search ID + function | Timing facts |
+| `root_moves` | Table: recorded root move ID | Root move observations |
+| `engines`, `experiments`, `engine_ratings`, `game_stats`, `sprt_runs`, `sts_runs` | Tables at their source entity grain | Metadata and results |
+| `dim_positions`, `position_features` | Tables: search ID | Position inputs and expensive Python analysis |
+| `search_metrics` | View: search ID | Ratios, totals, aliases, evaluation difference; no joins |
+| `search_context` | View: search ID | Metrics with engine, game, and STS metadata |
+| `search_position_metrics` | View: search ID | Metrics with stored position analysis |
+| `search_iteration_metrics` | View: search ID + iteration depth | Counters and ratios without windows |
+| `search_iteration_features` | View: search ID + iteration depth | Metrics with branching and stability windows |
+| `search_tree_features` | View: search ID + tree depth | Tree ratios and branching factors |
+| `search_iteration_summary` | View: search ID | Aggregated iteration features, for consumers that need them |
+| `search_timing_summary` | View: search ID | Timing pivot, for compatibility consumers |
+| `search_features` | View: search ID | Compatibility join for existing notebooks/scripts |
 
-Arrows indicate data flow into derived tables.
+The compatibility view aggregates each child relation before joining, so
+iterations and timing functions do not multiply search counts. Metadata IDs
+and `position_features.search_id` must remain unique. Dashboard queries use
+focused views, and timing/root-move tabs query their fact tables directly.
+
+See [OLAP migration](olap-migration.md) for commands, metric definitions,
+validation, and refresh/performance limitations.

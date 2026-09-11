@@ -55,9 +55,27 @@ Produces a `dist/` folder that can be hosted anywhere (GitHub Pages, Vercel, Net
 
 ## Data requirements
 
-Expects a DuckDB file with these tables (from analytics pipeline):
+Expects a DuckDB file with these relations (from analytics pipeline):
 - `engines`, `experiments`, `game_stats`
-- `search_stats` or `search_features`
-- `iterative_deepening_stats` or `search_iteration_features`
-- `search_tree_stats` or `search_tree_features`
+- `search_metrics` for search-level counters and ratios
+- `search_context` for engine/game/STS metadata
+- `search_position_metrics` for position analysis
+- `search_iteration_metrics`, `search_tree_features` for per-depth charts
+- `search_iteration_features` for optional branching/stability window queries
 - `search_timings`, `root_moves`, `sprt_runs`
+
+The analytics relations are SQL views over facts. Charts aggregate at query
+time; no wide fact table is required. The old `search_features` name remains
+a compatibility view for analysis scripts. Older analytics files with physical
+feature tables are still detected, but should be migrated for consistent columns.
+
+To migrate an existing database without reloading facts or rerunning Stockfish:
+
+```bash
+python -m data.transforms.transform_search
+python -m data.databases.test_schema
+```
+
+Run these commands from the repository root. `CHESS_ANALYTICS_DB` selects a
+database path. Reload the database in the dashboard after migration.
+See [migration details](../../docs/olap-migration.md).

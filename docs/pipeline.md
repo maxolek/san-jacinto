@@ -21,14 +21,12 @@ graph TD
         RUN["run_analytics_pipeline.py<br/><i>Pipeline orchestrator</i>"]
 
         LOAD["load_analytics.py<br/><i>Import raw tables</i>"]
-        MIG["migrate_schema.py<br/><i>Schema migrations</i>"]
         TP["transform_positions.py<br/><i>Position features</i>"]
-        TS["transform_search.py<br/><i>Search features</i>"]
+        TS["transform_search.py<br/><i>Install SQL analytics views</i>"]
 
         RUN -.->|"1"| LOAD
-        LOAD -.->|"2"| MIG
-        MIG -.->|"3"| TP
-        TP -.->|"4"| TS
+        LOAD -.->|"2"| TP
+        TP -.->|"3"| TS
     end
 
     subgraph Analytics["Analytics Layer"]
@@ -50,7 +48,6 @@ graph TD
     SQLITE -->|"source data"| RUN
 
     LOAD --> DUCK
-    MIG --> DUCK
     TP --> DUCK
     TS --> DUCK
 
@@ -69,6 +66,4 @@ graph TD
     style APP fill:#1a0a2e,stroke:#ff6b35,stroke-width:3px,color:#fff
     style RUN fill:#0a2e1a,stroke:#7fff6b,stroke-width:3px,color:#fff
 
-    linkStyle 4,5,6,7,8,9,10,11,12,13,14,15,16 stroke:#00d2ff,stroke-width:2.5px
-    linkStyle 0,1,2,3,17 stroke:#8892a4,stroke-width:1.5px,stroke-dasharray:5
 ```

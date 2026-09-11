@@ -14,11 +14,11 @@ const METRIC_OPTIONS = [
 
 export async function renderOpenings() {
   const tables = window.__tables || [];
-  const searchTable = getSearchTable();
+  const searchTable = getSearchTable('context');
 
-  // Need either game_stats (with opening) or search_features (with game_opening)
+  // Opening counts use games; search-depth analysis uses the metadata view.
   const hasGames = tables.includes('game_stats');
-  const hasFeatures = searchTable === 'search_features';
+  const hasFeatures = Boolean(searchTable);
 
   if (!hasGames && !hasFeatures) {
     return el('div', { class: 'panel' }, el('p', {}, 'No game or search data with opening information found.'));
@@ -95,7 +95,7 @@ export async function renderOpenings() {
         );
         plotContainer.appendChild(bar);
       } else {
-        plotContainer.appendChild(el('p', {}, 'Depth by opening requires search_features table.'));
+        plotContainer.appendChild(el('p', {}, 'Depth by opening requires analytics views. Run the analytics pipeline.'));
       }
 
     } else if (metric === 'eco') {

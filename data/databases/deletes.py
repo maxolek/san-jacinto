@@ -3,6 +3,7 @@ import duckdb
 from pathlib import Path
 import argparse
 from ..etl.paths import RAW_DB, ANALYTICS_DB
+from ..transforms.transform_search import ANALYTICS_VIEWS
 
 def drop_all_tables(db_path) -> None:
     """
@@ -18,6 +19,14 @@ def drop_all_tables(db_path) -> None:
     if not is_duckdb: cur.execute("PRAGMA foreign_keys = OFF;")
 
     if is_duckdb:
+        # Views must be dropped with DROP VIEW, including legacy feature names.
+        for name in reversed(ANALYTICS_VIEWS):
+            kind = cur.execute("""
+                SELECT table_type FROM information_schema.tables
+                WHERE table_catalog = current_database() AND table_schema = 'main' AND table_name = ?
+            """, [name]).fetchone()
+            if kind and kind[0] == 'VIEW':
+                cur.execute(f'DROP VIEW "{name}"')
         tables = [
             "search_timings",
             "iterative_deepening_stats",
@@ -115,8 +124,15 @@ def clear_all_tables(db_path, exclude_engines=False) -> None:
     deleted_info = []
 
     for table in tables:
+        if is_duckdb:
+            kind = cur.execute("""
+                SELECT table_type FROM information_schema.tables
+                WHERE table_catalog = current_database() AND table_schema = 'main' AND table_name = ?
+            """, [table]).fetchone()
+            if not kind or kind[0] == 'VIEW':
+                continue
         cur.execute(f"DELETE FROM {table};")
-        count = cur.rowcount  # rows affected
+        count = cur.fetchone()[0] if is_duckdb else cur.rowcount
         total_deleted += count
         deleted_info.append((table, count))
 

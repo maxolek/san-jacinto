@@ -82,13 +82,15 @@ def load_full(cnxn):
     cnxn.execute("""
         CREATE TABLE engine_ratings AS
         SELECT
-            r.id, r.engine_id  
+            r.id, r.engine_id,
             e.name as engine_name, 
             e.version as engine_version,
+            cast(r.elo_ultra_fast AS INTEGER) AS elo_ultra_fast,
             cast(r.elo_bullet AS INTEGER) AS elo_bullet,
             cast(r.elo_blitz AS INTEGER) AS elo_blitz,
             cast(r.elo_rapid AS INTEGER) AS elo_rapid,
             cast(r.elo_classical AS INTEGER) AS elo_classical,
+            r.games_ultra_fast AS games_ultra_fast,
             r.games_bullet AS games_bullet,
             r.games_blitz AS games_blitz,
             r.games_rapid AS games_rapid,
@@ -383,15 +385,8 @@ def load_incremental(cnxn):
         before = cnxn.execute("SELECT COUNT(*) FROM search_stats").fetchone()[0]
         cnxn.execute("BEGIN TRANSACTION")
         cnxn.execute(f"""
-                     INSERT INTO search_stats 
-                     SELECT *, 
-                        CAST(NULL AS INTEGER)   AS sf_eval, 
-                        CAST(NULL AS TEXT)      AS sf_best_move, 
-                        CAST(NULL AS DOUBLE)    AS sf_time_ms, 
-                        CAST(NULL AS TIMESTAMP) AS sf_computed_at, 
-                        CAST(NULL AS TEXT)      AS sf_pv ,
-                        CAST(NULL AS INTEGER)   AS eval_diff,
-                     FROM raw.searches 
+                     INSERT INTO search_stats BY NAME
+                     SELECT * FROM raw.searches
                      WHERE id > {max_id}
         """)
         cnxn.execute("COMMIT")

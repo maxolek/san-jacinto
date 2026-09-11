@@ -9,7 +9,7 @@ import mvp_worker from '@duckdb/duckdb-wasm/dist/duckdb-browser-mvp.worker.js?ur
 import duckdb_wasm_eh from '@duckdb/duckdb-wasm/dist/duckdb-eh.wasm?url';
 import eh_worker from '@duckdb/duckdb-wasm/dist/duckdb-browser-eh.worker.js?url';
 import * as vg from '@uwdata/vgplot';
-import { getCount, getTables, tableExists } from './connection.js';
+import { useAnalyticsDatabase } from './connection.js';
 import { renderOverview } from './views/overview.js';
 import { renderSearch } from './views/search.js';
 import { renderGames } from './views/games.js';
@@ -86,8 +86,8 @@ async function init() {
     const dbPath = getDbPath();
     
     if (dbPath) {
-      await coordinator().exec(`ATTACH '${dbPath}' AS db (READ_ONLY)`);
-      await coordinator().exec(`USE db`);
+      await coordinator().exec(`ATTACH '${dbPath.replaceAll("'", "''")}' AS db (READ_ONLY)`);
+      await useAnalyticsDatabase();
     } else {
       // Show file picker
       showFilePicker(status);
@@ -140,8 +140,8 @@ function showFilePicker(status) {
       // Register buffer with the DuckDB instance directly
       const db = window.__duckdb;
       await db.registerFileBuffer(file.name, uint8);
-      await coordinator().exec(`ATTACH '${file.name}' AS db (READ_ONLY)`);
-      await coordinator().exec(`USE db`);
+      await coordinator().exec(`ATTACH '${file.name.replaceAll("'", "''")}' AS db (READ_ONLY)`);
+      await useAnalyticsDatabase();
       
       status.textContent = 'Connected';
       status.className = 'connected';

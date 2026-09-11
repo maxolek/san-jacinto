@@ -6,6 +6,26 @@
  */
 import { coordinator } from '@uwdata/mosaic-core';
 
+let _ready = false;
+
+/**
+ * Keep Mosaic's preaggregation caches in a writable, in-memory database.
+ * Temporary aliases expose attached facts/views without copying their data.
+ */
+export async function useAnalyticsDatabase() {
+  _ready = false;
+  await coordinator().exec('USE memory');
+  const relations = await coordinator().query(`
+    SELECT table_name FROM information_schema.tables
+    WHERE table_catalog = 'db' AND table_schema = 'main'
+  `);
+  for (const { table_name } of relations) {
+    const name = '"' + table_name.replaceAll('"', '""') + '"';
+    await coordinator().exec(`CREATE OR REPLACE TEMP VIEW ${name} AS SELECT * FROM db.main.${name}`);
+  }
+  _ready = true;
+}
+
 /**
  * Run a raw SQL query and return results as an array of objects.
  */

@@ -18,7 +18,7 @@ const VIEW_OPTIONS = [
 ];
 
 export async function renderMoveOrder() {
-  const searchTable = getSearchTable();
+  const searchTable = getSearchTable('context');
   const iterTable = getIterTable();
   const treeTable = getTreeTable();
 
@@ -76,9 +76,10 @@ export async function renderMoveOrder() {
         UNION ALL SELECT 'Idx 8+', SUM(total_fh_index_8plus)::DOUBLE / NULLIF(SUM(total_fail_highs),0), 5 FROM ${searchTable} WHERE total_fh_index_0 IS NOT NULL
       `);
       const plot = vg.plot(
-        vg.barX(vg.from('fh_dist'), { x: 'ratio', y: 'bucket', fill: 'bucket', sort: { y: 'ord' } }),
+        vg.barX(vg.from('fh_dist'), { x: 'ratio', y: 'bucket', fill: 'bucket' }),
         vg.width(700), vg.height(250), vg.marginLeft(100),
         vg.xLabel('Fraction of Fail-Highs'), vg.yLabel('Move Index Bucket'),
+        vg.yDomain(BUCKET_LABELS),
         vg.colorDomain(BUCKET_LABELS), vg.colorRange(COLORS),
       );
       plotContainer.appendChild(plotPanel('Overall Fail-High Distribution by Move Index', plot));
@@ -186,13 +187,7 @@ export async function renderMoveOrder() {
         WHERE total_fh_index_0 IS NOT NULL
         GROUP BY engine_name
       `);
-      const plot = vg.plot(
-        vg.barY(vg.from('fh_by_engine'), { x: 'engine_name', y: 'idx0_ratio', fill: COLORS[0] }),
-        vg.barY(vg.from('fh_by_engine'), { x: 'engine_name', y: 'idx1_ratio', fill: COLORS[1], offset: 'zero' }),
-        vg.width(700), vg.height(300), vg.marginLeft(70),
-        vg.xLabel('Engine Version'), vg.yLabel('Idx 0 (TT) Ratio'),
-      );
-      // Simpler: just show the TT/hash move hit rate per engine
+      // Show the TT/hash move hit rate per engine.
       const plot2 = vg.plot(
         vg.barY(vg.from('fh_by_engine'), { x: 'engine_name', y: 'idx0_ratio', fill: COLORS[0] }),
         vg.width(700), vg.height(280), vg.marginLeft(70), vg.marginBottom(60),

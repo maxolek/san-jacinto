@@ -37,7 +37,7 @@ export async function renderQuality() {
       COUNT(*) as total_with_sf,
       AVG(ABS(eval - sf_eval)) as mae,
       MEDIAN(ABS(eval - sf_eval)) as median_ae,
-      AVG(CASE WHEN move = sf_best_move THEN 1.0 ELSE 0.0 END) as best_move_match_rate,
+      AVG(best_move_match) as best_move_match_rate,
       STDDEV(eval - sf_eval) as eval_diff_std
     FROM ${searchTable}
     WHERE sf_eval IS NOT NULL AND eval IS NOT NULL
