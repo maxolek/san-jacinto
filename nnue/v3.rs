@@ -233,7 +233,10 @@ fn main() {
             superbatch_start - 1
         );
 
-        trainer.load_from_checkpoint(&checkpoint);
+        // reset weights without adam-optimizer momentums
+        //  idea/hope - prevent huge stage change validation jumps
+        trainner.load_weights_from_file(&checkpoint + "/optimiser_state/weights.bin")
+        //trainer.load_from_checkpoint(&checkpoint);
     }
 
     trainer.run_with_validation(
