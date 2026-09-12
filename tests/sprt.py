@@ -37,7 +37,7 @@ elif system == "Darwin":
     CUTECHESS_CLI = (
         PROJECT_ROOT.parent
         / "libs"
-        / "cutechess-1.5.1"
+        / "cutechess"
         / "build"
         / "cutechess-cli"
     )

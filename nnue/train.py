@@ -50,12 +50,11 @@ import threading
 from datetime import datetime
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-# train.py lives in Projects/san-jacinto/nnue/
+# train.py lives in /san-jacinto/nnue/
 SAN_JACINTO_ROOT = os.path.dirname(HERE)
 NNUE_SJ_ROOT = os.path.join(SAN_JACINTO_ROOT, "nnue")
-# Bullet lives in Projects/libs/bullet/
-PROJECTS_ROOT = os.path.dirname(SAN_JACINTO_ROOT)
-BULLET_ROOT = os.path.join(PROJECTS_ROOT, "libs", "bullet")
+# Bullet lives in /san-jacinto/libs/bullet/
+BULLET_ROOT = os.path.join(SAN_JACINTO_ROOT, "libs", "bullet")
 DATA_ROOT = os.path.join(BULLET_ROOT, "data")
 
 DATASET_EXTENSIONS = (".binpack", ".bin")

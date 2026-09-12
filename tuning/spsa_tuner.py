@@ -599,7 +599,7 @@ def parse_args():
     p.add_argument("--baseline", default=None,
                    help="Path to baseline engine (for validation only, not used in tuning)")
     p.add_argument("--cutechess-cli",
-                   default=r"C:\Program Files (x86)\Cute Chess\cutechess-cli.exe")
+                   default=r"libs\Cute Chess\cutechess-cli.exe")
 
     # Time control
     p.add_argument("--tc", type=str, default=None, help="Time control (e.g. 0:1+0.01)")

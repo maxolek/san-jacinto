@@ -1,0 +1,6 @@
+[submodule "libs/cutechess"]
+	path = libs/cutechess
+	url = https://github.com/cutechess/cutechess.git
+[submodule "libs/bullet"]
+	path = libs/bullet
+	url = https://github.com/jw1912/bullet.git

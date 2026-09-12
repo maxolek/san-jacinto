@@ -318,7 +318,7 @@ def parse_args():
                    help="Path to baseline engine (default: same as --engine, "
                         "running the current parameter values)")
     p.add_argument("--cutechess-cli",
-                   default=r"C:\Program Files (x86)\Cute Chess\cutechess-cli.exe")
+                   default=r"libs\Cute Chess\cutechess-cli.exe")
 
     # Time control
     p.add_argument("--tc", type=str, default=None)

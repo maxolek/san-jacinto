@@ -672,7 +672,7 @@ def main(argv=None):
     parser.add_argument("--book", default=str(PROJECT_ROOT / "bin" / "opening_books" / "8moves_v3.pgn"))
     parser.add_argument("--concurrency", default=2, type=int, help="Number of games to run simultaneously (uses 2*concurrency threads)")
     parser.add_argument("--cutechess-cli",
-                        default=r"C:\Program Files (x86)\Cute Chess\cutechess-cli.exe")
+                        default=r"libs\Cute Chess\cutechess-cli.exe")
  
     # Accept a pre-built Namespace (programmatic callers like release.py)
     # as well as a raw argv list / sys.argv (CLI callers).
