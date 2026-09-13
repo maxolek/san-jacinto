@@ -186,29 +186,11 @@ fn main() {
         batch_queue_size: 64,
     };
 
-    // ========================================================
-    // Train with validation
-    // ========================================================
-
-    // cirriculum learning
-    //  if this is not superbatch 1, then we are loading from a trained net
-    //  so we load the last checkpoint (start-1) and continue
-    if superbatch_start > 1 {
-        let checkpoint = format!(
-            "{}/{}-{}",
-            output_dir,
-            net_id,
-            superbatch_start - 1
-        );
-
-        trainer.load_from_checkpoint(&checkpoint);
-    }
-
-    trainer.run_with_validation(
+    trainer.run(
         &schedule,
         &settings,
         &train_loader,
-        &val_loader,
+        Some(&val_loader), // None
     );
 
 }
