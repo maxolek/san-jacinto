@@ -1,4 +1,4 @@
-"""Paired-game SPRT in logistic Elo, independent of cutechess and plotting.
+"""Paired-game SPRT in logistic Elo, independent of fastchess and plotting.
 
 Support is the candidate's mean score in a color-reversed opening pair:
 LL, LD, DD/WL, WD, WW -> 0, .25, .5, .75, 1. The generalized likelihood
@@ -84,9 +84,11 @@ class PentanomialSPRT:
 
     A pair may finish out of order, but it is not tested until all preceding
     pairs are complete. Unknown/unfinished outcomes are never counted as draws.
+    With sequential=False the bounds are never applied (result "fixed"): every
+    pair is counted, for fixed-length matches that only estimate Elo.
     """
 
-    def __init__(self, elo0, elo1, alpha=0.05, beta=0.05):
+    def __init__(self, elo0, elo1, alpha=0.05, beta=0.05, sequential=True):
         if not all(math.isfinite(x) for x in (elo0, elo1, alpha, beta)):
             raise ValueError("SPRT parameters must be finite")
         if elo0 == elo1 or not all(0 < elo_to_score(x) < 1 for x in (elo0, elo1)):
@@ -94,6 +96,7 @@ class PentanomialSPRT:
         if not (0 < alpha < 1 and 0 < beta < 1 and alpha + beta < 1):
             raise ValueError("alpha and beta must be positive with alpha + beta < 1")
         self.elo0, self.elo1 = elo0, elo1
+        self.sequential = sequential
         self.lbound = math.log(beta / (1 - alpha))
         self.ubound = math.log((1 - beta) / alpha)
         self.counts = [0] * 5
@@ -101,7 +104,12 @@ class PentanomialSPRT:
         self.next_pair = 0
         self.wdl = {color: [0, 0, 0] for color in ("white", "black")}
         self.llr = 0.0
-        self.result = "inconclusive"
+        self.result = "inconclusive" if sequential else "fixed"
+
+    @property
+    def decided(self):
+        """An SPRT bound has been crossed (never for fixed-length matches)."""
+        return self.sequential and self.result != "inconclusive"
 
     def add_game(self, number, white, black, result):
         if number < 1 or {white, black} != {"Candidate", "Baseline"}:
@@ -115,7 +123,7 @@ class PentanomialSPRT:
             return []
         self.games[number] = game
         updates = []
-        while self.result == "inconclusive":
+        while not self.decided:
             first = 2 * self.next_pair + 1
             if first not in self.games or first + 1 not in self.games:
                 break
@@ -130,9 +138,9 @@ class PentanomialSPRT:
             self.counts[round(2 * sum(scores))] += 1
             self.next_pair += 1
             self.llr = compute_llr(self.counts, self.elo0, self.elo1)
-            if self.llr >= self.ubound:
+            if self.sequential and self.llr >= self.ubound:
                 self.result = "pass"
-            elif self.llr <= self.lbound:
+            elif self.sequential and self.llr <= self.lbound:
                 self.result = "fail"
             updates.append(self.snapshot())
         return updates

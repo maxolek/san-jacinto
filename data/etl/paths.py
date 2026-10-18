@@ -60,3 +60,15 @@ else:
 
 RAW_DB = Path(os.environ.get("CHESS_RAW_DB") or _DEFAULT_RAW)
 ANALYTICS_DB = Path(os.environ.get("CHESS_ANALYTICS_DB") or _DEFAULT_ANALYTICS)
+
+# How long a raw-database connection waits for another program's write (one side of an
+# SPRT's telemetry is a single transaction; a long run's takes minutes) before it gives
+# up with "database is locked". sqlite3's default is 5 seconds.
+RAW_DB_TIMEOUT_S = 1800
+
+
+def connect_raw(path=None, **kwargs):
+    """Connect to the raw database (default RAW_DB), waiting for concurrent writers."""
+    import sqlite3
+    kwargs.setdefault("timeout", RAW_DB_TIMEOUT_S)
+    return sqlite3.connect(str(path or RAW_DB), **kwargs)

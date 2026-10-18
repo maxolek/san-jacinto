@@ -9,7 +9,7 @@ from pathlib import Path
 import re
 import queue 
 import threading
-from .paths import RAW_DB
+from .paths import RAW_DB, connect_raw
 
 
 # -----------------------
@@ -130,7 +130,7 @@ def get_db(path=None):
     """Get a SQLite connection with Row factory."""
     if path is None:
         path = str(RAW_DB)
-    cnxn = sqlite3.connect(path)
+    cnxn = connect_raw(path)
     cnxn.row_factory = sqlite3.Row
     return cnxn
 
@@ -161,7 +161,7 @@ def register_engine(cnxn, engine):
             name        = input("  Enter a name for this engine version (or press Enter to skip): ").strip()
             description = input("  Enter a description for this engine version (or press Enter to skip): ").strip()
             if not description: 
-                description = f"Auto-registered from {engine_path}"
+                description = f"Auto-registered from {Path(engine_path).name}"  # no folders: they hold user names
 
         move_overhead_ms = _int_option(options, "Move Overhead")
         max_threads = _int_option(options, "Threads")
@@ -229,9 +229,16 @@ def register_engine(cnxn, engine):
         lmr_move_order_threshold = engine.get("lmr_move_order_threshold")
         lmr_depth_threshold = engine.get("lmr_depth_threshold")
 
-    # Check if engine with this version already exists
-    # Check if engine with this version already exists
-    if version:
+    # An engine is identified by its build (binary + net) when that is known:
+    # several builds can share a version string. Otherwise by version, as before.
+    if engine.get("engine_key"):
+        existing = cnxn.execute(
+            "SELECT id FROM engines WHERE engine_key=?", (engine["engine_key"],)
+        ).fetchone()
+        if existing is not None:
+            print(f"[ETL] Engine {name} ({version}) already registered with ID {existing[0]}")
+            return existing[0]
+    elif version:
         existing = cnxn.execute(
             "SELECT id FROM engines WHERE version=?", (version,)
         ).fetchone()
@@ -284,9 +291,9 @@ def register_engine(cnxn, engine):
 
 
 def get_engine_id(cnxn, version=None):
-    """Look up engine ID by version string."""
+    """Look up engine ID by version string (the newest build when several share it)."""
     row = cnxn.execute(
-        "SELECT id FROM engines WHERE version=?",
+        "SELECT id FROM engines WHERE version=? ORDER BY id DESC",
         (version,)
     ).fetchone()
 
@@ -298,7 +305,7 @@ def get_engine_id(cnxn, version=None):
         )
 
         row = cnxn.execute(
-            "SELECT id FROM engines WHERE version=?",
+            "SELECT id FROM engines WHERE version=? ORDER BY id DESC",
             (version,)
         ).fetchone()
 
@@ -370,6 +377,8 @@ def probe_engine_metadata(engine_path, timeout=10.0):
                     meta["version"] = line[len("id version"):].strip()
                 elif line.startswith("id author"):
                     meta["author"] = line[len("id author"):].strip()
+                elif line.startswith("info string "):
+                    meta.setdefault("info_strings", []).append(line[len("info string "):].strip())
                 elif line.startswith("option name "):
                     m = re.match(r'^option name (.+?) type (\w+)(?: default (".*?"|[^ ]+))?(?: min ([^ ]+))?(?: max ([^ ]+))?', line)
                     if m:
@@ -411,10 +420,7 @@ def probe_engine_metadata(engine_path, timeout=10.0):
         meta["options"] = options
         return meta
 
-    try:
-        return _run_probe("uci_dev")
-    except RuntimeError:
-        return _run_probe("uci")
+    return _run_probe("uci")
 
 
 def save_engine_config(engine_path, config_name, timeout=10.0):

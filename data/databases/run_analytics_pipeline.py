@@ -17,7 +17,8 @@ MODULES = [
     "data.transforms.transform_positions",
     "data.transforms.transform_search",
     "data.transforms.validate",
-    "data.databases.test_schema",
+    # data.databases.test_schema (the analytics schema check) exists only in the
+    #       improving-testing-environment-dashboard worktree; it comes with that merge
 ]
 
 

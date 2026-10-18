@@ -25,7 +25,24 @@ PUBLIC_TABLES = (
     'search_stats', 'iterative_deepening_stats', 'search_tree_stats',
     'search_timings', 'root_moves', 'dim_positions', 'position_features',
 )
+# Local details never published: file paths (they contain user names), branch names, and
+# the full provenance record (paths, dirty file names). Hashes and the commit stay.
+PRIVATE_COLUMNS = {'engines': ('binary_path', 'net_path', 'git_branch', 'provenance')}
+# Free text published without the folders of any absolute path in it (older rows were
+# auto-described as "Auto-registered from <full exe path>"); the file names stay.
+SCRUBBED_COLUMNS = {'engines': {'description': (
+    r"regexp_replace(regexp_replace(description, '^(Auto-registered from ).*[\\/]', '\1'), "
+    r"'(^|\s)(?:[A-Za-z]:)?[\\/](?:[^\s\\/]*[\\/])+', '\1', 'g')")}}
 SNAPSHOT_NAME = re.compile(r'[0-9a-f]{64}\.duckdb')
+
+
+def public_select(c, table):
+    """SELECT list copying `table` from the attached source without its private details."""
+    columns = {row[0] for row in c.execute(f'DESCRIBE source.main."{table}"').fetchall()}
+    private = [col for col in PRIVATE_COLUMNS.get(table, ()) if col in columns]
+    scrubbed = [f'{expr} AS {col}' for col, expr in SCRUBBED_COLUMNS.get(table, {}).items() if col in columns]
+    return ('*' + (f' EXCLUDE ({", ".join(private)})' if private else '')
+            + (f' REPLACE ({", ".join(scrubbed)})' if scrubbed else ''))
 
 
 def sha256(path):
@@ -57,7 +74,8 @@ def export_public(source=ANALYTICS_DB, output=DATA_DIR / 'dashboard/public/data'
             c.execute('BEGIN TRANSACTION')
             try:
                 for table in PUBLIC_TABLES:
-                    c.execute(f'CREATE TABLE "{table}" AS SELECT * FROM source.main."{table}"')
+                    c.execute(f'CREATE TABLE "{table}" AS SELECT {public_select(c, table)} '
+                              f'FROM source.main."{table}"')
                 c.execute('COMMIT')
             except Exception:
                 c.execute('ROLLBACK')

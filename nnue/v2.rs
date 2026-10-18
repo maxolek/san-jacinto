@@ -42,6 +42,29 @@ fn env_string(key: &str, default: &str) -> String {
 }
 
 
+/// Linear WDL taper over the whole curriculum. bullet's LinearWDL tapers over
+/// each run (its `max` is the run's last superbatch), so a multi-stage
+/// curriculum would restart the ramp at every stage; this one is indexed by the
+/// global superbatch, like the cosine LR schedule.
+#[derive(Clone, Debug)]
+struct CurriculumWDL {
+    start: f32,
+    end: f32,
+    final_superbatch: usize,
+}
+
+impl wdl::WdlScheduler for CurriculumWDL {
+    fn blend(&self, _batch: usize, superbatch: usize, _max: usize) -> f32 {
+        let span = self.final_superbatch.saturating_sub(1).max(1) as f32;
+        let progress = (superbatch.saturating_sub(1) as f32 / span).min(1.0);
+        self.start + (self.end - self.start) * progress
+    }
+
+    fn colourful(&self) -> String {
+        format!("linear taper {} -> {} over superbatches 1-{}", self.start, self.end, self.final_superbatch)
+    }
+}
+
 
 fn main() {
     // hyperparams to fiddle with
@@ -61,6 +84,8 @@ fn main() {
     assert!(lr_final_superbatch >= stage_end, "LR schedule must cover the entire stage");
     let wdl_start           = env_f32("wdl_start", 0.25);
     let wdl_end             = env_f32("wdl_end", 0.25);
+    // WDL taper spans whole cirriculum, like LR schedule
+    let wdl_final_superbatch   = env_usize("wdl_final_superbatch", lr_final_superbatch);
 
     let net_id              = env_string("net_id", "1024x16x32_25wdl");
     let output_dir          = env_string("output_dir", "checkpoints");
@@ -133,8 +158,15 @@ fn main() {
             start_superbatch: superbatch_start,
             end_superbatch: stage_end,
         },
-        wdl_scheduler: wdl::LinearWDL { start: wdl_start, end: wdl_end },
-        lr_scheduler: lr::CosineDecayLR { initial_lr, final_lr, final_superbatch: lr_final_superbatch },
+        wdl_scheduler: wdl::CirriculumWDL { 
+            start: wdl_start, 
+            end: wdl_end,
+            final_superbatch: wdl_final_superbatch
+        },
+        lr_scheduler: lr::Warmup{
+            inner: lr::CosineDecayLR { initial_lr, final_lr, final_superbatch: lr_final_superbatch },
+            warmup_batches: 10
+        },
         save_rate: _save_rate,
     };
 
@@ -144,8 +176,7 @@ fn main() {
 
     use loader::sfbinpack::SfBinpackLoader;
 
-    /*
-    fn filter(entry: &loader::sfbinpack::TrainingDataEntry) -> bool {
+    let train_filter: fn(&loader::sfbinpack::TrainingDataEntry) -> bool {
         use loader::sfbinpack::{MoveType,PieceType,};
         entry.ply >= 16
             && !entry.pos.is_checked(entry.pos.side_to_move())
@@ -153,14 +184,15 @@ fn main() {
             && entry.mv.mtype() == MoveType::Normal
             && entry.pos.piece_at(entry.mv.to()).piece_type()== PieceType::None
     }
-    */
+
+    let val_filter: fn(&loader::sfbinpack::TrainingDataEntry) -> bool = |_| true;
 
     let train_loader =
         SfBinpackLoader::new(
             &train_path,
             1024,
             _threads,
-            |_| true, //|_| true, //filter,
+            train_filter
         );
 
     let val_loader =
@@ -168,7 +200,7 @@ fn main() {
             &val_path,
             256,
             _threads/2,
-            |_| true, //|_| true, //filter,
+            val_filter
         );
 
     // ========================================================
@@ -179,8 +211,8 @@ fn main() {
         threads: _threads,
         test_set: Some(
             TestDataset::at(&val_path)
-            .freq(_batches) // once per superbatch
-            .batches(256), // ~ 4 million validation positions (x * _batch_size)
+            .freq(0) // once per superbatch
+            .batches(1_000_000), // ~ 4 million validation positions (x * _batch_size)
         ),
         output_directory: &output_dir,
         batch_queue_size: 64,
@@ -190,25 +222,28 @@ fn main() {
     // Train with validation
     // ========================================================
 
-    // cirriculum learning
-    //  if this is not superbatch 1, then we are loading from a trained net
-    //  so we load the last checkpoint (start-1) and continue
+    // Curriculum stages and resumed runs continue from the checkpoint the previous
+    // run saved at superbatch_start - 1 (train.py checks that it exists). With
+    // reset_optimiser=1 only the weights are loaded and AdamW starts from zero moments.
     if superbatch_start > 1 {
-        let checkpoint = format!(
-            "{}/{}-{}",
-            output_dir,
-            net_id,
-            superbatch_start - 1
-        );
-
-        trainer.load_from_checkpoint(&checkpoint);
+        let checkpoint = format!("{output_dir}/{net_id}-{}", superbatch_start - 1);
+        if env_usize("reset_optimiser", 0) == 1 {
+            println!("Loading weights (fresh optimiser state) from {checkpoint}");
+            trainer
+                .optimiser
+                .load_weights_from_file(&format!("{checkpoint}/optimiser_state/weights.bin"))
+                .unwrap_or_else(|e| panic!("could not load weights from {checkpoint}: {e:?}"));
+        } else {
+            println!("Loading checkpoint {checkpoint}");
+            trainer.load_from_checkpoint(&checkpoint);
+        }
     }
 
-    trainer.run_with_validation(
-        &schedule,
-        &settings,
+    trainer.run(
+        &schedule, 
+        &settings, 
         &train_loader,
-        &val_loader,
+        Some(&val_loader), // None
     );
 
 }

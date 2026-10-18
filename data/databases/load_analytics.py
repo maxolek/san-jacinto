@@ -64,6 +64,38 @@ def _max_id(cnxn, table: str, id_col: str = 'id') -> int:
     return result[0]
 
 
+def _sync_columns(cnxn, table: str, select_sql: str) -> list:
+    """Add to `table` the columns `select_sql` returns that it lacks, e.g. a raw column a
+    migration added after the analytics table was built (earlier rows get NULL)."""
+    have = {row[0] for row in cnxn.execute(f'DESCRIBE "{table}"').fetchall()}
+    added = []
+    for name, dtype, *_ in cnxn.execute(f"DESCRIBE SELECT * FROM ({select_sql}) AS q").fetchall():
+        if name not in have:
+            cnxn.execute(f'ALTER TABLE "{table}" ADD COLUMN "{name}" {dtype}')
+            added.append(name)
+    return added
+
+
+def _append(cnxn, table: str, select_sql: str) -> int:
+    """Insert the rows of `select_sql` into `table` by column name, adding new columns first.
+
+    One transaction: on failure neither the columns nor the rows are kept.
+    Returns the number of rows inserted.
+    """
+    before = cnxn.execute(f'SELECT COUNT(*) FROM "{table}"').fetchone()[0]
+    cnxn.execute("BEGIN TRANSACTION")
+    try:
+        added = _sync_columns(cnxn, table, select_sql)
+        cnxn.execute(f'INSERT INTO "{table}" BY NAME SELECT * FROM ({select_sql}) AS q')
+        cnxn.execute("COMMIT")
+    except Exception:
+        cnxn.execute("ROLLBACK")
+        raise
+    if added:
+        print(f"    {table}: new columns {', '.join(added)} (NULL for earlier rows)")
+    return cnxn.execute(f'SELECT COUNT(*) FROM "{table}"').fetchone()[0] - before
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Full refresh (original behaviour)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -261,10 +293,7 @@ def load_incremental(cnxn):
         totals['sprt_runs'] = cnxn.execute("SELECT COUNT(*) FROM sprt_runs").fetchone()[0]
     else:
         max_id = _max_id(cnxn, 'sprt_runs')
-        before = cnxn.execute("SELECT COUNT(*) FROM sprt_runs").fetchone()[0]
-        cnxn.execute("BEGIN TRANSACTION")
-        cnxn.execute(f"""
-            INSERT INTO sprt_runs
+        totals['sprt_runs'] = _append(cnxn, 'sprt_runs', f"""
             SELECT * REPLACE (
                         CAST(alpha AS DOUBLE) AS alpha,
                         CAST(beta AS DOUBLE) AS beta,
@@ -273,9 +302,6 @@ def load_incremental(cnxn):
                     )
             FROM raw.sprt WHERE id > {max_id}
         """)
-        cnxn.execute("COMMIT")
-        after = cnxn.execute("SELECT COUNT(*) FROM sprt_runs").fetchone()[0]
-        totals['sprt_runs'] = after - before
 
     # ── sts_runs ──
     print("  [incr] Syncing sts_runs...")
@@ -291,19 +317,13 @@ def load_incremental(cnxn):
         totals['sts_runs'] = cnxn.execute("SELECT COUNT(*) FROM sts_runs").fetchone()[0]
     else:
         max_id = _max_id(cnxn, 'sts_runs')
-        before = cnxn.execute("SELECT COUNT(*) FROM sts_runs").fetchone()[0]
-        cnxn.execute("BEGIN TRANSACTION")
-        cnxn.execute(f"""
-            INSERT INTO sts_runs
+        totals['sts_runs'] = _append(cnxn, 'sts_runs', f"""
             SELECT * REPLACE (
                         list_extract(string_split(suite, '\\'), -1) AS suite
                     ),
                     trim(split_part(position_name, '-', 2)) as position_type
             FROM raw.sts WHERE id > {max_id}
         """)
-        cnxn.execute("COMMIT")
-        after = cnxn.execute("SELECT COUNT(*) FROM sts_runs").fetchone()[0]
-        totals['sts_runs'] = after - before
 
     # ── game_stats ──
     print("  [incr] Syncing game_stats...")
@@ -336,10 +356,7 @@ def load_incremental(cnxn):
         totals['game_stats'] = cnxn.execute("SELECT COUNT(*) FROM game_stats").fetchone()[0]
     else:
         max_id = _max_id(cnxn, 'game_stats')
-        before = cnxn.execute("SELECT COUNT(*) FROM game_stats").fetchone()[0]
-        cnxn.execute("BEGIN TRANSACTION")
-        cnxn.execute(f"""
-            INSERT INTO game_stats
+        totals['game_stats'] = _append(cnxn, 'game_stats', f"""
             WITH openings AS (
                 SELECT * EXCLUDE (opening),
                      get_opening_name(moves) as opening,
@@ -363,9 +380,6 @@ def load_incremental(cnxn):
                     )
                 FROM openings
         """)
-        cnxn.execute("COMMIT")
-        after = cnxn.execute("SELECT COUNT(*) FROM game_stats").fetchone()[0]
-        totals['game_stats'] = after - before
 
     # ── search_stats ──
     print("  [incr] Syncing search_stats...")
@@ -382,16 +396,7 @@ def load_incremental(cnxn):
         totals['search_stats'] = cnxn.execute("SELECT COUNT(*) FROM search_stats").fetchone()[0]
     else:
         max_id = _max_id(cnxn, 'search_stats')
-        before = cnxn.execute("SELECT COUNT(*) FROM search_stats").fetchone()[0]
-        cnxn.execute("BEGIN TRANSACTION")
-        cnxn.execute(f"""
-                     INSERT INTO search_stats BY NAME
-                     SELECT * FROM raw.searches
-                     WHERE id > {max_id}
-        """)
-        cnxn.execute("COMMIT")
-        after = cnxn.execute("SELECT COUNT(*) FROM search_stats").fetchone()[0]
-        totals['search_stats'] = after - before
+        totals['search_stats'] = _append(cnxn, 'search_stats', f"SELECT * FROM raw.searches WHERE id > {max_id}")
 
     # ── iterative_deepening_stats ──
     print("  [incr] Syncing iterative_deepening_stats...")
@@ -400,12 +405,8 @@ def load_incremental(cnxn):
         totals['iterative_deepening_stats'] = cnxn.execute("SELECT COUNT(*) FROM iterative_deepening_stats").fetchone()[0]
     else:
         max_id = _max_id(cnxn, 'iterative_deepening_stats', id_col='search_id')
-        before = cnxn.execute("SELECT COUNT(*) FROM iterative_deepening_stats").fetchone()[0]
-        cnxn.execute("BEGIN TRANSACTION")
-        cnxn.execute(f"INSERT INTO iterative_deepening_stats SELECT * FROM raw.searches_by_iteration WHERE search_id > {max_id}")
-        cnxn.execute("COMMIT")
-        after = cnxn.execute("SELECT COUNT(*) FROM iterative_deepening_stats").fetchone()[0]
-        totals['iterative_deepening_stats'] = after - before
+        totals['iterative_deepening_stats'] = _append(
+            cnxn, 'iterative_deepening_stats', f"SELECT * FROM raw.searches_by_iteration WHERE search_id > {max_id}")
 
     # ── search_tree_stats ──
     print("  [incr] Syncing search_tree_stats...")
@@ -414,12 +415,8 @@ def load_incremental(cnxn):
         totals['search_tree_stats'] = cnxn.execute("SELECT COUNT(*) FROM search_tree_stats").fetchone()[0]
     else:
         max_id = _max_id(cnxn, 'search_tree_stats', id_col='search_id')
-        before = cnxn.execute("SELECT COUNT(*) FROM search_tree_stats").fetchone()[0]
-        cnxn.execute("BEGIN TRANSACTION")
-        cnxn.execute(f"INSERT INTO search_tree_stats SELECT * FROM raw.searches_by_tree_depth WHERE search_id > {max_id}")
-        cnxn.execute("COMMIT")
-        after = cnxn.execute("SELECT COUNT(*) FROM search_tree_stats").fetchone()[0]
-        totals['search_tree_stats'] = after - before
+        totals['search_tree_stats'] = _append(
+            cnxn, 'search_tree_stats', f"SELECT * FROM raw.searches_by_tree_depth WHERE search_id > {max_id}")
 
     # ── search_timings ──
     print("  [incr] Syncing search_timings...")
@@ -428,12 +425,7 @@ def load_incremental(cnxn):
         totals['search_timings'] = cnxn.execute("SELECT COUNT(*) FROM search_timings").fetchone()[0]
     else:
         max_id = _max_id(cnxn, 'search_timings', id_col='search_id')
-        before = cnxn.execute("SELECT COUNT(*) FROM search_timings").fetchone()[0]
-        cnxn.execute("BEGIN TRANSACTION")
-        cnxn.execute(f"INSERT INTO search_timings SELECT * FROM raw.timing WHERE search_id > {max_id}")
-        cnxn.execute("COMMIT")
-        after = cnxn.execute("SELECT COUNT(*) FROM search_timings").fetchone()[0]
-        totals['search_timings'] = after - before
+        totals['search_timings'] = _append(cnxn, 'search_timings', f"SELECT * FROM raw.timing WHERE search_id > {max_id}")
 
     # ── root_moves ──
     print("  [incr] Syncing root_moves...")
@@ -442,12 +434,7 @@ def load_incremental(cnxn):
         totals['root_moves'] = cnxn.execute("SELECT COUNT(*) FROM root_moves").fetchone()[0]
     else:
         max_id = _max_id(cnxn, 'root_moves')
-        before = cnxn.execute("SELECT COUNT(*) FROM root_moves").fetchone()[0]
-        cnxn.execute("BEGIN TRANSACTION")
-        cnxn.execute(f"INSERT INTO root_moves SELECT * FROM raw.root_moves WHERE id > {max_id}")
-        cnxn.execute("COMMIT")
-        after = cnxn.execute("SELECT COUNT(*) FROM root_moves").fetchone()[0]
-        totals['root_moves'] = after - before
+        totals['root_moves'] = _append(cnxn, 'root_moves', f"SELECT * FROM raw.root_moves WHERE id > {max_id}")
 
     # ── dim_positions (derived from search_stats) ──
     print("  [incr] Syncing dim_positions...")
@@ -460,16 +447,10 @@ def load_incremental(cnxn):
         totals['dim_positions'] = cnxn.execute("SELECT COUNT(*) FROM dim_positions").fetchone()[0]
     else:
         max_id = _max_id(cnxn, 'dim_positions', id_col='search_id')
-        before = cnxn.execute("SELECT COUNT(*) FROM dim_positions").fetchone()[0]
-        cnxn.execute("BEGIN TRANSACTION")
-        cnxn.execute(f"""
-            INSERT INTO dim_positions
+        totals['dim_positions'] = _append(cnxn, 'dim_positions', f"""
             SELECT id as search_id, fen, game_id, sts_id
             FROM raw.searches WHERE id > {max_id}
         """)
-        cnxn.execute("COMMIT")
-        after = cnxn.execute("SELECT COUNT(*) FROM dim_positions").fetchone()[0]
-        totals['dim_positions'] = after - before
 
     # ── Summary ──
     print("\n  Incremental load summary:")

@@ -28,19 +28,11 @@ STS_JSON = STS_LOGS_DIR / "sts_suite.jsonl"
 # --------------------------
 
 def upload_logs(args):
-    if system == "Windows": cnxn = sqlite3.connect('F:/databases/chess.db')
-    elif system == "Darwin": cnxn = sqlite3.connect(Path.home() / "Documents/databases/chess.db")
-
+    cnxn = etl.connect_raw()
     cnxn.row_factory = sqlite3.Row 
 
-    # probe metadata
-    meta = etl.probe_engine_metadata(args.engine)
-    engine_id = etl.get_engine_id(cnxn, version=meta["version"])
-
-    # auto-register if not found
-    if engine_id is None:
-        print(f"[STS] Engine {meta['version']} not registered, registering now...")
-        engine_id = etl.register_engine(cnxn, {"engine_path": args.engine})
+    # the engine's build (binary + net hash), registered if new
+    engine_id = etl.resolve_engine(cnxn, args.engine)
 
     # log
     sts_id = etl.start_experiment(
@@ -83,11 +75,13 @@ def upload_logs(args):
 # --------------------------
 # Run engine and get eval/bestmove
 # --------------------------
-def run_eval(engine, fen, depth=8, time=None):
+def run_eval(engine, fen, depth=8, time=None, nodes=None):
     """Send position and go eval command, return (score, bestmove)."""
     # position + eval
     engine.stdin.write(f"position fen {fen}\n".encode())
-    if time is not None: 
+    if nodes is not None:
+        engine.stdin.write(f"go eval nodes {nodes}\n".encode())
+    elif time is not None: 
         engine.stdin.write(f"go eval movetime {time}\n".encode())
     else: 
         engine.stdin.write(f"go eval depth {depth}\n".encode())
@@ -247,7 +241,7 @@ def moves_to_uci(board, expected_moves):
 # --------------------------
 # Run STS for a single file
 # --------------------------
-def run_sts_file(engine_path, epd_file, depth=8, time = None, log_file = None):
+def run_sts_file(engine_path, epd_file, depth=8, time = None, log_file = None, nodes=None):
     engine_dir = os.path.dirname(os.path.abspath(engine_path))
     engine = subprocess.Popen(
         [engine_path],
@@ -288,10 +282,10 @@ def run_sts_file(engine_path, epd_file, depth=8, time = None, log_file = None):
         avoid_moves = moves_to_uci(board, avoid_moves_raw)
 
         print(f"[STS] {epd_file}: position {i}")
-        score, bestmove = run_eval(engine, fen, depth, time)
+        score, bestmove = run_eval(engine, fen, depth, time, nodes)
         total += 1
 
-        move_ok = (expected_moves and bestmove in expected_moves) or (avoid_moves and bestmove not in avoid_moves)
+        move_ok = bool((expected_moves and bestmove in expected_moves) or (avoid_moves and bestmove not in avoid_moves))
         if move_ok:
             correct += 1
         category_stats.setdefault(cat, {"total": 0, "correct": 0})
@@ -357,6 +351,8 @@ def parse_args():
     parser.add_argument("--engine", default="./src/tomahawk.exe", help="Path to UCI engine")
     parser.add_argument("--time", type=int, default=None, help = "Move time in MS")
     parser.add_argument("--depth", type=int, default=None, help = "Search depth")
+    parser.add_argument("--nodes", type=int, default=None,
+                        help="Nodes per position (hardware-independent; the engine must honour go nodes)")
     parser.add_argument("--sts", nargs="+", default=["./bin/STS"], help="One or more EPD files and/or folders")
     #parser.add_argument("--log_dir", default="./logs/sts_logs/", help="Output log directory")
 
@@ -366,6 +362,10 @@ def parse_args():
 def main(args=None):
     if args is None: 
         args = parse_args()
+    nodes = getattr(args, "nodes", None)
+    if nodes is not None:
+        from utils.uci_probe import require_node_limit
+        require_node_limit([args.engine])
 
     #log_dir = os.path.abspath(args.log_dir)
     #os.makedirs(log_dir, exist_ok=True)
@@ -384,7 +384,7 @@ def main(args=None):
 
     for epd_file in epd_files:
         print(f"\n=== Running STS file: {epd_file} ===")
-        summary = run_sts_file(args.engine, epd_file, args.depth, args.time, log_f)
+        summary = run_sts_file(args.engine, epd_file, args.depth, args.time, log_f, nodes)
         all_summaries.append(summary)
         print(f"File summary: {summary['correct']}/{summary['total']} correct ({summary['accuracy']:.1f}%)")
         global_total += summary['total']

@@ -13,7 +13,7 @@ Better for eval tuning (irrelevant under nnue framework, except HP tuning of tra
 CMA-ES parameter tuner .
 
 Uses Covariance Matrix Adaptation Evolution Strategy for black-box
-optimization of search parameters. Wraps cutechess-cli as the game oracle.
+optimization of search parameters. Wraps fastchess as the game oracle.
 
 Advantages over SPSA:
   - No learning rate to tune (adapts automatically)
@@ -38,6 +38,10 @@ import copy
 import numpy as np
 from pathlib import Path
 from datetime import datetime, timezone
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(PROJECT_ROOT))
+from utils import cpu_slots, uci_probe
 
 try:
     import cma
@@ -100,11 +104,11 @@ DEFAULT_PARAMS = {
 
 
 # ============================================================================
-# Cutechess integration
+# fastchess integration
 # ============================================================================
 
 def build_option_string(params_dict, param_names, values):
-    """Build cutechess option string for a parameter vector."""
+    """Build fastchess option string for a parameter vector."""
     options = []
     for name, val in zip(param_names, values):
         cfg = params_dict[name]
@@ -115,19 +119,22 @@ def build_option_string(params_dict, param_names, values):
 
 
 def evaluate_candidate(engine_path, baseline_path, params_dict, param_names, candidate,
-                       games, tc_args, book_args, concurrency, cutechess_cli,
-                       baseline_opts=None):
+                       games, tc_args, book_args, concurrency, fastchess,
+                       baseline_opts=None, affinity=()):
     """
     Evaluate a candidate by playing against the baseline.
     The baseline runs with `baseline_opts` (the current parameter values) so it
     represents the engine as currently configured. Returns score (higher = better).
+    `affinity`: fastchess options pinning each game to its own cpu (cpu_slots.fastchess_args).
     """
     opts_candidate = build_option_string(params_dict, param_names, candidate)
     if baseline_opts is None:
         baseline_opts = []
 
     cmd = [
-        cutechess_cli,
+        fastchess,
+        # fastchess saves a resume file on exit; a single evaluation has nothing to resume
+        "-config", f"outname={os.devnull}",
         "-engine", "name=Candidate", f"cmd={engine_path}",
         f"dir={os.path.dirname(engine_path)}",
     ] + opts_candidate + [
@@ -136,25 +143,34 @@ def evaluate_candidate(engine_path, baseline_path, params_dict, param_names, can
     ] + baseline_opts + [
         "-each", "proto=uci",
     ] + tc_args + [
-        "-games", str(games),
-        "-repeat",
-        "-concurrency", str(concurrency),
+        # every opening twice with colors reversed; at most 2 games per round
+        "-games", "2",
+        "-rounds", str(max(1, -(-games // 2))),
+        "-concurrency", str(concurrency), "-force-concurrency",
         "-maxmoves", "100",
     ] + book_args + [
         "-wait", "50",
-    ]
+    ] + list(affinity)
 
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=7200)
 
-    score_re = re.compile(
-        r"Score of Candidate vs Baseline:\s*(\d+)\s*-\s*(\d+)\s*-\s*(\d+)"
-    )
+    # Per-game result lines (White first), e.g.:
+    #   Finished game 3 (Candidate vs Baseline): 1-0 {White mates}
+    finished_re = re.compile(r"Finished game (\d+) \((.+?) vs (.+?)\):\s*(\S+)")
 
     W, L, D = 0, 0, 0
     for line in result.stdout.splitlines():
-        m = score_re.search(line)
-        if m:
-            W, L, D = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        m = finished_re.search(line)
+        if not m:
+            continue
+        white, outcome = m.group(2), m.group(4)
+        if outcome == "1/2-1/2":
+            D += 1
+        elif outcome in ("1-0", "0-1"):
+            if (outcome == "1-0") == (white == "Candidate"):
+                W += 1
+            else:
+                L += 1
 
     N = W + L + D
     if N == 0:
@@ -317,13 +333,16 @@ def parse_args():
     p.add_argument("--baseline", default=None,
                    help="Path to baseline engine (default: same as --engine, "
                         "running the current parameter values)")
-    p.add_argument("--cutechess-cli",
-                   default=r"libs\Cute Chess\cutechess-cli.exe")
+    p.add_argument("--fastchess",
+                   default=str(PROJECT_ROOT / "libs" / "fastchess" /
+                               ("fastchess.exe" if os.name == "nt" else "fastchess")),
+                   help="Path to the fastchess executable")
 
     # Time control
     p.add_argument("--tc", type=str, default=None)
     p.add_argument("--time", type=float, default=None)
     p.add_argument("--depth", type=int, default=None)
+    p.add_argument("--nodes", type=int, default=None, help="Fixed nodes per move (the engine must honour go nodes)")
 
     # CMA-ES settings
     p.add_argument("--generations", type=int, default=100)
@@ -333,6 +352,8 @@ def parse_args():
     p.add_argument("--sigma0", type=float, default=None,
                    help="Initial global step size (default: auto)")
     p.add_argument("--concurrency", type=int, default=2)
+    p.add_argument("--no-pin", action="store_true",
+                   help="Don't give each game its own cpu in the engines' Affinity order")
 
     # Opening book
     p.add_argument("--book", default=None)
@@ -407,8 +428,10 @@ def main():
         tc_args = [f"st={args.time}", "timemargin=30"]
     elif args.tc is not None:
         tc_args = [f"tc={args.tc}"]
+    elif args.nodes is not None:
+        tc_args = [f"nodes={args.nodes}", "tc=inf"]
     else:
-        print("[CMA-ES] ERROR: Specify --tc, --time, or --depth")
+        print("[CMA-ES] ERROR: Specify --tc, --time, --depth or --nodes")
         sys.exit(1)
 
     # Book
@@ -422,6 +445,12 @@ def main():
 
     engine_path = os.path.abspath(args.engine)
     baseline_path = os.path.abspath(args.baseline) if args.baseline else engine_path
+    if args.nodes is not None:
+        uci_probe.require_node_limit([engine_path, baseline_path])
+
+    # Each game's own cpu, in the engines' Affinity order (if both report one)
+    affinity = cpu_slots.fastchess_args(cpu_slots.plan([engine_path, baseline_path], 1, args.concurrency,
+                                                       enabled=not args.no_pin))
 
     # Baseline plays the current (start) parameter values so it represents the
     # engine as currently configured. Candidates are scored against this.
@@ -464,7 +493,7 @@ def main():
             score = evaluate_candidate(
                 engine_path, baseline_path, params_dict, param_names, x,
                 args.games_per_eval, tc_args, book_args, args.concurrency,
-                args.cutechess_cli, baseline_opts=baseline_opts
+                args.fastchess, baseline_opts=baseline_opts, affinity=affinity
             )
             scores.append(score)
             total_games += args.games_per_eval
@@ -579,6 +608,7 @@ def main():
         print(f"    {name:30s}: {start_val} -> {v}")
 
     print(f"\n  Results saved to: {args.output}")
+    cpu_slots.release()
 
     if plotter:
         plotter.finalize()

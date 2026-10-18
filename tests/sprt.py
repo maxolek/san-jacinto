@@ -11,8 +11,14 @@ from datetime import datetime, timezone
 import platform
 import threading
 import json
+import shutil
 import signal
 import queue
+
+from utils.pentanomial import FINISHED_GAME, PentanomialSPRT
+from utils.fastchess_match import (
+    FASTCHESS, Side, limit_args, limit_label, prepare_match, run_fastchess, run_match, stop_fastchess, tb_args
+)
 
 system = platform.system()
 
@@ -20,32 +26,14 @@ system = platform.system()
 TESTS_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = TESTS_DIR.parent
 sys.path.insert(0, str(PROJECT_ROOT))
-from utils.pentanomial import FINISHED_GAME, PentanomialSPRT
+
 # log paths
 LOGS_DIR = PROJECT_ROOT / "logs"
 SPRT_LOG_DIR = LOGS_DIR / "sprt_logs"
-GAME_JSON = SPRT_LOG_DIR / "game.jsonl"
-SEARCH_JSON = SPRT_LOG_DIR / "search.jsonl"
-TIMING_JSON = SPRT_LOG_DIR / "timing.jsonl"
-ROOT_MOVES_JSON = SPRT_LOG_DIR / "root_moves.jsonl"
 
-# cutechess-cli
-
-if system == "Windows": 
-    CUTECHESS_CLI = r"C:\Program Files (x86)\Cute Chess\cutechess-cli.exe" 
-elif system == "Darwin": 
-    CUTECHESS_CLI = (
-        PROJECT_ROOT.parent
-        / "libs"
-        / "cutechess"
-        / "build"
-        / "cutechess-cli"
-    )
-
-
-def parse_cutechess_output(output, candidate_name="Candidate", elo0=0, elo1=10,
-                          alpha=0.05, beta=0.05):
-    """Rebuild pentanomial evidence from game results, never cutechess summaries."""
+def parse_fastchess_output(output, candidate_name="Candidate", elo0=0, elo1=10,
+                           alpha=0.05, beta=0.05):
+    """Rebuild pentanomial evidence from game results, never fastchess summaries."""
     state = PentanomialSPRT(elo0, elo1, alpha, beta)
     for line in output.splitlines():
         match = FINISHED_GAME.search(line)
@@ -57,211 +45,155 @@ def parse_cutechess_output(output, candidate_name="Candidate", elo0=0, elo1=10,
     return state.snapshot()
 
 
-def stop_cutechess(proc, force=False):
-    """Stop only this run's process tree, including the engine children.
+def ingest_telemetry(cnxn, run_logs, ids):
+    """Load one run's engine logs (<run_logs>/<side>/), each side attributed to its own build.
 
-    Cutechess handles SIGINT on POSIX. Windows has no equivalent targeted
-    SIGINT delivery; taskkill /T stops the dedicated tree there. Our result
-    journal is flushed before shutdown, independent of PGN finalization.
+    `ids`: the run's engine and experiment ids, as in its engines.json. Every run has
+    its own log folder, so logs of other, aborted or concurrent runs are never mixed in.
+    Each side is one transaction, loaded completely or not at all (even if the process
+    is killed). It records the load in telemetry_loads, whose key refuses a second load
+    of the same side, and the side's logs are then removed, so a retry loads each side
+    exactly once. Returns True if everything was loaded.
     """
-    if proc.poll() is not None:
-        return
-    if os.name == "nt":
-        result = subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"],
-                                capture_output=True, text=True,
-                                creationflags=subprocess.CREATE_NO_WINDOW)
-        if result.returncode and proc.poll() is None:
-            raise RuntimeError(f"Could not stop cutechess process tree: {result.stderr}")
-    else:
-        try:
-            os.killpg(proc.pid, signal.SIGKILL if force else signal.SIGINT)
-        except ProcessLookupError:
-            pass
-
-
-def run_cutechess(cmd, state, run_dir, plotter=None):
-    """Journal raw results and ordered pair snapshots, with or without a GUI."""
-    run_dir = Path(run_dir)
-    process_options = (dict(creationflags=subprocess.CREATE_NEW_PROCESS_GROUP)
-                       if os.name == "nt" else dict(start_new_session=True))
-    stopping_at = None
-    failure = None
-    with (open(run_dir / "cutechess_stdout.log", "w", encoding="utf-8") as transcript,
-          open(run_dir / "games.jsonl", "w", encoding="utf-8") as games,
-          open(run_dir / "stats.jsonl", "w", encoding="utf-8") as history,
-          subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                           text=True, bufsize=1, **process_options) as proc):
-        line_queue = queue.Queue()
-
-        def reader():
-            try:
-                for line in proc.stdout:
-                    line_queue.put(line)
-            finally:
-                line_queue.put(None)
-
-        thread = threading.Thread(target=reader, daemon=True)
-        thread.start()
-        try:
-            done = False
-            while not done:
-                # Bound work per pass so high concurrency cannot starve the GUI.
-                for _ in range(128):
-                    try:
-                        line = line_queue.get(timeout=0.05)
-                    except queue.Empty:
-                        break
-                    if line is None:
-                        done = True
-                        break
-                    print(line, end="")
-                    transcript.write(line)
-                    transcript.flush()
-                    match = FINISHED_GAME.search(line)
-                    if not match:
-                        continue
-                    number, white, black, outcome = match.groups()
-                    games.write(json.dumps(dict(game=int(number), white=white, black=black,
-                                                result=outcome)) + "\n")
-                    games.flush()
-                    updates = state.add_game(int(number), white, black, outcome)
-                    for snapshot in updates:
-                        history.write(json.dumps(snapshot, allow_nan=False) + "\n")
-                        history.flush()
-                    if updates:
-                        snapshot = updates[-1]
-                        print(f"[PENTA] pairs={snapshot['pairs']} bins={snapshot['pentanomial']} "
-                              f"LLR={snapshot['llr']:+.4f} result={snapshot['result']}")
-                    if state.result != "inconclusive" and stopping_at is None:
-                        stopping_at = time.monotonic()
-                        stop_cutechess(proc)
-                    if plotter:
-                        for snapshot in updates:
-                            plotter.update(snapshot)
-                if plotter:
-                    plotter._pump_events()
-                if stopping_at is not None and time.monotonic() - stopping_at > 10:
-                    stop_cutechess(proc, force=True)
-            ret = proc.wait(timeout=10)
-            if ret != 0 and stopping_at is None:
-                raise subprocess.CalledProcessError(ret, cmd)
-        except BaseException as exc:
-            failure = str(exc) or type(exc).__name__
-            stop_cutechess(proc, force=True)
-            proc.wait(timeout=10)
-            raise
-        finally:
-            summary = state.snapshot()
-            summary["error"] = failure
-            (run_dir / "summary.json").write_text(
-                json.dumps(summary, indent=2, allow_nan=False), encoding="utf-8")
-            thread.join(timeout=2)
-    return state.snapshot()
-
-
-def upload_logs(args, cute_chess_stats, runtime=None):
     from data import etl
+    run_logs = Path(run_logs)
+    etl.ensure_schema(cnxn)  # e.g. a migration added since the run (a retry): no transaction is open yet
+    ok = True
+    for side, opponent in (("candidate", "baseline"), ("baseline", "candidate")):
+        log_dir = run_logs / side
+        if side in ids.setdefault("loaded", []) or not log_dir.is_dir():
+            continue
+        print(f"[DATA] Logging {side} telemetry ...")
+        try:
+            # first, in the side's transaction: a side loaded before (e.g. the process stopped
+            # right after that commit) fails here, before any of its rows are added again
+            cnxn.execute("INSERT INTO telemetry_loads (experiment_id, side) VALUES (?, ?)", (ids["experiment"], side))
+            etl.consolidate_instance_logs(log_dir)
+            paths = etl.get_jsonl_paths(log_dir)
+            game_map = {}
+            if paths["game"].exists():
+                game_map = etl.bulk_log_game(cnxn, paths["game"], ids["experiment"], second_engine_id=ids[opponent],
+                                             engine_id=ids[side], commit=False)
+            if paths["search"].exists():
+                etl.bulk_log_search_and_timing(
+                    cnxn,
+                    paths["search"],
+                    game_map,
+                    engine_id=ids[side],
+                    timing_path=paths["timing"] if paths["timing"].exists() else None,
+                    root_moves_path=paths["root_moves"] if paths["root_moves"].exists() else None,
+                    commit=False,
+                )
+            cnxn.commit()
+        except sqlite3.IntegrityError:
+            cnxn.rollback()
+            print(f"[DATA] {side} telemetry of experiment {ids['experiment']} was loaded already")
+        except Exception as e:
+            cnxn.rollback()
+            print(f"[DATA] JSONL ingestion failed ({side}): {e}")
+            ok = False
+            continue
+        ids["loaded"].append(side)
+        (run_logs / "engines.json").write_text(json.dumps(ids), encoding="utf-8")
+        shutil.rmtree(log_dir, ignore_errors=True)
+    return ok
+
+
+def retry_ingest(run_logs):
+    """Load a run's preserved telemetry with the engine ids recorded for it (engines.json)."""
+    from data import etl
+    run_logs = Path(run_logs)
+    ids = json.loads((run_logs / "engines.json").read_text(encoding="utf-8"))
+    cnxn = etl.connect_raw()
+    try:
+        if ingest_telemetry(cnxn, run_logs, ids):
+            shutil.rmtree(run_logs, ignore_errors=True)
+            print(f"[DATA] Telemetry of experiment {ids['experiment']} loaded.")
+    finally:
+        cnxn.close()
+
+
+
+def upload_logs(args, fastchess_stats, runtime=None, run_logs=None):
+    from data import etl, ratings
     print("[DATA] Preparing to upload logs to database...")
 
-    if system == "Windows": cnxn = sqlite3.connect('F:/databases/chess.db')
-    elif system == "Darwin": cnxn = sqlite3.connect(Path.home() / "Documents/databases/chess.db")
+    cnxn = etl.connect_raw()  # waits for another run's write instead of failing after 5 s
+    try:
+        # engines are identified by their build (binary + net hash), not their version string;
+        # the baseline first: it is usually the canonical build of its version (legacy rows)
+        print("[DATA] Identifying engine builds...")
+        baseline_engine_id = etl.resolve_engine(cnxn, args.engine_b)
+        candidate_engine_id = etl.resolve_engine(cnxn, args.engine_a)
 
-    print("[DATA] Probing engine metadata...")
-    candidate_engine_version = etl.probe_engine_metadata(args.engine_a)['version']
-    baseline_engine_version = etl.probe_engine_metadata(args.engine_b)['version']
+        # log sprt experiment
+        sprt_id = etl.start_experiment(
+            cnxn,
+            "SPRT",
+            candidate_engine_id,
+            comparison_engine_id = baseline_engine_id
+        )
 
-    # get engine_id by probing db.engines via version
-    print("[DATA] Retrieving engine ids...")
-    candidate_engine_id = etl.get_engine_id(cnxn, version=candidate_engine_version)
-    baseline_engine_id = etl.get_engine_id(cnxn, version=baseline_engine_version)
+        # The results first: telemetry below can fail and be retried, they cannot.
+        # log sprt experiment details in db.sprt (always, regardless of --log)
+        args_dict = {k: (str(v) if isinstance(v, Path) else v) for k, v in vars(args).items()}
+        etl.log_sprt(
+            cnxn,
+            sprt_id,  # experiment_id
+            candidate_engine_id,
+            baseline_engine_id,
+            **{**args_dict, **fastchess_stats},
+            runtime=runtime
+        )
+        # pairwise result; rating fits leave SPRT results out unless asked (early stopping biases them)
+        limit = dict(tc=args.tc, depth=args.depth, time=args.time, nodes=getattr(args, "nodes", None))
+        ratings.record_snapshot(cnxn, source="sprt", engine_a=candidate_engine_id, engine_b=baseline_engine_id,
+                                snapshot=fastchess_stats,
+                                tc_category=ratings.category(**limit, threads=getattr(args, "threads", 1)),
+                                time_control=limit_label(**limit), experiment_id=sprt_id)
+        etl.update_experiment(
+            cnxn,
+            sprt_id,
+            {"end_time_utc": datetime.now(timezone.utc).isoformat()}
+        )
 
-    # auto-register if not found
-    if candidate_engine_id is None:
-        print(f"[SPRT] Candidate engine {candidate_engine_version} not registered, registering now...")
-        candidate_engine_id = etl.register_engine(cnxn, {"engine_path": args.engine_a})
-    if baseline_engine_id is None:
-        print(f"[SPRT] Baseline engine {baseline_engine_version} not registered, registering now...")
-        baseline_engine_id = etl.register_engine(cnxn, {"engine_path": args.engine_b})
-
-    # log sprt experiment
-    sprt_id = etl.start_experiment(
-        cnxn, 
-        "SPRT",
-        candidate_engine_id,
-        comparison_engine_id = baseline_engine_id
-    )
-
-    # Only consolidate and ingest JSONL data if logging was enabled
-    ingestion_ok = False
-    if args.log:
-        # consolidate per-instance log files from concurrent engine processes
-        print("[DATA] Consolidating per-instance log files...")
-        etl.consolidate_instance_logs(args.logroot)
-
-        try:
-            # map search --> game
-            print("[DATA] Building game map ...")
-            game_map = etl.bulk_log_game(
-                cnxn, 
-                GAME_JSON, 
-                sprt_id,
-            )
-
-            # log search+timing with game mapping
-            print("[DATA] Logging all search data ...")
-            etl.bulk_log_search_and_timing(
-                cnxn, 
-                SEARCH_JSON,
-                game_map, 
-                timing_path=TIMING_JSON,
-                root_moves_path=ROOT_MOVES_JSON
-            )
-            ingestion_ok = True
-        except Exception as e:
-            print(f"[DATA] JSONL ingestion failed: {e}")
-            print("[DATA] Log files preserved for retry.")
-    else:
-        print("[DATA] Logging was disabled, skipping JSONL ingestion.")
-
-    # log sprt experiment details in db.sprt (always, regardless of --log)
-    args_dict = {k: (str(v) if isinstance(v, Path) else v) for k, v in vars(args).items()}
-    etl.log_sprt(
-        cnxn,
-        sprt_id,  # experiment_id
-        candidate_engine_id,
-        baseline_engine_id,
-        **{**args_dict, **cute_chess_stats},
-        runtime=runtime
-    )
-    etl.update_experiment(
-        cnxn, 
-        sprt_id, 
-        {"end_time_utc": datetime.now(timezone.utc).isoformat()}
-    )
-
-    # Only clear log directory if ingestion succeeded
-    if args.log and ingestion_ok:
-        print("[DATA] Clearing log directory...")
-        etl.clear_log_dir(args.logroot)
-        print(f"[DATA] Logging completed for SPRT {sprt_id}.")
+        # This run's engine logs only (engines log games even with --log off)
+        run_logs = Path(run_logs) if run_logs else None
+        if not args.log:
+            print("[DATA] Logging was disabled, skipping JSONL ingestion.")
+            if run_logs:
+                shutil.rmtree(run_logs, ignore_errors=True)
+        elif run_logs and run_logs.is_dir():
+            ids = dict(candidate=candidate_engine_id, baseline=baseline_engine_id, experiment=sprt_id, loaded=[])
+            (run_logs / "engines.json").write_text(json.dumps(ids), encoding="utf-8")  # a retry attributes the logs
+            if ingest_telemetry(cnxn, run_logs, ids):
+                shutil.rmtree(run_logs, ignore_errors=True)
+                print(f"[DATA] Logging completed for SPRT {sprt_id}.")
+            else:
+                print(f"[DATA] Log files preserved; retry with: python -m tests.sprt --retry-ingest {run_logs}")
+    finally:
+        cnxn.close()
 
 
-def parse_args():
+def parse_args(argv=None):
     p = argparse.ArgumentParser(description="SPRT runner using cutechess-cli")
 
     # Engines
     p.add_argument("--engine-a", required=True, help="Candidate engine path")
     p.add_argument("--engine-b", required=True, help="Baseline engine path")
     p.add_argument("--params", type=dict, help="Dictionary of parameter and their values to test against the current version of the engine")
+    p.add_argument("--retry-ingest", metavar="RUN_LOG_DIR", 
+        help="Only load the preserved telemetry of an earlier run (<logroot>/<run>) into the database")
 
-    # cutechess
+    # fastchess-cli path
     p.add_argument(
-        "--cutechess-cli",
-        default=str(CUTECHESS_CLI),
-        help="Path to cutechess-cli.exe"
+        "--fastchess",
+        default=str(FASTCHESS),
+        help="Path to fastchess.exe"
     )
 
     # Time control (choose ONE)
+    p.add_argument("--nodes", type=int, default=None, help="Nodes per move")
     p.add_argument("--depth", type=int, default=None, help="Depth per move")
     p.add_argument("--time", type=float, default=None, help="Seconds per move")
     p.add_argument("--tc", type=str, default=None, help="Time control (e.g. 0+1)")
@@ -273,10 +205,18 @@ def parse_args():
     p.add_argument("--beta", type=float, default=0.05)
     p.add_argument("--max-games", type=int, default=1000)
     p.add_argument("--concurrency", type=int, default=2, help="Number of concurrent games")
+    p.add_argument("--threads", type=int, default=1, help="Threads per engine (option.Threads); each pinned game gets this many cpu cores")
+    p.add_argument("--no-pin", action="store_true", 
+                   help="Do not pin each game to its own CPU cores (default: pin)")
 
     # Opening book
     p.add_argument("--book", default= PROJECT_ROOT / "bin" / "opening_books" / "8moves_v3.pgn" , help="Opening book file")
     p.add_argument("--book-depth", type=int, default=16) # 8 full moves
+
+    # adjudication
+    p.add_argument("--tb", default=None,
+                   help="Syzygy tablebase dir(s) for adjudication (';'-separated on Windows); WDL files are enough")
+    p.add_argument("--tbpieces", type=int, default=None, help="Only adjudicate positions with at most this many pieces")
 
     # Logging
     p.add_argument('--log', action="store_true", help="Flag to turn on logging for candidate engine")
@@ -284,16 +224,21 @@ def parse_args():
     p.add_argument(
         "--logroot",
         default=SPRT_LOG_DIR,
-        help="Root directory for SPRT logs"
+        help="Root directory for SPRT logs (each run logs into <logroot>/<run>/<side>/)"
     )
 
-    return p.parse_args()
+    args = p.parse_args(argv)
+    if not args.retry_ingest and not (args.engine_a and args.engine_b):
+        p.error("--engine-a and --engine-b are required")
+    return args
 
 
 
 def main(args=None):
     if args is None:
         args = parse_args()
+    if getattr(args, "retry_ingest", None):
+        return retry_ingest(args.retry_ingest)
     state = PentanomialSPRT(args.elo0, args.elo1, args.alpha, args.beta)
     if args.max_games < 2 or args.max_games % 2:
         raise ValueError("--max-games must be a positive even number (complete opening pairs)")
@@ -301,104 +246,62 @@ def main(args=None):
         raise ValueError("--concurrency must be positive")
 
     # Validate TC
-    if sum(x is not None for x in (args.depth, args.time, args.tc)) != 1:
-        raise ValueError("Specify exactly one of --depth, --time, or --tc")
+    nodes = getattr(args, "nodes", None)
+    limits = limit_args(depth=args.depth, time=args.time, tc=args.tc, nodes=nodes)
 
     engine_a = os.path.abspath(args.engine_a)
     engine_b = os.path.abspath(args.engine_b)
 
-    should_log = args.log
-    print(f"[SPRT] Engine logging: {'enabled' if should_log else 'disabled'}")
-    Path(args.logroot).mkdir(parents=True, exist_ok=True)
-    run_dir = LOGS_DIR / "sprt_results" / datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-    run_dir.mkdir(parents=True)
+    # Threads: --threads for both engines; tuned params may give the candidate its own
+    params = dict(args.params or {})
+    threads_b = getattr(args, "threads", 1)
+    threads_a = int(params.pop("Threads", threads_b))
+    if min(threads_a, threads_b) < 1:
+        raise ValueError("--threads must be positive")
+
+    # logging // options
+    print(f"[SPRT] Engine logging: {'enabled' if args.log else 'disabled'}")
+
+    run_id = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    run_dir = LOGS_DIR / "sprt_results" / run_id
+    run_logs = Path(args.logroot).resolve() / run_id  # this run's engine logs only (engines run in their own dir)
+
+    def side_options(side):
+        return [
+            f"option.log_dir={run_logs / side}",
+            f"option.uci_logging={str(args.log).lower()}",
+        ]
+
+    options_a = side_options("candidate") + [f"options.{name}={value}" for name, value in params.items()]
+    match = prepare_match(
+        Side(engine_a, options_a, threads_a),
+        Side(engine_b, side_options("baseline"), threads_b),
+        limits=limits, pairs=args.max_games // 2, concurrency=args.concurrency,
+        run_dir=run_dir, fastchess=args.fastchess, book=args.book, book_depth=args.book_depth,
+        pin=not getattr(args, "no_pin", False), maxmoves=100,
+        extra=tb_args(getattr(args, "tb", None), getattr(args, "tbpieces", None)),
+        meta=dict(arguments=vars(args), model="pentanomial-logistic")
+    )
     print(f"[SPRT] Results: {run_dir}")
+    print("[SPRT] Launching fastchess:")
 
-    each_block = [
-        "-each",
-        "proto=uci"
-    ]
-    log_a_block = [
-        f"option.log_dir={args.logroot}",
-        f"option.uci_logging={str(should_log).lower()}",
-    ]
-    if args.params:
-        for name, value in args.params.items(): # add tuning result param values
-            log_a_block.append(
-                f"option.{name}={value}"
-            )
-    log_b_block = [
-        f"option.log_dir={args.logroot}",
-        f"option.uci_logging={str(should_log).lower()}",
-    ]
-
-    # Time control
-    if args.depth is not None:
-        each_block += [f"depth={args.depth}", "tc=inf"]
-    elif args.time is not None:
-        each_block += [f"st={args.time}", "timemargin=30"]
-    else:
-        each_block.append(f"tc={args.tc}")
-
-    # opening book
-    book_block = []
-    if args.book is not None:
-        book_block.append("-openings")
-        book_block.append(f"file={os.path.abspath(args.book)}")
-        book_block.append(f"format={os.path.splitext(args.book)[1][1:]}")
-        book_block.append("order=random")
-        book_block.append(f"plies={args.book_depth}")
-
-    cmd = [
-        args.cutechess_cli,
-
-        # Candidate engine
-        "-engine",
-        "name=Candidate",
-        f"cmd={engine_a}",
-        f"dir={os.path.dirname(engine_a)}",
-    ] + log_a_block + [
-
-        # Baseline engine
-        "-engine",
-        "name=Baseline",
-        f"cmd={engine_b}",
-        f"dir={os.path.dirname(engine_b)}",
-    ] + log_b_block + each_block + [
-
-        # SPRT
-        "-maxmoves", "100",
-        "-games", "2",
-        "-rounds", str(args.max_games // 2),
-    ] + book_block + [
-
-        # Runtime
-        "-repeat",
-        "-concurrency", str(args.concurrency),
-        "-pgnout", str(run_dir / "games.pgn"),
-    ]
-
-    print("[SPRT] Launching cutechess:")
-    print(" ".join(cmd))
-
-    (run_dir / "config.json").write_text(
-        json.dumps(dict(arguments=vars(args), command=cmd, model="pentanomial-logistic"),
-                   indent=2, default=str), encoding="utf-8")
+    # launch
     start_time = time.time()
-    plotter = None
+    plotter = None 
     if args.plot:
         from data import etl
         from utils.sprt_plot import LivePlotter
-        plotter = LivePlotter(args.elo0, args.elo1, args.alpha, args.beta,
+        plotter = LivePlotter(args.elo0, args.elo1, args.alpha, args.beta, 
                               etl.probe_engine_metadata(args.engine_a),
                               etl.probe_engine_metadata(args.engine_b),
-                              args.time, args.depth, args.tc)
-    stats = run_cutechess(cmd, state, run_dir, plotter)
-    run_time = time.time() - start_time
-    if plotter:
-        plotter.finalize(stats, run_dir / "sprt.png")
+                              args.time, args.depth, args.tc or (f"{nodes} nodes / move" if nodes else None)
+                            )
+    stats = run_match(match, state, plotter)
+    run_time = time.time() - start_time 
+    if plotter: plotter.finalize(stats, run_dir / "sprt.png")
 
-    upload_logs(args, cute_chess_stats=stats, runtime=run_time)
+    # finalize
+    upload_logs(args, fastchess_stats=stats, runtime=run_time, run_logs=run_logs)
 
     print(f"[SPRT] {stats['result']}: {stats['pairs']} pairs, LLR {stats['llr']:+.4f}")
     if plotter:
@@ -409,7 +312,6 @@ def main(args=None):
         "elo": stats['elo_diff'],
         "games": stats['games_played']
     }
-
 
 if __name__ == "__main__":
     try:

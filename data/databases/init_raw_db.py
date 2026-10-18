@@ -1,10 +1,14 @@
 import sqlite3
 from pathlib import Path
-from ..etl.paths import RAW_DB
-from .run_analytics_pipeline import run_module
+from ..etl.paths import RAW_DB, connect_raw
+from ..etl.schema import ensure_schema
 
 # long form function that create the database
 # and some associated tables
+#
+# These CREATE TABLEs are the base schema: don't add columns or tables here. Every
+# change is a migration in migrate_schema.py, which init_raw_db applies right after
+# creating these, so new and upgraded databases always have the same schema.
 
 def init_raw_db(db_dir=None) -> None:
 
@@ -29,8 +33,16 @@ def init_raw_db(db_dir=None) -> None:
     db_path = db_dir / "chess.db"
     print(f"[DB] Initializing raw database at: {db_path}")
 
-    # cnxn + cursor
-    cnxn = sqlite3.connect(db_path)
+    cnxn = connect_raw(db_path)
+    create_base_tables(cnxn)
+    # every migration, and whatever is missing of applied ones (tables dropped, history kept)
+    ensure_schema(cnxn, recheck=True)
+    cnxn.close()
+    print(f"[DB] Raw database initialized with schema at {db_path}")
+
+
+def create_base_tables(cnxn) -> None:
+    """Create the base tables (IF NOT EXISTS). Everything added since is a migration."""
     cur = cnxn.cursor()
 
 
@@ -426,11 +438,6 @@ def init_raw_db(db_dir=None) -> None:
     ]:
         cur.executescript(script)
     cnxn.commit()
-    print(f"[DB] Raw database initialized with schema at {db_path}")
 
 if __name__ == "__main__":
     init_raw_db()
-
-    # migrate schema after init db
-    # (will throw warning for analytics if any migrations there yet)
-    run_module("data.transforms.migrate_schema")

@@ -7,9 +7,10 @@ metrics.csv:
 
 Dashboard:
     1. Training loss
-    2. Learning-rate schedule
-    3. Validation loss / best validation
-    4. Validation - training loss gap
+    2. Validation loss / best validation
+    3. Learning-rate schedule
+    4. WDL schedule
+    5. Run / dataset information
 
 The plot can be used standalone or through python/train.py.
 """
@@ -61,6 +62,8 @@ class PlotConfig:
     net_id: str | None = None
     train_data: str | None = None
     val_data: str | None = None
+    validation_frequency: int | None = None
+    validation_batches: int | None = None
 
     l1: int | None = None
     l2: int | None = None
@@ -886,6 +889,16 @@ def _draw_info(
         if config.val_data is not None:
             right_lines.append(
                 f"Val: {os.path.basename(config.val_data)}"
+            )
+
+        if config.validation_frequency is not None:
+            right_lines.append(
+                f"Val frequency: every {config.validation_frequency:,} batches"
+            )
+
+        if config.validation_batches is not None:
+            right_lines.append(
+                f"Val batches / eval: {config.validation_batches:,}"
             )
 
     ax.text(

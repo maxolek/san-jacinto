@@ -2,7 +2,7 @@
 SPSA parameter tuner.
 
 Uses standard 2-point simultaneous perturbation (Spall, 1992) with
-per-parameter configuration (Fishtest-style). Wraps cutechess-cli 
+per-parameter configuration (Fishtest-style). Wraps fastchess 
 
 Usage:
     python -m tests.spsa --engine <path> --baseline <path> --tc 0:1+0.01 --iterations 500
@@ -24,6 +24,8 @@ from datetime import datetime, timezone
 
 TESTS_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = TESTS_DIR.parent
+sys.path.insert(0, str(PROJECT_ROOT))
+from utils import cpu_slots, uci_probe
 
 # ============================================================================
 # SPSA Configuration
@@ -167,11 +169,11 @@ def clamp(value, lo, hi):
 
 
 # ============================================================================
-# Cutechess integration
+# fastchess integration
 # ============================================================================
 
 def build_option_string(params_dict, values):
-    """Build cutechess option string for a parameter set."""
+    """Build fastchess option string for a parameter set."""
     options = []
     for name, val in zip(params_dict.keys(), values):
         cfg = params_dict[name]
@@ -182,29 +184,37 @@ def build_option_string(params_dict, values):
 
 
 def run_match(engine_path, baseline_path, params_dict, theta_plus, theta_minus,
-              games_per_iter, tc_args, book_args, concurrency, cutechess_cli,
-              plotter=None, iteration=None, total_iterations=None):
+              games_per_iter, tc_args, book_args, concurrency, fastchess,
+              plotter=None, iteration=None, total_iterations=None, affinity=()):
     """
     Run a match: theta_plus vs theta_minus.
     Returns (score_plus, score_minus, W, D, L).
     Score is from each side's perspective (W + D/2) / N.
+    `affinity`: fastchess options pinning each game to its own cpu (cpu_slots.fastchess_args).
 
     Uses a non-blocking Popen + reader-thread instead of subprocess.run()
     so that, when a live plot window is open, we can keep pumping its GUI
-    event loop while cutechess-cli runs. subprocess.run() blocks the main
+    event loop while fastchess runs. subprocess.run() blocks the main
     thread for the whole match, during which the window manager sees no
     paint/input events from the process and marks it "Not Responding" --
     the tuner isn't actually hung, the GUI just never gets serviced.
 
-    Also prints a live, in-place progress line ("N/games W-D-L") as cutechess
+    Also prints a live, in-place progress line ("N/games W-D-L") as fastchess
     finishes each game, parsed from its stdout, so the terminal isn't blank
     for the several minutes a match can take.
     """
     opts_plus = build_option_string(params_dict, theta_plus)
     opts_minus = build_option_string(params_dict, theta_minus)
 
+    # fastchess plays every opening twice with colors reversed (-games 2) and
+    # allows at most 2 games per round, so the match length is set via -rounds.
+    rounds = max(1, -(-games_per_iter // 2))
+    n_games = 2 * rounds
+
     cmd = [
-        cutechess_cli,
+        fastchess,
+        # fastchess saves a resume file on exit; a single match has nothing to resume
+        "-config", f"outname={os.devnull}",
         "-engine", "name=Plus", f"cmd={engine_path}",
         f"dir={os.path.dirname(engine_path)}",
     ] + opts_plus + [
@@ -213,21 +223,17 @@ def run_match(engine_path, baseline_path, params_dict, theta_plus, theta_minus,
     ] + opts_minus + [
         "-each", "proto=uci",
     ] + tc_args + [
-        "-games", str(games_per_iter),
-        "-repeat",
-        "-concurrency", str(concurrency),
+        "-games", "2",
+        "-rounds", str(rounds),
+        "-concurrency", str(concurrency), "-force-concurrency",
         "-maxmoves", "100",
     ] + book_args + [
         "-wait", "50",
-    ]
+    ] + list(affinity)
 
-    # Per-game progress lines, e.g.:
-    #   Finished game 3 (Plus vs Minus): 1-0 {White wins}
-    #   Score of Plus vs Minus: 2 - 1 - 0 [0.667] 3
-    finished_re = re.compile(r"Finished game (\d+)")
-    score_re = re.compile(
-        r"Score of Plus vs Minus:\s*(\d+)\s*-\s*(\d+)\s*-\s*(\d+)"
-    )
+    # Per-game result lines (White first), e.g.:
+    #   Finished game 3 (Plus vs Minus): 1-0 {White mates}
+    finished_re = re.compile(r"Finished game (\d+) \((.+?) vs (.+?)\):\s*(\S+)")
 
     iter_label = f"Iter {iteration}/{total_iterations} | " if iteration is not None else ""
 
@@ -242,7 +248,7 @@ def run_match(engine_path, baseline_path, params_dict, theta_plus, theta_minus,
         elapsed = time.time() - match_start
         rate = f"{elapsed / n:.1f}s/game" if n > 0 else "..."
         line = (
-            f"\r  [running] {iter_label}{games_done}/{games_per_iter} games "
+            f"\r  [running] {iter_label}{games_done}/{n_games} games "
             f"(W:{W} D:{D} L:{L}) | {elapsed:.0f}s elapsed, {rate}"
         )
         sys.stdout.write(line + " " * 10)  # clear any trailing chars from a longer previous line
@@ -260,7 +266,7 @@ def run_match(engine_path, baseline_path, params_dict, theta_plus, theta_minus,
     ) as proc:
 
         # Read stdout in a background thread so the main thread stays free
-        # to pump GUI events while waiting on cutechess-cli.
+        # to pump GUI events while waiting on fastchess.
         line_queue = queue.Queue()
 
         def _reader():
@@ -286,15 +292,20 @@ def run_match(engine_path, baseline_path, params_dict, theta_plus, theta_minus,
                     break
                 output_lines.append(line)
 
-                if finished_re.search(line):
-                    games_done += 1
-                    progress_dirty = True
-                m = score_re.search(line)
+                m = finished_re.search(line)
                 if m:
-                    W, L, D = int(m.group(1)), int(m.group(2)), int(m.group(3))
+                    games_done += 1
+                    white, result = m.group(2), m.group(4)
+                    if result == "1/2-1/2":
+                        D += 1
+                    elif result in ("1-0", "0-1"):
+                        if (result == "1-0") == (white == "Plus"):
+                            W += 1
+                        else:
+                            L += 1
                     progress_dirty = True
 
-            # Keep the plot window responsive while cutechess-cli runs.
+            # Keep the plot window responsive while fastchess runs.
             if plotter:
                 plotter._pump_events()
 
@@ -320,18 +331,11 @@ def run_match(engine_path, baseline_path, params_dict, theta_plus, theta_minus,
     _print_progress(final=True)
 
     if timed_out:
-        print("[SPSA] WARNING: cutechess-cli timed out after 7200s and was killed.")
+        print("[SPSA] WARNING: fastchess timed out after 7200s and was killed.")
 
     result_stdout = "".join(output_lines)
 
-    # Final score parse (authoritative — overwrite whatever the progress
-    # loop last saw, in case the last line arrived after our final read).
-    W, L, D = 0, 0, 0
-    for line in result_stdout.splitlines():
-        m = score_re.search(line)
-        if m:
-            W, L, D = int(m.group(1)), int(m.group(2)), int(m.group(3))
-
+    # W/D/L are tallied per finished game above (unfinished '*' games score nothing).
     N = W + L + D
     if N == 0:
         print("[SPSA] WARNING: No games completed!")
@@ -592,25 +596,31 @@ class SPSAPlotter:
 # Main SPSA loop
 # ============================================================================
 
-def parse_args():
+def parse_args(argv=None):
     p = argparse.ArgumentParser(description="SPSA parameter tuner for Tomahawk")
 
     p.add_argument("--engine", required=True, help="Path to candidate engine")
     p.add_argument("--baseline", default=None,
                    help="Path to baseline engine (for validation only, not used in tuning)")
-    p.add_argument("--cutechess-cli",
-                   default=r"libs\Cute Chess\cutechess-cli.exe")
+    p.add_argument("--fastchess",
+                   default=str(PROJECT_ROOT / "libs" / "fastchess" /
+                               ("fastchess.exe" if os.name == "nt" else "fastchess")),
+                   help="Path to the fastchess executable")
 
     # Time control
     p.add_argument("--tc", type=str, default=None, help="Time control (e.g. 0:1+0.01)")
     p.add_argument("--time", type=float, default=None, help="Seconds per move")
     p.add_argument("--depth", type=int, default=None, help="Fixed depth")
+    p.add_argument("--nodes", type=int, default=None,
+                   help="Fixed nodes per move (the engine must honour go nodes)")
 
     # SPSA settings
     p.add_argument("--iterations", type=int, default=500, help="Number of SPSA iterations")
     p.add_argument("--games-per-iter", type=int, default=4,
                    help="Games per iteration (split between +/- perturbations)")
     p.add_argument("--concurrency", type=int, default=4)
+    p.add_argument("--no-pin", action="store_true",
+                   help="Don't give each game its own cpu in the engine's Affinity order")
     p.add_argument("--r", type=float, default=None,
                    help="Override learning rate r (default: auto from games_per_iter)")
 
@@ -633,7 +643,7 @@ def parse_args():
     p.add_argument("--no-polyak", action="store_true",
                    help="Disable Polyak-Ruppert averaging of the final theta")
 
-    return p.parse_args()
+    return p.parse_args(argv)
 
 
 def main(args=None):
@@ -685,7 +695,7 @@ def main(args=None):
             sys.exit(1)
         print(f"[SPSA] Resuming from iteration {start_iter}, theta = {theta}")
 
-    # Time control args for cutechess
+    # Time control args for fastchess
     tc_args = []
     if args.depth is not None:
         tc_args = [f"depth={args.depth}"]
@@ -693,8 +703,10 @@ def main(args=None):
         tc_args = [f"st={args.time}", "timemargin=30"]
     elif args.tc is not None:
         tc_args = [f"tc={args.tc}"]
+    elif args.nodes is not None:
+        tc_args = [f"nodes={args.nodes}", "tc=inf"]
     else:
-        print("[SPSA] ERROR: Specify --tc, --time, or --depth")
+        print("[SPSA] ERROR: Specify --tc, --time, --depth or --nodes")
         sys.exit(1)
 
     # Book args
@@ -707,6 +719,12 @@ def main(args=None):
         ]
 
     engine_path = os.path.abspath(args.engine)
+    if args.nodes is not None:
+        uci_probe.require_node_limit([engine_path])
+
+    # Each game's own cpu, in the engine's Affinity order (if it reports one)
+    affinity = cpu_slots.fastchess_args(cpu_slots.plan([engine_path], 1, args.concurrency,
+                                                       enabled=not args.no_pin))
 
     # Compute global learning rate
     r = compute_r(args.games_per_iter)
@@ -727,6 +745,9 @@ def main(args=None):
     print(f"\n[SPSA] Initial theta: {dict(zip(param_names, theta))}")
     print(f"[SPSA] Starting tuning...")
     print()
+
+    # Ensure output directory exists (checkpoints are written from iteration 0)
+    Path(args.output).parent.mkdir(parents=True, exist_ok=True)
 
     if start_iter == 0:
         total_games = 0
@@ -801,8 +822,8 @@ def main(args=None):
         score_plus, score_minus, W, D, L = run_match(
             engine_path, None, params_dict, theta_plus, theta_minus,
             args.games_per_iter, tc_args, book_args, args.concurrency,
-            args.cutechess_cli, plotter=plotter,
-            iteration=k, total_iterations=args.iterations
+            args.fastchess, plotter=plotter,
+            iteration=k, total_iterations=args.iterations, affinity=affinity
         )
         n_games = W + D + L
         total_games += n_games
@@ -998,6 +1019,7 @@ def main(args=None):
         json.dump(final_checkpoint, f, indent=2)
 
     print(f"\n  Results saved to: {args.output}")
+    cpu_slots.release()
 
     if plotter:
         plotter.finalize()

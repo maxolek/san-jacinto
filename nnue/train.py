@@ -41,6 +41,7 @@ Examples:
 from __future__ import annotations
 
 import argparse
+import json
 import math
 import os
 import shutil
@@ -260,6 +261,34 @@ def net_output_dir(args) -> str:
     return os.path.join(NNUE_SJ_ROOT, args.output_dir, args.net_id)
 
 
+def write_train_config(args, train_stages, val_stages, stage_lengths, final_superbatch) -> None:
+    """The run's settings next to its checkpoints, for the net registry (nnue/registry.py)."""
+    out_dir = net_output_dir(args)
+    os.makedirs(out_dir, exist_ok=True)
+    config = dict(vars(args), train_stages=train_stages, val_stages=val_stages, stage_lengths=stage_lengths,
+                  final_superbatch=final_superbatch, written=datetime.now().isoformat(timespec="seconds"))
+    with open(os.path.join(out_dir, "train_config.json"), "w", encoding="utf-8") as f:
+        json.dump(config, f, indent=2, default=str)
+
+
+def register_checkpoints(args) -> None:
+    """Add the run's checkpoints to the net registry; training never fails on this."""
+    if args.no_register:
+        return
+    try:
+        import registry  # nnue/registry.py
+
+        cnxn = registry.connect_raw(registry.RAW_DB)
+        try:
+            count = len(registry.scan(cnxn, os.path.join(NNUE_SJ_ROOT, args.output_dir), args.net_id))
+        finally:
+            cnxn.close()
+        print(f"[train] registered {count} checkpoint(s) of {args.net_id} in the net registry")
+    except Exception as exc:
+        print(f"[train] could not register checkpoints in the net registry ({exc}); later run: "
+              f"python -m nnue.registry scan --run-id {args.net_id}")
+
+
 def archive_previous_plot(out_dir: str, history_dir: str) -> None:
     """Start a new plot history while retaining the previous run's files."""
     if not os.path.isdir(out_dir):
@@ -467,6 +496,8 @@ def main() -> int:
     p.add_argument("--interval", type=float, default=3.0, help="live plot refresh seconds")
     p.add_argument("--smooth", type=int, default=15, help="train-curve moving-average window")
     p.add_argument("--log-y", action="store_true", help="logarithmic loss axis")
+    p.add_argument("--no-register", action="store_true",
+                   help="do not add the run's checkpoints to the net registry when training finishes")
     args = p.parse_args()
     if args.superbatch_start < 1 or any(n < 1 for n in args.superbatches):
         p.error("--superbatch-start and --superbatches must be positive")
@@ -546,6 +577,7 @@ def main() -> int:
             net_output_dir(args),
             os.path.join(NNUE_SJ_ROOT, args.output_dir, "plot_history", args.net_id),
         )
+        write_train_config(args, train_stages, val_stages, stage_lengths, final_superbatch)
         for i, (train_data, val_data) in enumerate(zip(train_stages, val_stages)):
             stage_label = f"_stage{i + 1}" if multi_stage else ""
 
@@ -577,6 +609,7 @@ def main() -> int:
                 )
                 return code
 
+        register_checkpoints(args)
         return 0
     finally:
         if dashboard_fig is not None:
