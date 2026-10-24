@@ -58,9 +58,10 @@ SELECT
 
     SUM(itdeep.eval_sign_flips) AS eval_sign_flips,
 
-    MAX(itdeep.eval) AS max_eval,
-    AVG(itdeep.eval) AS avg_eval,
-    STDDEV(itdeep.eval) AS stddev_eval
+    -- centipawn evals only: mate scores (+/-~100000) would dominate these
+    MAX(itdeep.eval_cp) AS max_eval,
+    AVG(itdeep.eval_cp) AS avg_eval,
+    STDDEV(itdeep.eval_cp) AS stddev_eval
 FROM search_iteration_features itdeep
 
 GROUP BY search_id

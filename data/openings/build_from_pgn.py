@@ -16,13 +16,16 @@ def build(pgn_path: Path, out_path: Path):
             headers = game.headers
             eco = headers.get('ECO') or headers.get('Eco') or ''
             name = headers.get('Opening') or headers.get('Event') or headers.get('Site') or ''
+            variation = headers.get('Variation') or ''
+            if headers.get('SubVariation'):
+                variation = f"{variation}, {headers['SubVariation']}" if variation else headers['SubVariation']
             # collect moves as UCI
             b = game.board()
             moves = []
             for mv in game.mainline_moves():
                 moves.append(mv.uci())
                 b.push(mv)
-            out.append({"eco": eco, "name": name, "moves": moves})
+            out.append({"eco": eco, "name": name, "variation": variation, "moves": moves})
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with open(out_path, 'w', encoding='utf-8') as f:

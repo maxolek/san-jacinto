@@ -6,6 +6,8 @@ from pathlib import Path
 from .paths import GAME_JSON, SEARCH_JSON, TIMING_JSON, ROOT_MOVES_JSON, GAMES_LOG_DIR, LOG_DIRS, get_jsonl_paths
 from .utils import safe_val, safe, consolidate_instance_logs
 from .db import get_engine_id, clear_log_dir, extract_engine_id_from_search, probe_engine_metadata, save_engine_config, register_engine
+from .schema import ensure_schema
+from .columns import MISMATCH, coerce
 
 def _iter_json_objects_from_path(path):
     with open(path, "r", encoding="utf-8") as f:
@@ -29,7 +31,186 @@ def _count_jsonl_rows(path):
     """Count non-empty lines in a JSONL file."""
     with open(path) as f:
         return sum(1 for line in f if line.strip())
-    
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Log fields -> columns
+# ─────────────────────────────────────────────────────────────────────────────
+# The loaders below read these log fields explicitly (some into a column of another
+# name). Every other field goes into the column of the same name when the table has
+# one (per-depth arrays: itdepth_x / treedepth_x -> column x), converted to its type,
+# so a statistic a new engine version logs only needs a migration
+# (data/databases/migrate_schema.py); earlier rows keep NULL. Nothing is lost on the
+# way: a field with no column yet, or a value that doesn't fit its column's type, is
+# kept in the row's extra_fields (JSON) and reported, and the migration that adds the
+# column fills it from there. A field an engine doesn't log is NULL ("not measured"),
+# never 0.
+
+LINK_FIELDS = {"engine_id", "game_uuid", "search_uuid"}  # resolved to row ids, not stored as such
+BOOKKEEPING_FIELDS = {"instance_id", "session", "type"}  # logging internals: stored only if a column exists
+SEARCH_FIELDS = {
+    "fen", "ply", "time_ms", "root_eval", "completed_depth", "max_depth", "max_qdepth", "best_move",
+    "principal_variation", "nodes", "qnodes", "tt_stores", "tt_hits", "tt_fill", "fail_highs", "fail_lows",
+    "aspiration_fail_high_researches", "aspiration_fail_low_researches", "fail_high_index",
+    "see_prunes", "delta_prunes", "nmp", "nmp_failhigh", "tt_overwritten",
+    "nmp_fail",  # nmp_failhigh before July 2026
+}
+ITERATION_FIELDS = {
+    "itdepth_time_ms", "itdepth_eval", "itdepth_move", "itdepth_qdepth", "itdepth_nodes", "itdepth_qnodes",
+    "itdepth_ttstores", "itdepth_tthits", "itdepth_ttfill", "itdepth_fail_highs", "itdepth_fail_lows",
+    "itdepth_aspiration_failhigh_researches", "itdepth_aspiration_faillow_researches", "itdepth_fh_index",
+    "itdepth_see_prunes", "itdepth_delta_prunes", "itdepth_pvs_researches", "itdepth_nmp", "itdepth_nmp_failhigh",
+    "itdepth_nmp_fail",
+}
+TREE_FIELDS = {
+    "treedepth_nodes", "treedepth_qnodes", "treedepth_tt_stores", "treedepth_tt_hits", "treedepth_fail_highs",
+    "treedepth_fail_lows", "treedepth_fh_index", "treedepth_see_prunes", "treedepth_delta_prunes",
+    "treedepth_pvs_researches", "treedepth_nmp", "treedepth_nmp_failhigh",
+    "treedepth_nmp_fail",
+}
+GAME_FIELDS = {
+    "side", "wtime", "btime", "winc", "binc", "movestogo", "depth", "nodes", "movetime", "result", "reason",
+    "opening", "start_fen", "moves", "time_s",
+}
+
+SEARCH_COLUMNS = (
+    "engine_id", "game_id", "sts_id", "fen", "ply", "time_ms", "eval", "completed_depth", "depth", "qdepth", "move",
+    "principal_variation", "nodes", "qnodes", "tt_stores", "tt_hits", "tt_fill",
+    "fail_highs", "fail_lows", "fail_high_researches", "fail_low_researches",
+    "fh_index_0", "fh_index_1", "fh_index_2", "fh_index_3", "fh_index_4to7", "fh_index_8plus",
+    "see_prunes", "delta_prunes", "nmp", "nmp_failhigh", "tt_overwritten",
+)
+ITERATION_COLUMNS = (
+    "search_id", "depth", "time_ms", "eval", "move", "qdepth",
+    "nodes", "qnodes", "tt_stores", "tt_hits", "tt_fill",
+    "fail_highs", "fail_lows", "fail_high_researches", "fail_low_researches",
+    "fh_index_0", "fh_index_1", "fh_index_2", "fh_index_3", "fh_index_4to7", "fh_index_8plus",
+    "see_prunes", "delta_prunes", "pvs_researches", "nmp", "nmp_failhigh",
+)
+TREE_COLUMNS = (
+    "search_id", "depth",
+    "nodes", "qnodes", "tt_stores", "tt_hits", "fail_highs", "fail_lows",
+    "fh_index_0", "fh_index_1", "fh_index_2", "fh_index_3", "fh_index_4to7", "fh_index_8plus",
+    "see_prunes", "delta_prunes", "pvs_researches", "nmp", "nmp_failhigh",
+)
+GAME_COLUMNS = (
+    "experiment_id", "white_engine_id", "black_engine_id",
+    "wtime", "btime", "winc", "binc", "movestogo", "depth", "nodes", "movetime",
+    "result", "termination", "opening", "start_fen", "moves", "run_time_s",
+)
+
+
+class _PassThrough:
+    """The log fields of one table that no explicit mapping reads: into same-named columns
+    (converted to the column's type) or, failing that, into extra_fields."""
+
+    def __init__(self, cnxn, table, explicit_columns, prefix=""):
+        info = cnxn.execute(f'PRAGMA table_info("{table}")').fetchall()
+        self.order = [row[1] for row in info]
+        self.types = {row[1]: row[2] for row in info
+                      if row[1] not in explicit_columns and row[1] not in ("id", "extra_fields")}
+        self.has_extra_fields = "extra_fields" in self.order
+        self.prefix = prefix
+        self.used = set()        # columns some row fills
+        self.unstored = set()    # fields without a column
+        self.mismatched = set()  # fields with a value that doesn't fit their column
+
+    def split(self, fields):
+        """({column: value}, {field: value}) for the fields (name -> value) of one row."""
+        stored, extra = {}, {}
+        for field, value in fields.items():
+            if value is None:
+                continue
+            column = field[len(self.prefix):]
+            if column in self.types:
+                converted = coerce(value, self.types[column])
+                if converted is MISMATCH:
+                    self.mismatched.add(field)
+                    extra[field] = value
+                else:
+                    stored[column] = converted
+                    self.used.add(column)
+            elif field not in BOOKKEEPING_FIELDS:
+                self.unstored.add(field)
+                extra[field] = value
+        return stored, extra
+
+    def columns(self, explicit, rows):
+        """INSERT columns for rows of (explicit values, stored, extra)."""
+        extra = ["extra_fields"] if self.has_extra_fields and any(row[2] for row in rows) else []
+        return tuple(explicit) + tuple(c for c in self.order if c in self.used) + tuple(extra)
+
+    def values(self, explicit, rows):
+        used = [c for c in self.order if c in self.used]
+        with_extra = self.has_extra_fields and any(row[2] for row in rows)
+        return [tuple(values) + tuple(stored.get(c) for c in used)
+                + ((json.dumps(extra) if extra else None,) if with_extra else ())
+                for values, stored, extra in rows]
+
+
+def _report_fields(kind, passes):
+    """Report fields that have no column, or a value of another type, for the given tables."""
+    unstored = sorted(set().union(*(p.unstored for p in passes)))
+    mismatched = sorted(set().union(*(p.mismatched for p in passes)))
+    kept = "Kept in extra_fields" if all(p.has_extra_fields for p in passes) else "Not stored"
+    if unstored:
+        print(f"[ETL] {kind} log fields with no column: {', '.join(unstored)}. {kept}; add a migration "
+              "(data/databases/migrate_schema.py) to give them a column, which is filled from extra_fields.")
+    if mismatched:
+        print(f"[ETL] {kind} log values that don't fit their column's type: {', '.join(mismatched)}. {kept}.")
+    return unstored, mismatched
+
+
+def _first(data, *fields):
+    """The first of `fields` the record has (current name first, then older names)."""
+    return next((f for f in fields if f in data), fields[0])
+
+
+def _insert_sql(table, columns):
+    names = ", ".join(f'"{c}"' for c in columns)
+    return f'INSERT INTO "{table}" ({names}) VALUES ({", ".join("?" * len(columns))})'
+
+
+def _at_depth(data, field, d, past_end=0):
+    """data[field][d] of a per-depth array: None if the engine does not log the field,
+    `past_end` beyond the end of the array."""
+    values = data.get(field)
+    if not isinstance(values, list):
+        return None
+    return values[d] if d < len(values) else past_end
+
+
+def _per_depth(data, field, d):
+    """The value of an unmapped per-depth field for depth index d (None past its end;
+    a field that isn't an array is kept once, with the first depth)."""
+    values = data[field]
+    if isinstance(values, list):
+        return values[d] if d < len(values) else None
+    return values if d == 0 else None
+
+
+_ambiguous_versions_reported = set()
+
+
+def _newest_build(cnxn, version):
+    """The id of the newest engine row with this version string (None if none), reporting
+    once when several builds share it: their logs can't tell them apart."""
+    ids = [row[0] for row in cnxn.execute("SELECT id FROM engines WHERE version = ? ORDER BY id DESC", (version,))]
+    if len(ids) > 1 and version not in _ambiguous_versions_reported:
+        _ambiguous_versions_reported.add(version)
+        print(f"[ETL] {len(ids)} builds are registered as version {version} (ids {', '.join(map(str, ids))}); "
+              f"its log records go to the newest, id {ids[0]}. Pass engine ids to attribute them exactly.")
+    return ids[0] if ids else None
+
+
+def _engine_for_version(cnxn, version, by_version=None):
+    """The engine id of a log record's version string: from `by_version` when given (exact),
+    else the newest build of that version (registered first if unknown)."""
+    if by_version and version in by_version:
+        return by_version[version]
+    return _newest_build(cnxn, version) or get_engine_id(cnxn, version)
+
+
 def _prompt_register_engine(cnxn, version, sample_record):
     """Ask the user whether to register a new, unrecognized engine version.
 
@@ -75,6 +256,7 @@ def log_games_directory(cnxn):
 
 def ingest_log_dir(cnxn, log_dir, clear=True):
     """Ingest all JSONL files from a given log directory."""
+    ensure_schema(cnxn)
     paths = get_jsonl_paths(log_dir)
     game_map = {}
     search_ok = False
@@ -244,18 +426,19 @@ def log_engine_ratings(cnxn, engine_id, ratings) -> int:
 
 def log_sprt(cnxn, experiment_id, candidate_engine_id, baseline_engine_id, **kwargs) -> int:
     """Log an SPRT experiment result and return its row ID."""
+    ensure_schema(cnxn)  # nodes_per_move, threads
     cur = cnxn.execute(
         """
         INSERT INTO sprt (
             experiment_id, baseline_engine_id, candidate_engine_id,
             opening_book, book_depth, time_control, time_per_move,
-            depth_per_move, elo0, elo1, alpha, beta, result, elo_diff,
+            depth_per_move, nodes_per_move, threads, elo0, elo1, alpha, beta, result, elo_diff,
             llr, los, candidate_wins, candidate_losses, candidate_draws,
             candidate_white_wins, candidate_white_losses, candidate_white_draws,
             candidate_black_wins, candidate_black_losses, candidate_black_draws,
             games_played, run_time_s
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             experiment_id,
@@ -266,6 +449,8 @@ def log_sprt(cnxn, experiment_id, candidate_engine_id, baseline_engine_id, **kwa
             kwargs.get("tc"),
             kwargs.get("time"),
             kwargs.get("depth"),
+            kwargs.get("nodes"),
+            kwargs.get("threads"),
             kwargs.get("elo0"),
             kwargs.get("elo1"),
             kwargs.get("alpha"),
@@ -297,6 +482,7 @@ def log_sprt(cnxn, experiment_id, candidate_engine_id, baseline_engine_id, **kwa
 
 def bulk_log_sts(cnxn, path, sts_id, **kwargs) -> None:
     """Bulk-load STS results from a JSONL file."""
+    ensure_schema(cnxn)  # search_nodes
     rows = []
 
     for data in _iter_json_objects_from_path(path):
@@ -306,7 +492,9 @@ def bulk_log_sts(cnxn, path, sts_id, **kwargs) -> None:
         expected_move_2 = expected_moves[1] if len(expected_moves) > 1 else None
         avoid_moves = data.get('avoid_moves') or []
 
-        if expected_moves != []:
+        if "move_ok" in data:
+            correct = bool(data["move_ok"])  # tests/sts.py's verdict, which checks every bm move
+        elif expected_moves != []:
             correct = (move == expected_move_1 or move == expected_move_2)
         elif avoid_moves != []:
             correct = (move != avoid_moves[0])
@@ -320,6 +508,7 @@ def bulk_log_sts(cnxn, path, sts_id, **kwargs) -> None:
             data.get("fen"),
             kwargs.get("time"),
             kwargs.get("depth"),
+            kwargs.get("nodes"),
             move,
             data.get("engine_score"),
             expected_move_1,
@@ -333,26 +522,33 @@ def bulk_log_sts(cnxn, path, sts_id, **kwargs) -> None:
         """
         INSERT INTO sts (
             experiment_id, suite, position_name,
-            fen, search_time_ms, search_depth,
+            fen, search_time_ms, search_depth, search_nodes,
             engine_move, engine_score, expected_move, expected_score,
             alt_expected_move, avoid_move, move_is_correct
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         rows
     )
     cnxn.commit()
 
 
-def bulk_log_game(cnxn, path, experiment_id=None, second_engine_id=None) -> dict:
+def bulk_log_game(cnxn, path, experiment_id=None, second_engine_id=None, engine_id=None, commit=True,
+                  engine_ids_by_version=None) -> dict:
     """
     Bulk-load games from a JSONL file. Returns {game_uuid: game_id} mapping.
     
     Handles multi-engine JSONL files: if multiple records share the same game_uuid
     (from different engines), both engine IDs are resolved from the records themselves.
     Falls back to second_engine_id for the opponent when only one engine logged.
+    Pass `engine_id` when the file holds one engine's logs (its own log directory):
+    its records are attributed to it instead of being looked up by version string.
+    engine_ids_by_version ({version: engine id}) attributes records exactly when several
+    builds share a version (e.g. a release's DEV and Prod builds).
+    commit=False leaves the rows in the caller's open transaction.
     """
     cursor = cnxn.cursor()
+    passthrough = _PassThrough(cnxn, "games", GAME_COLUMNS)
 
     # first pass: collect all records grouped by game_uuid
     game_records = {} # game_uuid -> list of record dicts
@@ -378,7 +574,8 @@ def bulk_log_game(cnxn, path, experiment_id=None, second_engine_id=None) -> dict
 
         # resolve engine  IDs from all records 
         for rec in records:
-            rec_engine_id = get_engine_id(cnxn, rec.get('engine_id'))
+            rec_engine_id = engine_id if engine_id is not None else \
+                _engine_for_version(cnxn, rec.get('engine_id'), engine_ids_by_version)
             if rec.get('side') == 'white':
                 white_engine_id = rec_engine_id
             else:
@@ -390,7 +587,9 @@ def bulk_log_game(cnxn, path, experiment_id=None, second_engine_id=None) -> dict
         if black_engine_id is None:
             black_engine_id = second_engine_id
 
-        rows.append((
+        stored, extra = passthrough.split(
+            {f: v for f, v in primary.items() if f not in GAME_FIELDS and f not in LINK_FIELDS})
+        rows.append(((
             experiment_id,
             white_engine_id,
             black_engine_id,
@@ -408,21 +607,11 @@ def bulk_log_game(cnxn, path, experiment_id=None, second_engine_id=None) -> dict
             primary.get("start_fen"),
             json.dumps(primary.get("moves")),
             primary.get("time_s")
-        ))
+        ), stored, extra))
 
-    cursor.executemany(
-        """
-        INSERT INTO games (
-            experiment_id,
-            white_engine_id, black_engine_id,
-            wtime, btime, winc, binc, movestogo, depth, nodes, movetime,
-            result, termination,
-            opening, start_fen, moves, run_time_s
-        )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        rows
-    )
+    cursor.executemany(_insert_sql("games", passthrough.columns(GAME_COLUMNS, rows)),
+                       passthrough.values(GAME_COLUMNS, rows))
+    _report_fields("game", [passthrough])
 
     # Recover inserted IDs deterministically
     cursor.execute(
@@ -431,7 +620,8 @@ def bulk_log_game(cnxn, path, experiment_id=None, second_engine_id=None) -> dict
     )
     game_ids = [r[0] for r in cursor.fetchall()][::-1]
 
-    cnxn.commit()
+    if commit:
+        cnxn.commit()
     return dict(zip(game_order, game_ids))
 
 
@@ -442,14 +632,18 @@ def bulk_log_search_and_timing(
     engine_id=None,
     timing_path=None,
     root_moves_path=None,
-    sts_id=None
+    sts_id=None,
+    commit=True,
+    engine_ids_by_version=None
 ) -> dict:
     """Bulk-load searches, per-depth iterations, tree stats, and timing from JSONL.
 
     Supports search logs that mix multiple engines: each record's engine is
     resolved individually via its own `engine_version` field (cached so we
     don't re-query the DB per row). Pass `engine_id` explicitly to force a
-    single engine for every record (old single-engine behavior).
+    single engine for every record (old single-engine behavior), or
+    engine_ids_by_version ({version: engine id}) when several builds share a version.
+    commit=False leaves the rows in the caller's open transaction.
     """
     cursor = cnxn.cursor()
 
@@ -479,22 +673,29 @@ def bulk_log_search_and_timing(
         if version in engine_id_cache:
             return engine_id_cache[version]
         
+        if engine_ids_by_version and version in engine_ids_by_version:
+            engine_id_cache[version] = engine_ids_by_version[version]
+            return engine_id_cache[version]
+
         if version in KNOWN_SKIP_VERSIONS:
             engine_id_cache[version] = None 
             return None
         
-        # Check DB directly 
-        row = cnxn.execute(
-            "SELECT id FROM engines WHERE version=?", (version,)
-        ).fetchone()
+        # Check DB directly (the newest build when several share the version)
+        row = _newest_build(cnxn, version)
 
         if row is not None:
-            engine_id_cache[version] = row[0]
-            return row[0]
+            engine_id_cache[version] = row
+            return row
 
         resolved = _prompt_register_engine(cnxn, version, data)
         engine_id_cache[version] = resolved 
         return resolved
+
+    # log fields no explicit mapping reads: same-named columns or extra_fields (top of this file)
+    search_pass = _PassThrough(cnxn, "searches", SEARCH_COLUMNS)
+    iteration_pass = _PassThrough(cnxn, "searches_by_iteration", ITERATION_COLUMNS, prefix="itdepth_")
+    tree_pass = _PassThrough(cnxn, "searches_by_tree_depth", TREE_COLUMNS, prefix="treedepth_")
 
     # ── SEARCHES ──
     for data in _iter_json_objects_from_path(search_path):
@@ -508,7 +709,10 @@ def bulk_log_search_and_timing(
             game_uuid = data["game_uuid"]
             game_id = game_map.get(game_uuid)
 
-        searches_rows.append((
+        stored, extra = search_pass.split({f: v for f, v in data.items()
+                                           if f not in SEARCH_FIELDS and f not in LINK_FIELDS
+                                           and not f.startswith(("itdepth_", "treedepth_"))})
+        searches_rows.append(((
             row_engine_id,
             game_id,
             sts_id,
@@ -531,20 +735,18 @@ def bulk_log_search_and_timing(
             data.get("aspiration_fail_high_researches"),
             data.get("aspiration_fail_low_researches"),
             # fail-high move index histogram buckets
-            safe(data.get("fail_high_index", []), 0),
-            safe(data.get("fail_high_index", []), 1),
-            safe(data.get("fail_high_index", []), 2),
-            safe(data.get("fail_high_index", []), 3),
-            safe(data.get("fail_high_index", []), 4),
-            safe(data.get("fail_high_index", []), 5),
+            _at_depth(data, "fail_high_index", 0),
+            _at_depth(data, "fail_high_index", 1),
+            _at_depth(data, "fail_high_index", 2),
+            _at_depth(data, "fail_high_index", 3),
+            _at_depth(data, "fail_high_index", 4),
+            _at_depth(data, "fail_high_index", 5),
             data.get("see_prunes"),
             data.get("delta_prunes"),
             data.get("nmp"),
-            data.get("nmp_failhigh"),
+            data.get(_first(data, "nmp_failhigh", "nmp_fail")),
             data.get("tt_overwritten"),
-            data["search_uuid"],   # temp key: uuid mapping
-            #engine_version,        # temp key: dev/test filtering
-        ))
+        ), stored, extra, data["search_uuid"]))
 
     # engines that never get logged — filtered by version string, not id
     #searches_rows = [
@@ -552,19 +754,9 @@ def bulk_log_search_and_timing(
     #    if row[-1] not in ('dev', 'test')
     #]
 
-    cursor.executemany(
-        """
-        INSERT INTO searches (
-            engine_id, game_id, sts_id, fen, ply, time_ms, eval, completed_depth, depth, qdepth, move,
-            principal_variation, nodes, qnodes, tt_stores, tt_hits, tt_fill,
-            fail_highs, fail_lows, fail_high_researches, fail_low_researches,
-            fh_index_0, fh_index_1, fh_index_2, fh_index_3, fh_index_4to7, fh_index_8plus,
-            see_prunes, delta_prunes, nmp, nmp_failhigh, tt_overwritten
-        )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        [row[:-1] for row in searches_rows]  # drop search_uuid temp keys
-    )
+    search_rows = [row[:3] for row in searches_rows]
+    cursor.executemany(_insert_sql("searches", search_pass.columns(SEARCH_COLUMNS, search_rows)),
+                       search_pass.values(SEARCH_COLUMNS, search_rows))
 
     # Recover search IDs
     cursor.execute(
@@ -574,7 +766,7 @@ def bulk_log_search_and_timing(
     search_ids = [r[0] for r in cursor.fetchall()][::-1]
 
     for row, sid in zip(searches_rows, search_ids):
-        uuid_map[row[-1]] = sid  # search_uuid is now last element
+        uuid_map[row[3]] = sid
 
     # ── PER-ITERATION DEPTH ──
     depth_rows = []
@@ -584,25 +776,27 @@ def bulk_log_search_and_timing(
 
         n = len(data.get("itdepth_nodes", []))
         fh_index_data = data.get("itdepth_fh_index", [])
+        unmapped = [f for f in data if f.startswith("itdepth_") and f not in ITERATION_FIELDS]
         for d in range(n):
             # Extract per-depth fh_index bucket (array of 6 values)
             fh_buckets = safe(fh_index_data, d) if d < len(fh_index_data) else None
-            depth_rows.append((
+            stored, extra = iteration_pass.split({f: _per_depth(data, f, d) for f in unmapped})
+            depth_rows.append(((
                 search_id,
                 d + 1,
-                safe(data.get("itdepth_time_ms", []), d),
-                safe(data.get("itdepth_eval", []), d),
-                safe(data.get("itdepth_move", []), d),
-                safe(data.get("itdepth_qdepth", []), d),
-                safe(data.get("itdepth_nodes", []), d),
-                safe(data.get("itdepth_qnodes", []), d),
-                safe(data.get("itdepth_ttstores", []), d),
-                safe(data.get("itdepth_tthits", []), d),
-                safe(data.get("itdepth_ttfill", []), d),
-                safe(data.get("itdepth_fail_highs", []), d),
-                safe(data.get("itdepth_fail_lows", []), d),
-                safe(data.get("itdepth_aspiration_failhigh_researches", []), d),
-                safe(data.get("itdepth_aspiration_faillow_researches", []), d),
+                _at_depth(data, "itdepth_time_ms", d),
+                _at_depth(data, "itdepth_eval", d),
+                _at_depth(data, "itdepth_move", d),
+                _at_depth(data, "itdepth_qdepth", d),
+                _at_depth(data, "itdepth_nodes", d),
+                _at_depth(data, "itdepth_qnodes", d),
+                _at_depth(data, "itdepth_ttstores", d),
+                _at_depth(data, "itdepth_tthits", d),
+                _at_depth(data, "itdepth_ttfill", d),
+                _at_depth(data, "itdepth_fail_highs", d),
+                _at_depth(data, "itdepth_fail_lows", d),
+                _at_depth(data, "itdepth_aspiration_failhigh_researches", d),
+                _at_depth(data, "itdepth_aspiration_faillow_researches", d),
                 # fail-high index histogram per iteration depth
                 fh_buckets[0] if isinstance(fh_buckets, list) and len(fh_buckets) > 0 else None,
                 fh_buckets[1] if isinstance(fh_buckets, list) and len(fh_buckets) > 1 else None,
@@ -610,28 +804,15 @@ def bulk_log_search_and_timing(
                 fh_buckets[3] if isinstance(fh_buckets, list) and len(fh_buckets) > 3 else None,
                 fh_buckets[4] if isinstance(fh_buckets, list) and len(fh_buckets) > 4 else None,
                 fh_buckets[5] if isinstance(fh_buckets, list) and len(fh_buckets) > 5 else None,
-                safe(data.get("itdepth_see_prunes", []), d),
-                safe(data.get("itdepth_delta_prunes", []), d),
-                safe(data.get("itdepth_pvs_researches", []), d),
-                safe(data.get("itdepth_nmp", []), d),
-                safe(data.get("itdepth_nmp_failhigh", []), d),
-            ))
+                _at_depth(data, "itdepth_see_prunes", d),
+                _at_depth(data, "itdepth_delta_prunes", d),
+                _at_depth(data, "itdepth_pvs_researches", d),
+                _at_depth(data, "itdepth_nmp", d),
+                _at_depth(data, _first(data, "itdepth_nmp_failhigh", "itdepth_nmp_fail"), d),
+            ), stored, extra))
 
-    cursor.executemany(
-        """
-        INSERT INTO searches_by_iteration (
-            search_id, depth, time_ms, eval, move, qdepth,
-            nodes, qnodes, tt_stores, tt_hits, tt_fill,
-            fail_highs, fail_lows,
-            fail_high_researches, fail_low_researches,
-            fh_index_0, fh_index_1, fh_index_2, fh_index_3, fh_index_4to7, fh_index_8plus,
-            see_prunes, delta_prunes,
-            pvs_researches, nmp, nmp_failhigh
-        )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        depth_rows
-    )
+    cursor.executemany(_insert_sql("searches_by_iteration", iteration_pass.columns(ITERATION_COLUMNS, depth_rows)),
+                       iteration_pass.values(ITERATION_COLUMNS, depth_rows))
 
     # ── PER-TREE DEPTH ──
     ply_rows = []
@@ -641,17 +822,19 @@ def bulk_log_search_and_timing(
 
         n = len(data.get("treedepth_nodes", []))
         fh_index_tree = data.get("treedepth_fh_index", [])
+        unmapped = [f for f in data if f.startswith("treedepth_") and f not in TREE_FIELDS]
         for d in range(n):
             fh_buckets = safe(fh_index_tree, d) if d < len(fh_index_tree) else None
-            ply_rows.append((
+            stored, extra = tree_pass.split({f: _per_depth(data, f, d) for f in unmapped})
+            ply_rows.append(((
                 search_id,
                 d + 1,
-                safe(data.get("treedepth_nodes", []), d),
-                safe(data.get("treedepth_qnodes", []), d),
-                safe(data.get("treedepth_tt_stores", []), d),
-                safe(data.get("treedepth_tt_hits", []), d),
-                safe(data.get("treedepth_fail_highs", []), d),
-                safe(data.get("treedepth_fail_lows", []), d),
+                _at_depth(data, "treedepth_nodes", d),
+                _at_depth(data, "treedepth_qnodes", d),
+                _at_depth(data, "treedepth_tt_stores", d),
+                _at_depth(data, "treedepth_tt_hits", d),
+                _at_depth(data, "treedepth_fail_highs", d),
+                _at_depth(data, "treedepth_fail_lows", d),
                 # fail-high index histogram per tree depth
                 fh_buckets[0] if isinstance(fh_buckets, list) and len(fh_buckets) > 0 else None,
                 fh_buckets[1] if isinstance(fh_buckets, list) and len(fh_buckets) > 1 else None,
@@ -659,26 +842,16 @@ def bulk_log_search_and_timing(
                 fh_buckets[3] if isinstance(fh_buckets, list) and len(fh_buckets) > 3 else None,
                 fh_buckets[4] if isinstance(fh_buckets, list) and len(fh_buckets) > 4 else None,
                 fh_buckets[5] if isinstance(fh_buckets, list) and len(fh_buckets) > 5 else None,
-                safe(data.get("treedepth_see_prunes", []), d),
-                safe(data.get("treedepth_delta_prunes", []), d),
-                safe(data.get("treedepth_pvs_researches", []), d),
-                safe(data.get("treedepth_nmp", []), d),
-                safe(data.get("treedepth_nmp_failhigh", []), d),
-            ))
+                _at_depth(data, "treedepth_see_prunes", d),
+                _at_depth(data, "treedepth_delta_prunes", d),
+                _at_depth(data, "treedepth_pvs_researches", d),
+                _at_depth(data, "treedepth_nmp", d),
+                _at_depth(data, _first(data, "treedepth_nmp_failhigh", "treedepth_nmp_fail"), d),
+            ), stored, extra))
 
-    cursor.executemany(
-        """
-        INSERT INTO searches_by_tree_depth (
-            search_id, depth,
-            nodes, qnodes, tt_stores, tt_hits, fail_highs, fail_lows,
-            fh_index_0, fh_index_1, fh_index_2, fh_index_3, fh_index_4to7, fh_index_8plus,
-            see_prunes, delta_prunes,
-            pvs_researches, nmp, nmp_failhigh
-        )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        ply_rows
-    )
+    cursor.executemany(_insert_sql("searches_by_tree_depth", tree_pass.columns(TREE_COLUMNS, ply_rows)),
+                       tree_pass.values(TREE_COLUMNS, ply_rows))
+    unstored, mismatched = _report_fields("search", [search_pass, iteration_pass, tree_pass])
 
     # ── TIMING ──
     timing_rows = []
@@ -740,7 +913,8 @@ def bulk_log_search_and_timing(
             root_moves_rows
         )
 
-    cnxn.commit()
+    if commit:
+        cnxn.commit()
 
     counts = {
         "searches": len(searches_rows),
@@ -749,6 +923,8 @@ def bulk_log_search_and_timing(
         "timing_rows": len(timing_rows),
         "root_moves_rows": len(root_moves_rows),
         "skipped": len(skipped_uuids),
+        "unstored_fields": unstored,
+        "mismatched_fields": mismatched,
     }
 
     print(

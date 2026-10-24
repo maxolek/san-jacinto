@@ -2,6 +2,9 @@ SELECT
     search_id, depth, qdepth,
     time_ms,
     eval AS eval, move,
+    -- evaluation without mate scores (+/-(100000 - plies)), and the mate side
+    CASE WHEN abs(eval) < 99000 THEN eval END AS eval_cp,
+    CASE WHEN eval >= 99000 THEN 1 WHEN eval <= -99000 THEN -1 WHEN eval IS NOT NULL THEN 0 END AS mate,
     nodes AS nodes, qnodes AS qnodes,
     tt_stores AS tt_stores, tt_hits AS tt_hits,
     fail_highs AS fail_highs, fail_lows AS fail_lows,

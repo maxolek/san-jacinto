@@ -1,6 +1,15 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { resolveDataSource } from '../src/data-source.js';
+import { duckdbConfig, resolveDataSource } from '../src/data-source.js';
+
+test('snapshots are opened with range reads that tolerate GitHub Pages HEAD responses', () => {
+  const config = duckdbConfig();
+  assert.deepEqual(config.filesystem, { allowFullHTTPReads: true, forceFullHTTPReads: false, reliableHeadRequests: false });
+  assert.equal(config.query.castBigIntToDouble, true);
+  assert.equal(duckdbConfig({ fullDownload: true }).filesystem.forceFullHTTPReads, true);
+  // a fresh object every time, so callers cannot mutate a shared default
+  assert.notEqual(duckdbConfig().filesystem, duckdbConfig().filesystem);
+});
 
 const page = 'https://example.org/san-jacinto/';
 const digest = 'a'.repeat(64);

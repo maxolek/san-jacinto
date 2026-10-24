@@ -15,7 +15,12 @@ import shutil
 import signal
 import queue
 
-from utils.pentanomial import FINISHED_GAME, PentanomialSPRT
+from utils.openings import OpeningBook, OpeningRegister, classify, display_name  # noqa: E402
+from utils.pentanomial import FINISHED_GAME, LABELS, PairTally, PentanomialSPRT  # noqa: E402
+
+from utils import environment  # noqa: E402
+from utils.match_runner import (EngineSpec, JobSpec, MatchRunner, describe_slots, plan_slots,  # noqa: E402
+                                print_line, tc_arguments)
 from utils.fastchess_match import (
     FASTCHESS, Side, limit_args, limit_label, prepare_match, run_fastchess, run_match, stop_fastchess, tb_args
 )
@@ -43,6 +48,294 @@ def parse_fastchess_output(output, candidate_name="Candidate", elo0=0, elo1=10,
             black = "Candidate" if black == candidate_name else black
             state.add_game(int(number), white, black, result)
     return state.snapshot()
+
+
+# ----------------------------------------------------------------------------
+# Presentation helpers
+# ----------------------------------------------------------------------------
+
+def termination_class(reason):
+    """Coarse class of a cutechess termination text, and the side at fault if any."""
+    text = (reason or "").lower()
+    side = "white" if text.startswith("white") else "black" if text.startswith("black") else None
+    for key, label in (("loses on time", "time forfeit"), ("disconnects", "crash"),
+                       ("connection stalls", "stall"), ("illegal move", "illegal move"),
+                       ("resigns", "resignation"), ("mates", "mate"), ("stalemate", "stalemate"),
+                       ("3-fold", "repetition"), ("fifty", "50-move rule"),
+                       ("insufficient", "insufficient material"), ("maximal game length", "move limit"),
+                       ("adjudication", "adjudication")):
+        if key in text:
+            return label, (side if label in ("time forfeit", "crash", "stall", "illegal move") else None)
+    return (text or "unknown"), None
+
+
+def fmt_elo(value, low=None, high=None):
+    if value is None:
+        return "   n/a"
+    if low is None:
+        return f"{value:+6.1f}"
+    return f"{value:+6.1f} +/-{(high - low) / 2:4.1f}"
+
+
+def fmt_ghz(mhz):
+    return f"{mhz / 1000:.1f}GHz" if mhz else "  -   "
+
+
+
+class SprtController:
+    """Schedules opening pairs on the slots and turns finished games into SPRT evidence."""
+
+    def __init__(self, args, engines, book, slots, run_dir, plotter=None):
+        self.args, self.engines, self.book, self.slots = args, engines, book, slots
+        self.run_dir = Path(run_dir)
+        self.plotter = plotter
+        self.state = PentanomialSPRT(args.elo0, args.elo1, args.alpha, args.beta)
+        self.max_pairs = args.max_games // 2
+        # Pairs excluded (unfinished, or an engine off its core) are replayed, but only up to a
+        # limit: if many are excluded something is systematically wrong and the run must stop.
+        self.max_excluded = max(20, self.max_pairs // 20)
+        self.stop_reason = None
+        self.planned = 0
+        self.next_global = 0
+        self.global_of = {}         # (job id, pair no) -> global pair index (start order)
+        self.pairs = {}             # global index -> dict(job, pair_no, opening, games={1: score, 2: score})
+        self.fed = 0                # pairs already added to the breakdowns (same order as the SPRT)
+        self.tainted = set()        # global indexes of pairs with a game that mixed core types
+        self.by_core = {}           # core type -> PairTally
+        self.core_time = {}         # core type -> [seconds, games, mhz sum, mhz count]
+        self.register = OpeningRegister()
+        self.terminations = {}      # (class, engine at fault or None) -> count
+        self.failures = 0
+        self.started = time.time()
+        self.last_status = 0.0
+        self.status_dirty = False
+        self.games_file = open(self.run_dir / "games.jsonl", "w", encoding="utf-8")
+        self.stats_file = open(self.run_dir / "stats.jsonl", "w", encoding="utf-8")
+        self.finished_games = 0
+
+    # -- scheduling -----------------------------------------------------------
+
+    def next_job(self, slot):
+        if self.state.result != "inconclusive" or self.planned >= self.max_pairs or self.stop_reason:
+            return None
+        if self.failures >= max(3, len(self.slots)):
+            return None
+        remaining = self.max_pairs - self.planned
+        size = max(1, min(self.args.pairs_per_job, math.ceil(remaining / len(self.slots))))
+        self.planned += size
+        return JobSpec(self.engines, self.book.take(size), self.book)
+
+    def on_pair_start(self, job, pair_no):
+        index = self.next_global
+        self.next_global += 1
+        self.global_of[(job.id, pair_no)] = index
+        self.pairs[index] = dict(job=job, pair_no=pair_no, opening=job.spec.openings[pair_no - 1], games={})
+        return True
+
+    def excluded(self):
+        return len(self.state.voided)
+
+    def finished(self):
+        if self.stop_reason is None and self.excluded() > self.max_excluded:
+            self.stop_reason = (f"{self.excluded()} pairs had to be excluded (limit {self.max_excluded}); "
+                                "see the warnings above and the job logs")
+            print_line(f"[SPRT] stopping: {self.stop_reason}")
+        return self.state.result != "inconclusive" or self.stop_reason is not None
+
+    # -- results --------------------------------------------------------------
+
+    def on_game(self, game):
+        index = self.global_of.get((game.job.id, game.pair_no))
+        if index is None:
+            return
+        number = 2 * index + (1 if game.game_no % 2 else 2)
+        score = game.score_for("Candidate")
+        pair = self.pairs[index]
+        details = classify(pair["opening"])
+        env = game.env
+        term, fault_side = termination_class(game.reason)
+        fault = None
+        if fault_side:
+            fault = game.white if fault_side == "white" else game.black
+        self.terminations[(term, fault)] = self.terminations.get((term, fault), 0) + 1
+        record = dict(run=self.run_dir.name, game=number, pair=index + 1, job=game.job.id, job_game=game.game_no,
+                      white=game.white, black=game.black, result=game.result, reason=game.reason,
+                      termination=term, candidate_score=score, seconds=round(game.seconds, 2),
+                      started_utc=datetime.fromtimestamp(game.started, timezone.utc).isoformat(),
+                      finished_utc=datetime.fromtimestamp(game.finished, timezone.utc).isoformat(),
+                      eco=details[0], opening=details[1], variation=details[2], **env)
+        self.games_file.write(json.dumps(record) + "\n")
+        self.games_file.flush()
+        self.finished_games += 1
+        if not self.args.quiet and self.state.result == "inconclusive":
+            opening = display_name(details)
+            print_line(f"  #{number:<6d} {env['core_type']} cpu{env['cpu'] if env['cpu'] is not None else '-':<3} "
+                       f"{fmt_ghz(env.get('mhz_mean'))}  {game.white[:9]:>9s}-{game.black[:9]:<9s} "
+                       f"{game.result:<7s} {term:<21s} {game.seconds:6.1f}s  {opening[:44]}")
+        if score is None:
+            return
+        if env.get("core_mixed"):
+            # Never count a game that may have been P-core against E-core.
+            if index not in self.tainted:
+                self.tainted.add(index)
+                self.state.void_pair(index)
+                self._feed_breakdowns()
+                print_line(f"[SPRT] pair {index + 1} excluded: an engine left its {env['core_type']}-core "
+                           f"(cpu {env['cpu']}) during game {number}")
+            return
+        pair["games"][game.game_no % 2 or 2] = (score, game.seconds, env.get("mhz_mean"), env["core_type"])
+        updates = self.state.add_game(number, game.white, game.black, game.result)
+        self._feed_breakdowns()
+        for snapshot in updates:
+            self.stats_file.write(json.dumps(self._enrich(snapshot), allow_nan=False) + "\n")
+            if self.plotter:
+                self.plotter.update(snapshot)
+        if updates:
+            self.stats_file.flush()
+            self.status_dirty = True
+            if self.state.result != "inconclusive":
+                self.print_status(force=True)
+
+    def _feed_breakdowns(self):
+        """Per-core and per-opening tallies see exactly the pairs the SPRT has tested."""
+        while self.fed < self.state.next_pair:
+            pair = self.pairs.get(self.fed)
+            self.fed += 1
+            if not pair or len(pair["games"]) < 2 or (self.fed - 1) in self.tainted:
+                continue  # voided
+            (s1, t1, m1, core), (s2, t2, m2, _) = pair["games"][1], pair["games"][2]
+            self.by_core.setdefault(core, PairTally()).add_pair(s1, s2)
+            timing = self.core_time.setdefault(core, [0.0, 0, 0.0, 0])
+            timing[0] += t1 + t2
+            timing[1] += 2
+            for mhz in (m1, m2):
+                if mhz:
+                    timing[2] += mhz
+                    timing[3] += 1
+            self.register.record_pair(pair["opening"], (s1, s2), core)
+
+    def on_job_end(self, job):
+        unstarted = job.pairs - job.pairs_started
+        voided = 0
+        for pair_no in range(1, job.pairs_started + 1):
+            index = self.global_of.get((job.id, pair_no))
+            if index is None:
+                continue
+            if index in self.tainted:
+                voided += 1
+            elif len(self.pairs[index]["games"]) < 2:
+                voided += 1
+                self.state.void_pair(index)
+        self._feed_breakdowns()
+        self.planned -= unstarted + voided
+        if job.killed:
+            return
+        if job.returncode or not job.games:
+            self.failures += 1
+            tail = job.log_path.read_text(encoding="utf-8", errors="replace").splitlines()[-8:]
+            print_line(f"[SPRT] job {job.id} on {job.slot.label} exited with code {job.returncode} "
+                       f"after {len(job.games)} games; last output:\n    " + "\n    ".join(tail))
+            if self.failures >= max(3, len(self.slots)):
+                print_line("[SPRT] too many failed jobs, not starting new ones")
+        else:
+            self.failures = 0
+        if voided:
+            print_line(f"[SPRT] job {job.id}: {voided} pair(s) excluded from the test "
+                       "(unfinished, or an engine left its core)")
+
+    def on_warning(self, job, text):
+        print_line(f"[cutechess] {text}")
+
+    def tick(self):
+        if self.plotter:
+            self.plotter._pump_events()
+        self.print_status()
+
+    # -- reporting ------------------------------------------------------------
+
+    def _enrich(self, snapshot):
+        snapshot = dict(snapshot)
+        snapshot["by_core"] = {core: t.summary() for core, t in sorted(self.by_core.items())}
+        snapshot["elapsed_s"] = round(time.time() - self.started, 1)
+        return snapshot
+
+    def rate(self):
+        minutes = (time.time() - self.started) / 60
+        return self.finished_games / minutes if minutes > 0 else 0.0
+
+    def print_status(self, force=False):
+        now = time.monotonic()
+        if not force and (not self.status_dirty or now - self.last_status < self.args.status_every):
+            return
+        self.last_status, self.status_dirty = now, False
+        s = self.state.snapshot()
+        if not s["pairs"]:
+            return
+        progress = s["llr_progress"]
+        direction = "H1" if s["llr"] >= 0 else "H0"
+        cores = "  ".join(f"{core}:{fmt_elo(t.summary()['elo_diff']).strip()}({t.pairs})"
+                          for core, t in sorted(self.by_core.items()))
+        eta = f"  ~{s['eta_pairs']:,} pairs to go" if s["eta_pairs"] is not None else ""
+        print_line(
+            f"[SPRT] {s['pairs']:,} pairs | LLR {s['llr']:+.2f} [{s['lbound']:+.2f},{s['ubound']:+.2f}] "
+            f"{abs(progress):.0%} to {direction} | Elo {fmt_elo(s['elo_diff'], s['elo_low'], s['elo_high'])} "
+            f"| nElo {fmt_elo(s['nelo'], s['nelo_low'], s['nelo_high'])} | LOS {s['los']:.1f}% | "
+            f"penta {'-'.join(map(str, s['pentanomial']))} | {cores} | {self.rate():.1f} games/min{eta}")
+
+    def report(self, stats, elapsed):
+        s = stats
+        lines = ["", "=" * 78,
+                 f"SPRT {s['result'].upper()}   ({s['pairs']:,} pairs = {s['games_played']:,} games, "
+                 f"{elapsed / 60:.1f} min, {self.rate():.1f} games/min)", "=" * 78]
+        if s["pairs"]:
+            lines += [
+                f"  LLR       {s['llr']:+.3f}   bounds [{s['lbound']:+.3f}, {s['ubound']:+.3f}]   "
+                f"H0: Elo {s['elo0']:+g}  H1: Elo {s['elo1']:+g}  alpha {s['alpha']} beta {s['beta']}",
+                f"  Elo       {s['elo_diff']:+.2f}   95% CI [{s['elo_low']:+.2f}, {s['elo_high']:+.2f}]   "
+                f"LOS {s['los']:.2f}%",
+                f"  nElo      {s['nelo']:+.2f}   95% CI [{s['nelo_low']:+.2f}, {s['nelo_high']:+.2f}]",
+                f"  score     {s['score']:.4f} per game   pair sd {s['pair_stdev']:.4f}"
+                + (f"   pair/game variance ratio {s['variance_ratio']:.3f}" if s["variance_ratio"] else "")
+                + ("  (pairing removes {:.0%} of the variance)".format(1 - s['variance_ratio'])
+                   if s['variance_ratio'] and s['variance_ratio'] < 1 else ""),
+                "  pairs     " + "   ".join(f"{label} {n}" for label, n in zip(LABELS, s["pentanomial"]))
+                + f"   (DD {s['pentanomial_detail']['DD']}, WL {s['pentanomial_detail']['WL']})",
+                f"  games     +{s['candidate_wins']} ={s['candidate_draws']} -{s['candidate_losses']}   "
+                f"as white +{s['candidate_white_wins']} ={s['candidate_white_draws']} -{s['candidate_white_losses']}"
+                f"   as black +{s['candidate_black_wins']} ={s['candidate_black_draws']} -{s['candidate_black_losses']}"
+                f"   draws {s['draw_ratio']:.1f}%",
+            ]
+            if s["voided_pairs"]:
+                lines.append(f"  excluded  {s['voided_pairs']} pair(s): unfinished, or an engine left its core"
+                             f" ({s.get('excluded_pairs', 0)} of them)")
+            if s.get("repinned_games"):
+                lines.append(f"  pinning   {s['repinned_games']} game(s) started with an engine outside its core; "
+                             "it was moved back before the game")
+            lines += ["", "  By core type (both engines of a game on the same core):",
+                      f"    {'core':4s} {'pairs':>6s} {'Elo':>16s} {'nElo':>7s} {'penta LL-LD-DD/WL-WD-WW':>24s} "
+                      f"{'s/game':>7s} {'clock':>7s}"]
+            for core, tally in sorted(self.by_core.items()):
+                t = tally.summary()
+                seconds, games, mhz_sum, mhz_n = self.core_time.get(core, [0, 0, 0, 0])
+                lines.append(f"    {core:4s} {t['pairs']:>6d} {fmt_elo(t['elo_diff'], t['elo_low'], t['elo_high']):>16s} "
+                             f"{t['nelo']:>+7.1f} {'-'.join(map(str, t['pentanomial'])):>24s} "
+                             f"{seconds / max(games, 1):>7.1f} {fmt_ghz(mhz_sum / mhz_n if mhz_n else None):>7s}")
+        if self.terminations:
+            lines += ["", "  Terminations:"]
+            for (term, fault), count in sorted(self.terminations.items(), key=lambda kv: -kv[1]):
+                lines.append(f"    {count:6d}  {term}{f'  ({fault})' if fault else ''}")
+            bad = {k: v for k, v in self.terminations.items() if k[1]}
+            if bad:
+                lines.append("    ! time forfeits / crashes / illegal moves above count as losses")
+        if self.register.rows:
+            lines += ["", "  Openings by family:", self.register.format_table(limit=10, level="family"),
+                      "", "  Openings by variation:", self.register.format_table(limit=10, level="variation")]
+        print_line("\n".join(lines))
+
+    def close(self):
+        self.games_file.close()
+        self.stats_file.close()
+
 
 
 def ingest_telemetry(cnxn, run_logs, ids):

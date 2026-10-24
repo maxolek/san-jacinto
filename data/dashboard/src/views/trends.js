@@ -1,147 +1,94 @@
-/**
- * Trends tab — engine version comparison over time.
- * Shows how key metrics evolve across versions with metric selection.
- */
-import { coordinator, Selection } from '@uwdata/mosaic-core';
+/** Trends: how key metrics move from version to version, in registration order. */
 import * as vg from '@uwdata/vgplot';
-import { sql, el, panel, plotPanel, getSearchTable, controlsBar, controlGroup, nativeSelect, summaryRow, fmt, COLORS } from '../util.js';
+import { dataset } from '../datasets.js';
+import { query } from '../db.js';
+import { engineById, engineWhere, shortLabel } from '../engines.js';
+import { coreRows, coreType } from '../settings.js';
+import { chartWidth, el, emptyNote, engineColors, panel, plot, reactive, selectInput, sourceNote } from '../ui.js';
+import { fillSampleErrors, METRICS } from './compare.js';
 
-const METRIC_OPTIONS = [
-  { value: 'avg_depth', label: 'Avg Depth' },
-  { value: 'avg_nodes', label: 'Avg Nodes' },
-  { value: 'avg_time_ms', label: 'Avg Time (ms)' },
-  { value: 'avg_tt_hits', label: 'Avg TT Hits' },
-  { value: 'avg_fail_highs', label: 'Avg Fail Highs' },
-  { value: 'avg_nmp', label: 'Avg NMP' },
-];
+const Z = 1.96;
+const SMALL = ['Nodes per second', 'Mean depth', 'Median time', 'TT hit rate', 'First-move cutoffs', 'Quiescence share'];
+// y axis title and scale factor per metric
+const AXES = {
+  'Nodes per second': ['Million nodes per second', 1e-6],
+  'Mean depth': ['Mean completed depth (plies)', 1],
+  'Median time': ['Median search time (ms)', 1],
+  'Mean nodes': ['Mean nodes per search (millions)', 1e-6],
+  'TT hit rate': ['TT hits per node (%)', 100],
+  'First-move cutoffs': ['Cutoffs by the first move (%)', 100],
+  'Quiescence share': ['Quiescence share of nodes (%)', 100],
+  'Null-move success': ['Null moves that failed high (%)', 100],
+};
+const CAPTIONS = {
+  'Nodes per second': 'Total nodes over total search time; the Hardware tab separates code speed from clock speed.',
+  'Mean depth': 'Average completed iterative-deepening depth per search.',
+  'Median time': 'Half of the searches took less than this.',
+  'TT hit rate': 'Transposition-table hits per node searched.',
+  'First-move cutoffs': 'Share of beta cutoffs caused by the first move tried; higher means better move ordering.',
+  'Quiescence share': 'Share of all nodes spent in quiescence search.',
+};
 
-export async function renderTrends() {
-  const searchTable = getSearchTable();
-  const tables = window.__tables || [];
-
-  if (!searchTable || !tables.includes('engines')) {
-    return el('div', { class: 'panel' }, el('p', {}, 'Need search and engines tables for trends.'));
+export async function render() {
+  const frag = document.createDocumentFragment();
+  const summary = await dataset('summary');
+  if (!summary) {
+    frag.append(panel({ body: emptyNote('This snapshot has no search data.') }));
+    return frag;
   }
+  frag.append(el('p', { class: 'tab-intro' },
+    'Versions run left to right in the order they were registered, not alphabetically, so 1.10 follows 1.9. ',
+    'Whiskers are 95% intervals where one can be computed.'));
 
-  const container = el('div', {});
+  const load = async () => {
+    const rows = await query(`SELECT * FROM ds_summary WHERE ${coreRows()} AND ${engineWhere()} ORDER BY engine_ord`);
+    await fillSampleErrors(rows, coreType());
+    return rows.map(r => ({ ...r, short: shortLabel(engineById(r.engine_id)) }));
+  };
+  const chart = (metric, rows, { width, height }) => {
+    const [axis, scale] = AXES[metric.label] ?? [metric.label, 1];
+    const data = rows.map(r => {
+      const { v, se } = metric.get(r);
+      const ok = Number.isFinite(se);
+      return { engine: r.engine, short: r.short, v: v * scale, lo: ok ? (v - Z * se) * scale : null, hi: ok ? (v + Z * se) * scale : null,
+        title: `${r.engine}: ${metric.format(v)}` };
+    }).filter(d => Number.isFinite(d.v));
+    if (!data.length) return emptyNote('Not available in this snapshot.');
+    return plot(
+      vg.lineY(data, { x: 'short', y: 'v', stroke: 'currentColor', strokeOpacity: 0.35, strokeWidth: 1 }),
+      vg.ruleX(data.filter(d => d.lo != null), { x: 'short', y1: 'lo', y2: 'hi', stroke: 'engine', strokeWidth: 1.5 }),
+      vg.dot(data, { x: 'short', y: 'v', fill: 'engine', r: 4, tip: true, title: 'title' }),
+      ...engineColors(), vg.xDomain(data.map(d => d.short)), vg.yGrid(true), vg.xLabel(null), vg.yLabel(axis),
+      vg.marginBottom(34), vg.width(width), vg.height(height));
+  };
 
-  // Get engine versions ordered by id
-  const engines = await sql(`
-    SELECT id, name, version, name || ' (' || version || ')' as label
-    FROM engines ORDER BY id
-  `);
-
-  if (engines.length < 2) {
-    return el('div', { class: 'panel' }, el('p', {}, 'Need at least 2 engine versions for trends.'));
-  }
-
-  // Summary stats
-  const [agg] = await sql(`
-    SELECT COUNT(*) as total_searches, COUNT(DISTINCT engine_id) as n_engines,
-      AVG(completed_depth) as avg_depth, AVG(total_nodes) as avg_nodes,
-      AVG(total_time_ms) as avg_time
-    FROM ${searchTable}
-  `);
-  container.appendChild(summaryRow({
-    'Total Searches': agg?.total_searches,
-    'Engines': agg?.n_engines,
-    'Avg Depth': agg?.avg_depth != null ? Number(agg.avg_depth).toFixed(1) : null,
-    'Avg Nodes': agg?.avg_nodes,
-    'Avg Time': agg?.avg_time != null ? Number(agg.avg_time).toFixed(0) + 'ms' : null,
+  let chosen = METRICS[0].label;
+  const main = el('div');
+  const redraw = reactive(main, async () => chart(METRICS.find(m => m.label === chosen), await load(), { width: chartWidth(), height: 300 }));
+  frag.append(panel({
+    title: 'One metric across versions',
+    caption: 'Each dot is one version; the thin line only connects neighbours to guide the eye, it does not imply anything between versions.',
+    controls: selectInput({ label: 'Metric', value: chosen, options: METRICS.map(m => ({ value: m.label, label: m.label })),
+      onChange: v => { chosen = v; redraw(); } }),
+    body: main, note: sourceNote(summary),
   }));
 
-  // Create trend aggregate view
-  await coordinator().exec(`
-    CREATE OR REPLACE TEMP VIEW trend_agg AS
-    SELECT 
-      e.name || ' (' || e.version || ')' as engine_label,
-      e.id as engine_order,
-      AVG(s.completed_depth) as avg_depth,
-      AVG(s.total_nodes) as avg_nodes,
-      AVG(s.total_time_ms) as avg_time_ms,
-      AVG(s.total_tt_hits) as avg_tt_hits,
-      AVG(s.total_fail_highs) as avg_fail_highs,
-      AVG(s.total_nmp) as avg_nmp,
-      COUNT(*) as n_searches
-    FROM ${searchTable} s
-    JOIN engines e ON s.engine_id = e.id
-    GROUP BY e.id, e.name, e.version
-    ORDER BY e.id
-  `);
-
-  // Metric selector for main trend line
-  let selectedMetric = 'avg_depth';
-  const plotContainer = el('div', {});
-
-  async function renderTrendLine(metric) {
-    plotContainer.innerHTML = '';
-    const label = METRIC_OPTIONS.find(o => o.value === metric)?.label || metric;
-    const line = vg.plot(
-      vg.lineY(vg.from('trend_agg'), {
-        x: 'engine_label',
-        y: metric,
-        stroke: COLORS[0],
-        marker: true,
-      }),
-      vg.width(750),
-      vg.height(300),
-      vg.marginLeft(70),
-      vg.marginBottom(70),
-      vg.xLabel('Engine Version'),
-      vg.yLabel(label),
-      vg.xTickRotate(-30),
-    );
-    plotContainer.appendChild(line);
+  for (const label of SMALL) {
+    const metric = METRICS.find(m => m.label === label);
+    const body = el('div');
+    reactive(body, async () => chart(metric, await load(), { width: chartWidth('half'), height: 220 }));
+    frag.append(panel({ span: 'half', title: label, caption: CAPTIONS[label], body }));
   }
 
-  const metricSelect = nativeSelect(METRIC_OPTIONS, async (val) => {
-    selectedMetric = val;
-    await renderTrendLine(val);
-  }, selectedMetric);
-
-  container.appendChild(controlsBar(controlGroup('Metric', metricSelect)));
-  container.appendChild(panel('Trend by Engine Version', plotContainer));
-  await renderTrendLine(selectedMetric);
-
-  // Grid of small multiples for all metrics
-  const grid = el('div', { class: 'grid-2' });
-  for (let i = 0; i < METRIC_OPTIONS.length; i++) {
-    const m = METRIC_OPTIONS[i];
-    const plot = vg.plot(
-      vg.lineY(vg.from('trend_agg'), {
-        x: 'engine_label',
-        y: m.value,
-        stroke: COLORS[i % COLORS.length],
-        marker: true,
-      }),
-      vg.width(440),
-      vg.height(200),
-      vg.marginLeft(60),
-      vg.marginBottom(60),
-      vg.xLabel('Engine'),
-      vg.yLabel(m.label),
-      vg.xTickRotate(-30),
-    );
-    grid.appendChild(plotPanel(m.label, plot));
-  }
-  container.appendChild(grid);
-
-  // Data volume bar chart
-  const countPlot = vg.plot(
-    vg.barY(vg.from('trend_agg'), {
-      x: 'engine_label',
-      y: 'n_searches',
-      fill: COLORS[3],
-    }),
-    vg.width(750),
-    vg.height(220),
-    vg.marginLeft(60),
-    vg.marginBottom(70),
-    vg.xLabel('Engine Version'),
-    vg.yLabel('Searches'),
-    vg.xTickRotate(-30),
-  );
-  container.appendChild(plotPanel('Data Volume per Engine', countPlot));
-
-  return container;
+  const volume = el('div');
+  reactive(volume, async () => {
+    const rows = await load();
+    return plot(
+      vg.barY(rows, { x: 'short', y: 'searches', fill: 'engine', tip: true }),
+      ...engineColors(), vg.xDomain(rows.map(r => r.short)), vg.xPadding(0.55), vg.yGrid(true), vg.xLabel(null),
+      vg.yLabel('Searches logged'), vg.marginBottom(34), vg.width(chartWidth()), vg.height(200));
+  });
+  frag.append(panel({ title: 'Data behind each version',
+    caption: 'Searches logged per version; the fewer there are, the wider the whiskers above.', body: volume }));
+  return frag;
 }

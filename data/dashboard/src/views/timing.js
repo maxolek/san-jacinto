@@ -1,80 +1,54 @@
-/**
- * Timing tab — function-level timing breakdown with metric selection.
- */
-import { coordinator, Selection } from '@uwdata/mosaic-core';
+/** Timing: where the time inside a search goes, per profiled function and engine. */
 import * as vg from '@uwdata/vgplot';
-import { sql, el, panel, plotPanel, fmt, metricCard, controlsBar, controlGroup, nativeSelect, summaryRow, COLORS } from '../util.js';
+import { dataset } from '../datasets.js';
+import { query } from '../db.js';
+import { engines, engineWhere } from '../engines.js';
+import { chartWidth, coreScopeNote, el, emptyNote, engineColors, engineLegend, fmt, panel, plot, reactive, selectInput, sourceNote } from '../ui.js';
 
-const METRIC_OPTIONS = [
-  { value: 'time', label: 'Avg Time / Search' },
-  { value: 'calls', label: 'Total Calls' },
-  { value: 'per_call', label: 'Time per Call' },
+const MEASURES = [
+  { value: 'share', label: 'Share of search time', format: v => fmt.pct(v, 1), tick: '%',
+    caption: 'Time inside each function as a share of the whole search (ROOT); functions nest, so the shares do not add up to 100%.' },
+  { value: 'ms_per_search', label: 'Milliseconds per search', format: v => fmt.ms(v),
+    caption: 'Average time each function takes per search: total time divided by the number of searches.' },
+  { value: 'us_per_call', label: 'Microseconds per call', format: v => `${fmt.num(v, 3)} \u00b5s`,
+    caption: 'Average cost of a single call: total time divided by the number of calls.' },
+  { value: 'calls_per_search', label: 'Calls per search', format: v => fmt.compact(v),
+    caption: 'How many times each function is called in an average search.' },
 ];
 
-export async function renderTiming() {
-  const tables = window.__tables || [];
-  if (!tables.includes('search_timings')) {
-    return el('div', { class: 'panel' }, el('p', {}, 'No search_timings table found.'));
+export async function render() {
+  const frag = document.createDocumentFragment();
+  const timing = await dataset('timing');
+  if (!timing) {
+    frag.append(panel({ body: emptyNote('This snapshot has no function timings.') }));
+    return frag;
   }
-
-  const container = el('div', {});
-
-  // Summary stats
-  const [stats] = await sql(`
-    SELECT COUNT(DISTINCT "function") as n_funcs,
-      SUM(total_time_ms) as total_ms,
-      SUM(num_calls) as total_calls
-    FROM search_timings
-  `);
-  container.appendChild(summaryRow({
-    'Functions': stats?.n_funcs,
-    'Total Time (ms)': stats?.total_ms,
-    'Total Calls': stats?.total_calls,
-    'Avg ms/Call': stats?.total_calls > 0 ? (stats.total_ms / stats.total_calls).toFixed(3) : null,
+  frag.append(coreScopeNote('Function timings are'));
+  let measure = 'share';
+  const body = el('div');
+  const caption = el('p', { class: 'caption' });
+  const redraw = reactive(body, async () => {
+    const m = MEASURES.find(x => x.value === measure);
+    caption.textContent = m.caption;
+    const rows = (await query(`SELECT engine, engine_id, function, ${measure} AS v FROM ds_timing
+      WHERE ${engineWhere()} ${measure === 'share' ? "AND upper(function) <> 'ROOT'" : ''} AND ${measure} IS NOT NULL ORDER BY engine_ord`))
+      .map(r => ({ ...r, title: `${r.function}, ${r.engine}: ${m.format(r.v)}` }));
+    if (!rows.length) return emptyNote('No timings for this selection.');
+    const base = rows.filter(r => r.engine_id === engines.baseline);
+    const order = [...new Set((base.length ? base : rows).sort((a, b) => b.v - a.v).map(r => r.function))];
+    for (const f of new Set(rows.map(r => r.function))) if (!order.includes(f)) order.push(f);
+    const labels = [...new Set(rows.map(r => r.engine))];
+    return [engineLegend(), plot(
+      vg.barX(rows, { x: 'v', y: 'engine', fy: 'function', fill: 'engine', insetTop: 1.5, insetBottom: 1.5, tip: true, title: 'title' }),
+      ...engineColors(), vg.fyDomain(order), vg.yDomain(labels), vg.yAxis(null), vg.fyLabel(null), vg.xGrid(true),
+      m.tick ? vg.xTickFormat(m.tick) : null, vg.marginLeft(130), vg.facetMarginTop(2), vg.facetMarginBottom(6),
+      vg.xLabel(m.label), vg.width(chartWidth()), vg.height(60 + order.length * (labels.length * 12 + 12)))];
+  });
+  frag.append(panel({
+    title: 'Function profile',
+    caption: 'One group of bars per profiled function, one bar per engine; functions are sorted by the baseline\u2019s value.',
+    controls: [selectInput({ label: 'Measure', value: measure, options: MEASURES, onChange: v => { measure = v; redraw(); } }), caption],
+    body, note: sourceNote(timing),
   }));
-
-  // Metric selector
-  let selectedMetric = 'time';
-  const plotContainer = el('div', {});
-
-  async function renderBar(metric) {
-    plotContainer.innerHTML = '';
-    if (metric === 'time') {
-      await coordinator().exec(`CREATE OR REPLACE TEMP VIEW timing_by_func AS SELECT "function", SUM(total_time_ms)/NULLIF(SUM(num_calls), 0) as avg_ms_per_search FROM search_timings WHERE "function" <> 'ROOT' GROUP BY "function" ORDER BY avg_ms_per_search DESC LIMIT 15`);
-      const bar = vg.plot(
-        vg.barX(vg.from('timing_by_func'), { x: 'avg_ms_per_search', y: 'function', fill: COLORS[0], sort: { y: '-x' } }),
-        vg.width(700), vg.height(380), vg.marginLeft(180),
-        vg.xLabel('Avg Time (ms)'), vg.yLabel('Function'),
-      );
-      plotContainer.appendChild(bar);
-    } else if (metric === 'calls') {
-      await coordinator().exec(`CREATE OR REPLACE TEMP VIEW calls_by_func AS SELECT "function", SUM(num_calls) as total_calls FROM search_timings GROUP BY "function" ORDER BY total_calls DESC LIMIT 15`);
-      const bar = vg.plot(
-        vg.barX(vg.from('calls_by_func'), { x: 'total_calls', y: 'function', fill: COLORS[1], sort: { y: '-x' } }),
-        vg.width(700), vg.height(380), vg.marginLeft(180),
-        vg.xLabel('Total Calls'), vg.yLabel('Function'),
-      );
-      plotContainer.appendChild(bar);
-    } else if (metric === 'per_call') {
-      await coordinator().exec(`CREATE OR REPLACE TEMP VIEW timing_per_call AS SELECT "function", SUM(total_time_ms) / NULLIF(SUM(num_calls), 0) as avg_time_per_call, SUM(num_calls) as total_calls FROM search_timings GROUP BY "function"`);
-      const scatter = vg.plot(
-        vg.dot(vg.from('timing_per_call'), { x: 'total_calls', y: 'avg_time_per_call', fill: COLORS[2], opacity: 0.7, r: 5 }),
-        vg.width(700), vg.height(350), vg.marginLeft(70),
-        vg.xLabel('Calls'), vg.yLabel('Avg Time per Call (ms)'),
-        vg.xScale('log'),
-      );
-      plotContainer.appendChild(scatter);
-    }
-  }
-
-  const metricSelect = nativeSelect(METRIC_OPTIONS, async (val) => {
-    selectedMetric = val;
-    await renderBar(val);
-  }, selectedMetric);
-
-  container.appendChild(controlsBar(controlGroup('View', metricSelect)));
-  container.appendChild(panel('Function Profiling', plotContainer));
-  await renderBar(selectedMetric);
-
-  return container;
+  return frag;
 }

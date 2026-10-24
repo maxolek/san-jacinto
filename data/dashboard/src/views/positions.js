@@ -1,176 +1,72 @@
-/**
- * Positions tab — performance breakdown by position type, game phase, and characteristics.
- */
-import { coordinator, Selection } from '@uwdata/mosaic-core';
+/** Positions: search behaviour by game phase and position type. */
 import * as vg from '@uwdata/vgplot';
-import { sql, el, panel, plotPanel, fmt, controlsBar, controlGroup, nativeSelect, summaryRow, getSearchTable, COLORS } from '../util.js';
+import { dataset } from '../datasets.js';
+import { query } from '../db.js';
+import { engineScoped, engineWhere } from '../engines.js';
+import { coreRows } from '../settings.js';
+import { chartWidth, el, emptyNote, engineColors, engineLegend, fmt, panel, plot, reactive, selectInput, sourceNote } from '../ui.js';
 
-const METRIC_OPTIONS = [
-  { value: 'by_phase', label: 'By Game Phase' },
-  { value: 'by_type', label: 'By Position Type' },
-  { value: 'accuracy_by_phase', label: 'Eval Accuracy by Phase' },
-  { value: 'depth_by_type', label: 'Depth by Position Type' },
-  { value: 'tactical_vs_positional', label: 'Tactical vs Positional' },
+const VIEWS = [
+  { value: 'searches', label: 'Searches', axis: 'Searches', format: fmt.int },
+  { value: 'depth_mean', label: 'Mean depth', axis: 'Mean completed depth (plies)', format: v => fmt.num(v, 2) },
+  { value: 'time_mean', label: 'Mean time', axis: 'Mean search time (ms)', format: fmt.ms },
+  { value: 'nps', label: 'Nodes per second', axis: 'Nodes per second', format: fmt.nps },
+  { value: 'sf_mae', label: 'Eval error vs Stockfish', axis: 'Mean absolute difference from Stockfish (cp)', format: v => `${fmt.num(v, 0)} cp` },
+  { value: 'sf_match', label: 'Best move agrees with Stockfish', axis: 'Share of best moves that match', format: v => fmt.pct(v), pct: true },
 ];
+const PHASES = ['opening', 'midgame', 'middlegame', 'endgame', 'unknown'];
 
-export async function renderPositions() {
-  const searchTable = getSearchTable('positions');
-  if (!searchTable) {
-    return el('div', { class: 'panel' }, el('p', {}, 'No search data table found.'));
+export async function render() {
+  const frag = document.createDocumentFragment();
+  const positions = await dataset('positions');
+  if (!positions) {
+    frag.append(panel({ body: emptyNote('This snapshot has no position features. Run the position step of the analytics pipeline.') }));
+    return frag;
   }
+  const [sf] = await query("SELECT sum(sf_n) AS n FROM ds_positions WHERE core_type = 'all'");
+  const views = VIEWS.filter(v => !v.value.startsWith('sf_') || sf?.n > 0);
+  let view = 'depth_mean';
+  const subs = new Set();
+  const grouped = (dim, title, caption) => {
+    const body = el('div');
+    reactive(body, async () => {
+      const v = views.find(x => x.value === view);
+      const agg = view === 'searches' ? 'sum(searches)' : view === 'nps' ? 'sum(nps * searches) / sum(searches)'
+        : `sum(${view} * searches) / nullif(sum(CASE WHEN ${view} IS NOT NULL THEN searches END), 0)`;
+      const rows = (await query(`SELECT engine, ${dim} AS g, ${agg} AS v, sum(searches) AS n FROM ds_positions
+        WHERE ${coreRows()} AND ${engineWhere()} GROUP BY ALL HAVING v IS NOT NULL ORDER BY min(engine_ord)`))
+        .map(r => ({ ...r, title: `${r.engine}, ${r.g}: ${v.format(r.v)} (${fmt.int(r.n)} searches)` }));
+      if (!rows.length) return emptyNote('No data for this selection.');
+      const groups = [...new Set(rows.map(r => r.g))].sort((a, b) => rank(a) - rank(b) || String(a).localeCompare(String(b)));
+      const labels = [...new Set(rows.map(r => r.engine))];
+      return plot(
+        vg.barX(rows, { x: 'v', y: 'engine', fy: 'g', fill: 'engine', insetTop: 1.5, insetBottom: 1.5, tip: true, title: 'title' }),
+        ...engineColors(), vg.fyDomain(groups), vg.yDomain(labels), vg.yAxis(null), vg.fyLabel(null), vg.xGrid(true),
+        v.pct ? vg.xTickFormat('%') : null, vg.marginLeft(110), vg.facetMarginBottom(6), vg.xLabel(v.axis),
+        vg.width(chartWidth('half')), vg.height(50 + groups.length * (labels.length * 12 + 14)));
+    }, [fn => subs.add(fn)]);
+    return panel({ span: 'half', title, caption, body });
+  };
+  frag.append(el('div', { class: 'controls section-controls' },
+    selectInput({ label: 'Show', value: view, options: views, onChange: v => { view = v; subs.forEach(fn => fn()); } }), engineLegend()));
+  frag.append(grouped('game_phase', 'By game phase', 'The chosen measure for each phase of the game, one bar per engine.'));
+  frag.append(grouped('position_type', 'By position type', 'The same measure for tactical and positional positions, as classified by the position step.'));
 
-  const container = el('div', {});
-
-  // Check if position features are available
-  const [check] = await sql(`
-    SELECT COUNT(*) as n FROM ${searchTable}
-    WHERE game_phase IS NOT NULL OR position_type IS NOT NULL
-  `);
-  if (!check || check.n === 0) {
-    container.appendChild(panel('Position Analysis',
-      el('p', { style: { color: 'var(--text-sec)' } },
-        'No position feature data available. Run the position analysis step of the analytics pipeline.'
-      )
-    ));
-    return container;
+  const pts = await dataset('positions_points');
+  if (pts) {
+    const $sel = engineScoped({ core: true });
+    frag.append(panel({ title: 'Tactical against positional score',
+      caption: 'Each dot is a sampled position placed by its tactical and positional feature scores; colour shows the engine that searched it.',
+      body: plot(
+        vg.dot(vg.from('ds_positions_points', { filterBy: $sel }), { x: 'tactical', y: 'positional', fill: 'engine', r: 1.6, fillOpacity: 0.45 }),
+        ...engineColors(), vg.xGrid(true), vg.yGrid(true), vg.xLabel('Tactical score'), vg.yLabel('Positional score'),
+        vg.width(chartWidth()), vg.height(340)),
+      note: sourceNote(positions) }));
   }
-
-  // Summary
-  const [stats] = await sql(`
-    SELECT COUNT(*) as total,
-      COUNT(DISTINCT game_phase) as n_phases,
-      COUNT(DISTINCT position_type) as n_types,
-      AVG(completed_depth) as avg_depth,
-      AVG(total_time_ms) as avg_time
-    FROM ${searchTable}
-    WHERE game_phase IS NOT NULL
-  `);
-  container.appendChild(summaryRow({
-    'Positions with Features': stats?.total,
-    'Game Phases': stats?.n_phases,
-    'Position Types': stats?.n_types,
-    'Avg Depth': stats?.avg_depth != null ? Number(stats.avg_depth).toFixed(1) : null,
-    'Avg Time': stats?.avg_time != null ? Number(stats.avg_time).toFixed(0) + ' ms' : null,
-  }));
-
-  // Metric selector
-  let selectedMetric = 'by_phase';
-  const plotContainer = el('div', {});
-
-  async function renderChart(metric) {
-    plotContainer.innerHTML = '';
-
-    if (metric === 'by_phase') {
-      // Distribution of searches by game phase
-      await coordinator().exec(`CREATE OR REPLACE TEMP VIEW phase_dist AS
-        SELECT game_phase, COUNT(*) as count, AVG(completed_depth) as avg_depth, AVG(nps) as avg_nps
-        FROM ${searchTable}
-        WHERE game_phase IS NOT NULL AND game_phase != ''
-        GROUP BY game_phase ORDER BY count DESC`);
-      const bar = vg.plot(
-        vg.barX(vg.from('phase_dist'), { x: 'count', y: 'game_phase', fill: COLORS[0], sort: { y: '-x' } }),
-        vg.width(750), vg.height(200), vg.marginLeft(120),
-        vg.xLabel('Searches'), vg.yLabel('Game Phase'),
-      );
-      plotContainer.appendChild(bar);
-
-      // Also show avg depth by phase
-      const depthBar = vg.plot(
-        vg.barX(vg.from('phase_dist'), { x: 'avg_depth', y: 'game_phase', fill: COLORS[4], sort: { y: '-x' } }),
-        vg.width(750), vg.height(200), vg.marginLeft(120),
-        vg.xLabel('Avg Depth'), vg.yLabel('Game Phase'),
-      );
-      plotContainer.appendChild(depthBar);
-
-    } else if (metric === 'by_type') {
-      // Distribution by position type
-      await coordinator().exec(`CREATE OR REPLACE TEMP VIEW type_dist AS
-        SELECT position_type, COUNT(*) as count
-        FROM ${searchTable}
-        WHERE position_type IS NOT NULL AND position_type != ''
-        GROUP BY position_type ORDER BY count DESC LIMIT 15`);
-      const bar = vg.plot(
-        vg.barX(vg.from('type_dist'), { x: 'count', y: 'position_type', fill: COLORS[2], sort: { y: '-x' } }),
-        vg.width(750), vg.height(350), vg.marginLeft(160),
-        vg.xLabel('Searches'), vg.yLabel('Position Type'),
-      );
-      plotContainer.appendChild(bar);
-
-    } else if (metric === 'accuracy_by_phase') {
-      // Eval accuracy (eval_diff) by game phase — requires SF data
-      const [sfCheck] = await sql(`SELECT COUNT(*) as n FROM ${searchTable} WHERE sf_eval IS NOT NULL AND game_phase IS NOT NULL`);
-      if (!sfCheck || sfCheck.n === 0) {
-        plotContainer.appendChild(el('p', {}, 'Requires Stockfish eval data + game phase. Run transform_positions first.'));
-        return;
-      }
-      await coordinator().exec(`CREATE OR REPLACE TEMP VIEW acc_by_phase AS
-        SELECT game_phase,
-          AVG(ABS(eval_diff)) as mae,
-          AVG(CASE WHEN best_move = sf_best_move THEN 1.0 ELSE 0.0 END) as match_rate,
-          COUNT(*) as n
-        FROM ${searchTable}
-        WHERE sf_eval IS NOT NULL AND game_phase IS NOT NULL AND game_phase != ''
-        GROUP BY game_phase`);
-      const bar = vg.plot(
-        vg.barX(vg.from('acc_by_phase'), { x: 'mae', y: 'game_phase', fill: COLORS[3], sort: { y: '-x' } }),
-        vg.width(750), vg.height(200), vg.marginLeft(120),
-        vg.xLabel('Mean Absolute Eval Error (cp)'), vg.yLabel('Game Phase'),
-      );
-      plotContainer.appendChild(bar);
-
-      const matchBar = vg.plot(
-        vg.barX(vg.from('acc_by_phase'), { x: 'match_rate', y: 'game_phase', fill: COLORS[1], sort: { y: '-x' } }),
-        vg.width(750), vg.height(200), vg.marginLeft(120),
-        vg.xLabel('Best Move Match Rate'), vg.yLabel('Game Phase'),
-      );
-      plotContainer.appendChild(matchBar);
-
-    } else if (metric === 'depth_by_type') {
-      // Avg depth and time by position type
-      await coordinator().exec(`CREATE OR REPLACE TEMP VIEW depth_by_type AS
-        SELECT position_type, AVG(completed_depth) as avg_depth, AVG(total_time_ms) as avg_time, COUNT(*) as n
-        FROM ${searchTable}
-        WHERE position_type IS NOT NULL AND position_type != ''
-        GROUP BY position_type HAVING n >= 5
-        ORDER BY avg_depth DESC LIMIT 15`);
-      const bar = vg.plot(
-        vg.barX(vg.from('depth_by_type'), { x: 'avg_depth', y: 'position_type', fill: COLORS[4], sort: { y: '-x' } }),
-        vg.width(750), vg.height(350), vg.marginLeft(160),
-        vg.xLabel('Avg Depth'), vg.yLabel('Position Type'),
-      );
-      plotContainer.appendChild(bar);
-
-    } else if (metric === 'tactical_vs_positional') {
-      // Scatter: tactical score vs positional score, colored by eval accuracy
-      const [hasTact] = await sql(`SELECT COUNT(*) as n FROM ${searchTable} WHERE position_tactical_score IS NOT NULL`);
-      if (!hasTact || hasTact.n === 0) {
-        plotContainer.appendChild(el('p', {}, 'No tactical/positional scores available.'));
-        return;
-      }
-      await coordinator().exec(`CREATE OR REPLACE TEMP VIEW tact_vs_pos AS
-        SELECT position_tactical_score as tactical, position_positional_score as positional,
-          completed_depth as depth, nps
-        FROM ${searchTable}
-        WHERE position_tactical_score IS NOT NULL AND position_positional_score IS NOT NULL
-        USING SAMPLE 3000`);
-      const scatter = vg.plot(
-        vg.dot(vg.from('tact_vs_pos'), { x: 'tactical', y: 'positional', fill: 'depth', opacity: 0.5, r: 4 }),
-        vg.width(600), vg.height(400), vg.marginLeft(60),
-        vg.xLabel('Tactical Score'), vg.yLabel('Positional Score'),
-        vg.colorLegend(true),
-      );
-      plotContainer.appendChild(scatter);
-    }
-  }
-
-  const metricSelect = nativeSelect(METRIC_OPTIONS, async (val) => {
-    selectedMetric = val;
-    await renderChart(val);
-  }, selectedMetric);
-
-  container.appendChild(controlsBar(controlGroup('View', metricSelect)));
-  container.appendChild(panel('Position Performance', plotContainer));
-  await renderChart(selectedMetric);
-
-  return container;
+  return frag;
 }
+
+const rank = g => {
+  const i = PHASES.indexOf(String(g).toLowerCase());
+  return i < 0 ? 99 : i;
+};

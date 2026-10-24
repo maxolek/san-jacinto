@@ -94,12 +94,14 @@ flowchart TD
     PF --> COMP
     IS --> COMP
     TS --> COMP
-    M --> DASH[Dashboard queries and aggregations]
-    C --> DASH
-    P --> DASH
-    IM --> DASH
-    TF --> DASH
-    ST --> DASH
+    M --> AGG[(agg_* tables + search_sample)]
+    PF --> AGG
+    I --> AGG
+    T --> AGG
+    ST --> AGG
+    E --> AGG
+    AGG --> DASH[Dashboard]
+    M -. local files without agg tables .-> DASH
 ```
 
 | Relation | Storage / grain | Purpose |
@@ -120,11 +122,20 @@ flowchart TD
 | `search_iteration_summary` | View: search ID | Aggregated iteration features, for consumers that need them |
 | `search_timing_summary` | View: search ID | Timing pivot, for compatibility consumers |
 | `search_features` | View: search ID | Compatibility join for existing notebooks/scripts |
+| `agg_engine_summary`, `agg_depth`, `agg_tree_ply`, `agg_timing`, `agg_moveorder`, `agg_eval_wdl`, `agg_openings`, `agg_env`, `agg_hist`, `agg_corr`, `agg_positions` | Tables: engine × dimension | Pre-aggregated metrics the dashboard reads, rebuilt by `data.transforms.aggregates` |
+| `search_sample` | Table: search ID | Up to 20,000 searches, stratified by engine, for scatter plots |
 
 The compatibility view aggregates each child relation before joining, so
 iterations and timing functions do not multiply search counts. Metadata IDs
-and `position_features.search_id` must remain unique. Dashboard queries use
-focused views, and timing/root-move tabs query their fact tables directly.
+and `position_features.search_id` must remain unique. The dashboard reads the
+pre-aggregated tables. It falls back to the focused views only for local files
+without them.
 
-See [OLAP migration](olap-migration.md) for commands, metric definitions,
+`game_stats` also carries the match-runner columns (`source`, `run_id`, `run_game`,
+`pair_index`) and the environment each game ran in (`env_*`: host, CPU, P/E core
+type, measured clock). `sprt_runs` carries the pentanomial statistics. Evaluations
+are from the side to move; `eval_cp` excludes mate scores.
+
+See [dashboard-data.md](dashboard-data.md) for every column the dashboard uses and
+[OLAP migration](olap-migration.md) for commands, metric definitions,
 validation, and refresh/performance limitations.

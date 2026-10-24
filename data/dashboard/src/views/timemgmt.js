@@ -1,147 +1,89 @@
-/**
- * Time Management tab — time allocation analysis across iterations and moves.
- */
-import { coordinator, Selection } from '@uwdata/mosaic-core';
+/** Time management: how search time is spread over iterations and over searches. */
 import * as vg from '@uwdata/vgplot';
-import { sql, el, panel, plotPanel, fmt, controlsBar, controlGroup, nativeSelect, summaryRow, getSearchTable, getIterTable, COLORS } from '../util.js';
+import { dataset } from '../datasets.js';
+import { query } from '../db.js';
+import { engineScoped, engineWhere } from '../engines.js';
+import { coreRows } from '../settings.js';
+import { chartWidth, el, emptyNote, engineColors, engineLegend, fmt, intTicks, panel, plot, reactive, sourceNote, statLine } from '../ui.js';
 
-const METRIC_OPTIONS = [
-  { value: 'time_by_depth', label: 'Time by Depth' },
-  { value: 'time_efficiency', label: 'NPS by Depth' },
-  { value: 'time_distribution', label: 'Search Duration Distribution' },
-  { value: 'time_vs_nodes', label: 'Time vs Nodes' },
-];
-
-export async function renderTimeMgmt() {
-  const searchTable = getSearchTable();
-  const iterTable = getIterTable();
-
-  if (!searchTable) {
-    return el('div', { class: 'panel' }, el('p', {}, 'No search data table found.'));
+export async function render() {
+  const frag = document.createDocumentFragment();
+  const [summary, depth, hist, points] = await Promise.all([dataset('summary'), dataset('depth'), dataset('hist'), dataset('sample_points')]);
+  if (!summary) {
+    frag.append(panel({ body: emptyNote('This snapshot has no search data.') }));
+    return frag;
   }
-
-  const container = el('div', {});
-
-  // Summary
-  const [stats] = await sql(`
-    SELECT COUNT(*) as total,
-      AVG(total_time_ms) as avg_time,
-      MEDIAN(total_time_ms) as med_time,
-      MAX(total_time_ms) as max_time,
-      AVG(nps) as avg_nps,
-      AVG(completed_depth) as avg_depth
-    FROM ${searchTable}
-    WHERE total_time_ms IS NOT NULL
-  `);
-  container.appendChild(summaryRow({
-    'Searches': stats?.total,
-    'Avg Time': stats?.avg_time != null ? Number(stats.avg_time).toFixed(0) + ' ms' : null,
-    'Median Time': stats?.med_time != null ? Number(stats.med_time).toFixed(0) + ' ms' : null,
-    'Max Time': stats?.max_time != null ? Number(stats.max_time).toFixed(0) + ' ms' : null,
-    'Avg NPS': stats?.avg_nps,
-    'Avg Depth': stats?.avg_depth != null ? Number(stats.avg_depth).toFixed(1) : null,
-  }));
-
-  // Metric selector
-  let selectedMetric = 'time_by_depth';
-  const plotContainer = el('div', {});
-
-  async function renderChart(metric) {
-    plotContainer.innerHTML = '';
-
-    if (metric === 'time_by_depth') {
-      if (iterTable) {
-        // Time allocation per iteration depth
-        const line = vg.plot(
-          vg.lineY(vg.from(iterTable), {
-            x: 'depth', y: vg.avg('time_ms'), stroke: COLORS[0], marker: true,
-          }),
-          vg.width(750), vg.height(300), vg.marginLeft(70),
-          vg.xLabel('Iteration Depth'), vg.yLabel('Avg Time (ms)'),
-        );
-        plotContainer.appendChild(line);
-      } else {
-        // Fallback: use search-level data
-        await coordinator().exec(`CREATE OR REPLACE TEMP VIEW time_by_depth_agg AS
-          SELECT completed_depth as depth, AVG(total_time_ms) as avg_time, COUNT(*) as n
-          FROM ${searchTable} WHERE completed_depth BETWEEN 1 AND 30
-          GROUP BY completed_depth ORDER BY depth`);
-        const line = vg.plot(
-          vg.lineY(vg.from('time_by_depth_agg'), { x: 'depth', y: 'avg_time', stroke: COLORS[0], marker: true }),
-          vg.width(750), vg.height(300), vg.marginLeft(70),
-          vg.xLabel('Completed Depth'), vg.yLabel('Avg Total Time (ms)'),
-        );
-        plotContainer.appendChild(line);
-      }
-
-    } else if (metric === 'time_efficiency') {
-      if (iterTable) {
-        // NPS by iteration depth (does time allocation get more efficient at deeper depths?)
-        const line = vg.plot(
-          vg.lineY(vg.from(iterTable), {
-            x: 'depth', y: vg.avg('nps'), stroke: COLORS[1], marker: true,
-          }),
-          vg.width(750), vg.height(300), vg.marginLeft(70),
-          vg.xLabel('Iteration Depth'), vg.yLabel('Avg NPS'),
-        );
-        plotContainer.appendChild(line);
-      } else {
-        await coordinator().exec(`CREATE OR REPLACE TEMP VIEW nps_by_depth AS
-          SELECT completed_depth as depth, AVG(nps) as avg_nps
-          FROM ${searchTable} WHERE nps IS NOT NULL AND completed_depth BETWEEN 1 AND 30
-          GROUP BY completed_depth ORDER BY depth`);
-        const line = vg.plot(
-          vg.lineY(vg.from('nps_by_depth'), { x: 'depth', y: 'avg_nps', stroke: COLORS[1], marker: true }),
-          vg.width(750), vg.height(300), vg.marginLeft(70),
-          vg.xLabel('Depth'), vg.yLabel('Avg NPS'),
-        );
-        plotContainer.appendChild(line);
-      }
-
-    } else if (metric === 'time_distribution') {
-      // Histogram of search durations
-      await coordinator().exec(`CREATE OR REPLACE TEMP VIEW time_dist AS SELECT total_time_ms FROM ${searchTable} WHERE total_time_ms IS NOT NULL AND total_time_ms BETWEEN 0 AND 60000`);
-      const hist = vg.plot(
-        vg.rectY(vg.from('time_dist'), { x: vg.bin('total_time_ms'), y: vg.count(), fill: COLORS[2] }),
-        vg.width(750), vg.height(280), vg.marginLeft(55),
-        vg.xLabel('Search Duration (ms)'), vg.yLabel('Count'),
-      );
-      plotContainer.appendChild(hist);
-
-    } else if (metric === 'time_vs_nodes') {
-      // Scatter: time vs nodes (shows efficiency)
-      await coordinator().exec(`CREATE OR REPLACE TEMP VIEW time_nodes_scatter AS SELECT total_time_ms, total_nodes FROM ${searchTable} WHERE total_time_ms IS NOT NULL AND total_nodes IS NOT NULL USING SAMPLE 3000`);
-      const scatter = vg.plot(
-        vg.dot(vg.from('time_nodes_scatter'), { x: 'total_time_ms', y: 'total_nodes', fill: COLORS[4], opacity: 0.3, r: 3 }),
-        vg.width(750), vg.height(320), vg.marginLeft(70),
-        vg.xLabel('Time (ms)'), vg.yLabel('Total Nodes'),
-        vg.xScale('log'), vg.yScale('log'),
-      );
-      plotContainer.appendChild(scatter);
+  const stats = el('div');
+  reactive(stats, async () => {
+    const [s] = await query(`SELECT sum(time_ms) / nullif(sum(searches), 0) AS mean, sum(time_ms_p50 * searches) / sum(searches) AS p50,
+        sum(time_ms_p90 * searches) / sum(searches) AS p90, sum(time_ms) / 3.6e6 AS hours
+      FROM ds_summary WHERE ${coreRows()} AND ${engineWhere()}`);
+    let last = null;
+    if (depth) {
+      [last] = await query(`WITH d AS (SELECT engine_id, depth, time_ms, searches,
+          lead(searches) OVER (PARTITION BY engine_id ORDER BY depth) AS next FROM ds_depth WHERE ${coreRows()} AND ${engineWhere()})
+        SELECT sum(time_ms * (searches - coalesce(next, 0)) / nullif(searches, 0)) / nullif(sum(time_ms), 0) AS share FROM d`);
     }
+    return statLine([
+      { value: fmt.ms(s.p50), label: 'typical median search time' },
+      { value: fmt.ms(s.p90), label: 'typical 90th percentile' },
+      { value: fmt.ms(s.mean), label: 'mean search time' },
+      last ? { value: fmt.pct(last.share, 0), label: 'of time in each search\u2019s final iteration (approx.)' } : null,
+      { value: fmt.num(s.hours, 1), label: 'hours of search logged' },
+    ]);
+  });
+  frag.append(stats);
+
+  if (depth) {
+    const perIteration = el('div');
+    reactive(perIteration, async () => {
+      const rows = await query(`SELECT engine, depth, time_ms_mean, searches FROM ds_depth
+        WHERE ${coreRows()} AND ${engineWhere()} ORDER BY engine_ord, depth`);
+      return [engineLegend(), plot(
+        vg.lineY(rows, { x: 'depth', y: 'time_ms_mean', stroke: 'engine', z: 'engine', strokeWidth: 1.5 }),
+        vg.dot(rows, { x: 'depth', y: 'time_ms_mean', fill: 'engine', r: 2, tip: true }),
+        ...engineColors(), vg.yScale('log'), vg.yTicks(5), vg.yGrid(true), intTicks(), vg.xLabel('Iteration depth (plies)'), vg.yLabel('Milliseconds in the iteration'),
+        vg.width(chartWidth('half')), vg.height(260))];
+    });
+    frag.append(panel({ span: 'half', title: 'Time per iteration',
+      caption: 'Average time spent in each iteration by the searches that reached it (log scale: equal steps mean equal ratios).',
+      body: perIteration, note: sourceNote(depth) }));
+    const cum = el('div');
+    reactive(cum, async () => {
+      const rows = await query(`SELECT engine, depth, time_share_cum FROM ds_depth WHERE ${coreRows()} AND ${engineWhere()}
+        ORDER BY engine_ord, depth`);
+      return plot(
+        vg.lineY(rows, { x: 'depth', y: 'time_share_cum', stroke: 'engine', z: 'engine', strokeWidth: 1.5, curve: 'monotone-x' }),
+        ...engineColors(), vg.yDomain([0, 1]), vg.yTickFormat('%'), vg.yGrid(true), intTicks(), vg.xLabel('Iteration depth (plies)'),
+        vg.yLabel('Share of all search time, cumulative'), vg.width(chartWidth('half')), vg.height(260));
+    });
+    frag.append(panel({ span: 'half', title: 'Cumulative time by depth',
+      caption: 'How much of all search time was spent up to each iteration depth, over every search together.', body: cum }));
   }
 
-  const metricSelect = nativeSelect(METRIC_OPTIONS, async (val) => {
-    selectedMetric = val;
-    await renderChart(val);
-  }, selectedMetric);
-
-  container.appendChild(controlsBar(controlGroup('View', metricSelect)));
-  container.appendChild(panel('Time Management', plotContainer));
-  await renderChart(selectedMetric);
-
-  // Time fraction spent per depth (cumulative)
-  if (iterTable) {
-    await coordinator().exec(`CREATE OR REPLACE TEMP VIEW time_fraction AS
-      SELECT depth, SUM(time_ms) as total_time FROM ${iterTable} GROUP BY depth ORDER BY depth`);
-    const area = vg.plot(
-      vg.areaY(vg.from('time_fraction'), { x: 'depth', y: 'total_time', fill: COLORS[0], opacity: 0.5 }),
-      vg.lineY(vg.from('time_fraction'), { x: 'depth', y: 'total_time', stroke: COLORS[0] }),
-      vg.width(750), vg.height(250), vg.marginLeft(70),
-      vg.xLabel('Iteration Depth'), vg.yLabel('Total Time (ms)'),
-    );
-    container.appendChild(plotPanel('Cumulative Time by Depth', area));
+  if (hist) {
+    const durations = el('div');
+    reactive(durations, async () => {
+      const rows = await query(`SELECT engine, mid_log AS x, share FROM ds_hist WHERE metric = 'time_ms' AND ${coreRows()}
+        AND ${engineWhere()} ORDER BY engine_ord, bin_lo`);
+      if (!rows.length) return emptyNote('No search times recorded.');
+      return [engineLegend(), plot(
+        vg.lineY(rows, { x: 'x', y: 'share', stroke: 'engine', z: 'engine', curve: 'step', strokeWidth: 1.4, tip: true }),
+        ...engineColors(), vg.xScale('log'), vg.yTickFormat('%'), vg.yGrid(true), vg.xLabel('Time per search (ms)'),
+        vg.yLabel('Share of searches'), vg.width(chartWidth('half')), vg.height(260))];
+    });
+    frag.append(panel({ span: 'half', title: 'How long searches take',
+      caption: 'Distribution of search time for each engine on a log scale; two humps usually mean two time controls.', body: durations }));
   }
 
-  return container;
+  if (points) {
+    const $sel = engineScoped({ core: points.columns.has('core_type') });
+    frag.append(panel({ span: 'half', title: 'Time against nodes',
+      caption: 'One dot per sampled search: points on one diagonal share a speed, so the spread across diagonals is the variation in nodes per second.',
+      body: plot(
+        vg.dot(vg.from('ds_sample_points', { filterBy: $sel }), { x: 'time_ms', y: 'nodes', fill: 'engine', r: 1.4, fillOpacity: 0.4 }),
+        ...engineColors(), vg.xScale('log'), vg.yScale('log'), vg.xGrid(true), vg.yGrid(true), vg.xLabel('Time per search (ms)'),
+        vg.yLabel('Nodes per search'), vg.width(chartWidth('half')), vg.height(260)) }));
+  }
+  return frag;
 }

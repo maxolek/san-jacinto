@@ -3,24 +3,31 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Chess Engine Analytics</title>
+  <meta name="color-scheme" content="light dark" />
+  <meta name="description" content="Search and match telemetry for the Tomahawk chess engine, explored in your browser." />
+  <title>San Jacinto</title>
   <link rel="stylesheet" href="/src/style.css" />
 </head>
 <body>
-  <div id="app">
-    <header id="header">
-      <h1>Chess Engine Analytics</h1>
-      <div style="display: flex; align-items: center; gap: 12px;">
-        <span id="db-freshness" style="display: none; font-size: 11px; color: var(--text-sec); opacity: 0.8;"></span>
-        <div id="db-status">Connecting...</div>
+  <header class="masthead">
+    <div class="masthead-inner">
+      <div class="brand">
+        <h1>San Jacinto</h1>
+        <p class="subtitle">Search and match telemetry for the Tomahawk chess engine</p>
       </div>
-    </header>
-    <nav id="tabs"></nav>
-    <aside id="filters"></aside>
-    <main id="content">
-      <div class="loading">Loading database...</div>
-    </main>
-  </div>
+      <div class="meta">
+        <p id="freshness"></p>
+        <p id="status" role="status">Loading&hellip;</p>
+      </div>
+    </div>
+    <nav id="tabs" aria-label="Sections"></nav>
+    <div id="engine-bar" aria-label="Engine selection"></div>
+  </header>
+  <main id="content"></main>
+  <footer class="colophon">
+    <p>Queries run in your browser with DuckDB-WASM and Mosaic; the snapshot is read in small pieces as charts need them.
+      Evaluations are in centipawns from the side to move.</p>
+  </footer>
   <script type="module" src="/src/main.js"></script>
 </body>
 </html>

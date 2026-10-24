@@ -1,106 +1,59 @@
-/**
- * Tree Depth tab — search tree depth statistics with metric selection.
- */
-import { coordinator, Selection } from '@uwdata/mosaic-core';
+/** Tree depth: statistics per ply of the search tree, with a brush on where the nodes are. */
 import * as vg from '@uwdata/vgplot';
-import { sql, el, panel, plotPanel, getTreeTable, controlsBar, controlGroup, nativeSelect, summaryRow, fmt, COLORS } from '../util.js';
+import { dataset } from '../datasets.js';
+import { engineScoped } from '../engines.js';
+import { chartWidth, coreScopeNote, el, emptyNote, engineColors, engineLegend, intTicks, panel, plot, releaseCharts, selectInput, sourceNote } from '../ui.js';
 
-const METRIC_OPTIONS = [
-  { value: 'nodes', label: 'Nodes' },
-  { value: 'qnodes', label: 'QNodes' },
-  { value: 'fail_highs', label: 'Fail Highs' },
-  { value: 'fail_lows', label: 'Fail Lows' },
-  { value: 'nmp', label: 'NMP' },
+const MEASURES = [
+  { value: 'nodes_mean', label: 'Nodes per search at this ply', log: true },
+  { value: 'qratio', label: 'Quiescence share of nodes', pct: true },
+  { value: 'fail_high_rate', label: 'Fail highs per node', pct: true },
+  { value: 'fail_low_rate', label: 'Fail lows per node', pct: true },
+  { value: 'fh_first_rate', label: 'Cutoffs by the first move', pct: true },
+  { value: 'tt_hit_rate', label: 'TT hits per node', pct: true },
+  { value: 'nmp_rate', label: 'Null-move searches per node', pct: true },
+  { value: 'see_prune_rate', label: 'SEE prunes per quiescence node', pct: true },
 ];
 
-export async function renderTree() {
-  const treeTable = getTreeTable();
-  if (!treeTable) {
-    return el('div', { class: 'panel' }, el('p', {}, 'No tree depth data table found.'));
+export async function render() {
+  const frag = document.createDocumentFragment();
+  const tree = await dataset('tree');
+  if (!tree) {
+    frag.append(panel({ body: emptyNote('This snapshot has no per-ply tree statistics.') }));
+    return frag;
   }
-
-  const container = el('div', {});
-
-  // Summary stats
-  const [stats] = await sql(`
-    SELECT COUNT(*) as total_rows, MAX(depth) as max_depth,
-      AVG(nodes) as avg_nodes, AVG(qnodes) as avg_qnodes,
-      SUM(fail_highs) as total_fh, SUM(nmp) as total_nmp
-    FROM ${treeTable}
-  `);
-  container.appendChild(summaryRow({
-    'Data Points': stats?.total_rows,
-    'Max Depth': stats?.max_depth,
-    'Avg Nodes': stats?.avg_nodes,
-    'Avg QNodes': stats?.avg_qnodes,
-    'Total Fail Highs': stats?.total_fh,
+  const measures = MEASURES.filter(m => tree.columns.has(m.value));
+  const $sel = engineScoped({ cross: true });
+  frag.append(coreScopeNote('Tree statistics are'));
+  frag.append(panel({
+    title: 'Where the nodes are',
+    caption: 'Share of each engine\u2019s nodes at every ply from the root; drag across it to focus the chart below on a range of plies.',
+    body: [engineLegend(), plot(
+      vg.areaY(vg.from('ds_tree', { filterBy: $sel }), { x: 'ply', y: 'node_share', fill: 'engine', fillOpacity: 0.08, curve: 'monotone-x' }),
+      vg.lineY(vg.from('ds_tree', { filterBy: $sel }), { x: 'ply', y: 'node_share', stroke: 'engine', strokeWidth: 1.6, curve: 'monotone-x' }),
+      vg.intervalX({ as: $sel }),
+      ...engineColors(), vg.yTickFormat('%'), vg.yGrid(true), intTicks(), vg.xLabel('Ply from the root'), vg.yLabel('Share of nodes'),
+      vg.width(chartWidth()), vg.height(260))],
+    note: sourceNote(tree),
   }));
 
-  const $filter = Selection.crossfilter();
-  let selectedMetric = 'nodes';
-  const plotContainer = el('div', {});
-
-  async function renderLine(metric) {
-    plotContainer.innerHTML = '';
-    const label = METRIC_OPTIONS.find(o => o.value === metric)?.label || metric;
-    const colorIdx = METRIC_OPTIONS.findIndex(o => o.value === metric);
-    const line = vg.plot(
-      vg.lineY(vg.from(treeTable, { filterBy: $filter }), {
-        x: 'depth',
-        y: vg.avg(metric),
-        stroke: COLORS[colorIdx % COLORS.length],
-        marker: true,
-      }),
-      vg.intervalX({ as: $filter }),
-      vg.width(750),
-      vg.height(320),
-      vg.marginLeft(70),
-      vg.xLabel('Tree Depth (ply)'),
-      vg.yLabel('Avg ' + label),
-    );
-    plotContainer.appendChild(line);
-  }
-
-  const metricSelect = nativeSelect(METRIC_OPTIONS, async (val) => {
-    selectedMetric = val;
-    await renderLine(val);
-  }, selectedMetric);
-
-  container.appendChild(controlsBar(controlGroup('Metric', metricSelect)));
-  container.appendChild(panel('Metric by Tree Depth', plotContainer));
-  await renderLine(selectedMetric);
-
-  // Multi-line comparison: nodes vs qnodes
-  const multiLine = vg.plot(
-    vg.lineY(vg.from(treeTable, { filterBy: $filter }), {
-      x: 'depth', y: vg.avg('nodes'), stroke: COLORS[0], marker: true,
-    }),
-    vg.lineY(vg.from(treeTable, { filterBy: $filter }), {
-      x: 'depth', y: vg.avg('qnodes'), stroke: COLORS[1], marker: true,
-    }),
-    vg.width(750),
-    vg.height(280),
-    vg.marginLeft(70),
-    vg.xLabel('Tree Depth (ply)'),
-    vg.yLabel('Avg Count'),
-  );
-  container.appendChild(plotPanel('Nodes vs QNodes by Depth', multiLine));
-
-  // Fail highs/lows comparison
-  const failPlot = vg.plot(
-    vg.lineY(vg.from(treeTable, { filterBy: $filter }), {
-      x: 'depth', y: vg.avg('fail_highs'), stroke: COLORS[3], marker: true,
-    }),
-    vg.lineY(vg.from(treeTable, { filterBy: $filter }), {
-      x: 'depth', y: vg.avg('fail_lows'), stroke: COLORS[2], marker: true,
-    }),
-    vg.width(750),
-    vg.height(260),
-    vg.marginLeft(70),
-    vg.xLabel('Tree Depth (ply)'),
-    vg.yLabel('Count'),
-  );
-  container.appendChild(plotPanel('Fail Highs / Lows by Depth', failPlot));
-
-  return container;
+  let measure = measures[0]?.value;
+  const body = el('div');
+  const draw = () => {
+    releaseCharts(body);
+    const m = measures.find(o => o.value === measure);
+    body.replaceChildren(plot(
+      vg.lineY(vg.from('ds_tree', { filterBy: $sel }), { x: 'ply', y: measure, stroke: 'engine', strokeWidth: 1.6 }),
+      vg.dot(vg.from('ds_tree', { filterBy: $sel }), { x: 'ply', y: measure, fill: 'engine', r: 2.2, tip: true }),
+      ...engineColors(), vg.yScale(m.log ? 'log' : 'linear'), m.pct ? vg.yTickFormat('%') : null, vg.yGrid(true),
+      intTicks(), vg.xLabel('Ply from the root'), vg.yLabel(m.label), vg.width(chartWidth()), vg.height(300)));
+  };
+  frag.append(panel({
+    title: 'A measure along the plies',
+    caption: 'The chosen measure at each ply, one line per engine; move ordering and pruning usually change character a few plies from the leaves.',
+    controls: selectInput({ label: 'Measure', options: measures, value: measure, onChange: v => { measure = v; draw(); } }),
+    body,
+  }));
+  draw();
+  return frag;
 }

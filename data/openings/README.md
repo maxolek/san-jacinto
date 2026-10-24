@@ -26,5 +26,5 @@ Notes and important caution:
 - After creating/updating `data/openings/eco_db.json`, re-run the pipeline to repopulate `game_stats.opening`:
 
 ```bash
-python data/run_analytics_pipeline.py
+python -m data.databases.run_analytics_pipeline --full
 ```

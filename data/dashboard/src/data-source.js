@@ -1,3 +1,20 @@
+/**
+ * DuckDB-WASM open options. Snapshots are read with HTTP range requests, so a visitor only downloads
+ * the pages a query touches. GitHub Pages answers ranged GETs with 206 but a HEAD carrying a Range header
+ * with 200, so HEAD responses are not trusted; a host without range support still works through one full
+ * download. `fullDownload` forces the old behaviour (one GET of the whole file).
+ */
+export function duckdbConfig({ fullDownload = false } = {}) {
+  return {
+    query: { castBigIntToDouble: true, castDecimalToDouble: true },
+    filesystem: {
+      allowFullHTTPReads: true,
+      forceFullHTTPReads: Boolean(fullDownload),
+      reliableHeadRequests: false,
+    },
+  };
+}
+
 /** Resolve a public snapshot, an explicit URL, or the local file-picker mode. */
 export async function resolveDataSource(pageURL, baseURL, { fetcher = fetch, development = false } = {}) {
   const page = new URL(pageURL);

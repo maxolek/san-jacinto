@@ -12,11 +12,13 @@ repository root:
 
 ```sh
 python -m data.transforms.transform_search
+python -m data.transforms.aggregates
 python -m data.databases.test_schema
 python -m data.transforms.validate
 ```
 
 Set `CHESS_ANALYTICS_DB=/path/to/chess_analytics.duckdb` to override the default.
+Each command also takes `--db PATH`.
 The first command atomically replaces `search_features`,
 `search_iteration_features`, and `search_tree_features` tables with views and
 installs their supporting views. If a definition fails, the transaction rolls
@@ -26,8 +28,11 @@ reload, position recomputation, or Stockfish run is needed for this migration.
 anything. Reopen the migrated file in the dashboard.
 
 The normal analytics pipeline installs these views after loading facts and
-computing position features. A pipeline `--full` still reloads source facts and
-resets stored Stockfish columns as before; it is unnecessary for this migration.
+computing position features, then builds the pre-aggregated `agg_*` tables that
+the dashboard reads (see [dashboard-data.md](dashboard-data.md)). A pipeline
+`--full` still reloads source facts, which empties the stored Stockfish columns
+of `search_stats`; the same run fills them again from `stockfish_moves`, so no
+Stockfish analysis is repeated. It is unnecessary for this migration.
 
 ## Query surfaces
 
@@ -70,11 +75,17 @@ now checks that assumption.
 - Search-level evaluation sign flips sum all iteration transitions. Each
   iteration's `eval_sign_flips` remains a zero/one transition indicator.
 - `stddev_last5_eval` uses the current iteration and four preceding iterations.
-- `eval_diff` is computed from current evaluations. An obsolete stored column
-  in an older `search_stats` table is ignored and no longer maintained.
+- Mate scores, ±(100000 − plies), are kept out of evaluation averages, deltas
+  and deviations. Use `eval_cp` (NULL for a mate) and `mate` (+1, −1 or 0);
+  sign flips still use the raw eval.
+- `eval_diff` is computed from current evaluations, both from the side to move,
+  and only when neither is a mate. An obsolete stored column in an older
+  `search_stats` table is ignored and no longer maintained.
 - Best-move agreement uses `sf_best_move`. `sf_pv` contains a continuation, not
-  ranked candidate moves: `engine_move_rank` is 1 for a known best-move match
-  and NULL otherwise, since other ranks cannot be recovered from this data.
+  ranked candidate moves. Stockfish's ranked candidates are analysed separately
+  (`stockfish_moves`, top 5 lines by default): `engine_move_rank` is the engine
+  move's line (0 = outside the lines), and for analyses made before those lines
+  existed it is 1 for a best-move match and NULL otherwise.
 - Searches without a known game result have NULL `game_score`, not a loss.
 - Search views supply both historical aliases and the dashboard's raw counter
   names, including `move`, `tt_hits`, `fail_highs`, and `total_nmp_failhigh`.
@@ -95,24 +106,32 @@ than the previous materialized tables. Benchmark actual browser workloads
 before adding any targeted cache. Dropping tables frees internal storage for
 reuse; it does not guarantee that an existing database file shrinks on disk.
 
-Regression tests use a fixture built from the repository's raw SQLite schema:
+Regression tests build a raw SQLite database from generated engine logs with
+the real ETL. They then run the pipeline without Stockfish, the public export
+and the migrations. From the repository root:
 
 ```sh
-python -m unittest data.databases.test_analytics_views
-cd data/dashboard
-npm run build
+python -m unittest discover -s data -p "test_*.py"
 ```
 
-The tests cover migration, reruns, transaction rollback, source updates,
-one-row-per-search joins, metric edge cases, and full/incremental loader
-compatibility. The schema check requires the new views, so a missing query
-layer can no longer silently pass as an unfinished optional feature build.
+They cover:
+
+- Every view and aggregate table has its documented columns.
+- One row per search in the metadata joins, including the STS join.
+- Evaluations with mate scores.
+- Aggregates that agree with `game_stats` and `search_stats`.
+- Incremental loads that match a full reload, including new raw columns.
+- Migrations on old databases, which are also idempotent and transactional.
+- The exact relations and columns of public snapshots.
 
 The browser attaches the analytics file read-only and exposes its relations
 through temporary aliases in a writable in-memory database. Mosaic can build
 small cross-filter caches there without writing to the source file.
 
 ## Migration verification
+
+This was a one-off measurement when the views replaced the materialized
+tables. The benchmark script is not part of the repository.
 
 Native DuckDB 1.4.4, synthetic data (20,002 searches / 80,008 iterations), five
 warm-query runs, median milliseconds:
@@ -125,10 +144,6 @@ warm-query runs, median milliseconds:
 | Iteration NPS by depth | 1.36 | 0.35 |
 | Iteration EBF by depth, including windows | 29.14 | 0.65 |
 
-Unchanged search totals, evaluations, NPS, average iteration NPS, and timing
-averages matched the previous transform across the synthetic dataset. These
-numbers demonstrate the build/query tradeoff, not production latency or file
-size savings. The existing database in Documents was inaccessible to the test
-process because of macOS file permissions, so it was not migrated or benchmarked.
-Browser verification used a small fixture: all 16 tabs and 83 selector options
-completed without console errors after fixing the cache workspace.
+These numbers demonstrate the build/query tradeoff, not production latency or
+file size. The dashboard now reads the pre-aggregated tables instead of
+aggregating these views in the browser.

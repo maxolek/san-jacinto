@@ -26,16 +26,41 @@ ANALYTICS_VIEWS = (
     "search_features",
 )
 
+# Columns newer than some existing analytics databases. They are added as NULL
+# (when missing) so the views still bind before the next load fills them.
+VIEW_INPUT_COLUMNS = {
+    "game_stats": (
+        ("opening_variation", "VARCHAR"),
+        ("env_core_type", "VARCHAR"),
+        ("env_core_mixed", "BIGINT"),
+        ("env_mhz_mean", "DOUBLE"),
+        ("env_host", "VARCHAR"),
+        ("env_cpu_model", "VARCHAR"),
+    ),
+}
 
-def _replace_view(cnxn, name):
-    """Replace a legacy materialized table or update an existing view."""
-    query = (SQL_DIR / f"{name}.sql").read_text()
+
+def _table_kind(cnxn, name):
     kind = cnxn.execute("""
         SELECT table_type FROM information_schema.tables
         WHERE table_catalog = current_database()
           AND table_schema = 'main' AND table_name = ?
     """, [name]).fetchone()
-    if kind and kind[0] == "BASE TABLE":
+    return kind[0] if kind else None
+
+
+def _ensure_view_inputs(cnxn):
+    for table, columns in VIEW_INPUT_COLUMNS.items():
+        if _table_kind(cnxn, table) != "BASE TABLE":
+            continue
+        for column, dtype in columns:
+            cnxn.execute(f'ALTER TABLE "{table}" ADD COLUMN IF NOT EXISTS "{column}" {dtype}')
+
+
+def _replace_view(cnxn, name):
+    """Replace a legacy materialized table or update an existing view."""
+    query = (SQL_DIR / f"{name}.sql").read_text()
+    if _table_kind(cnxn, name) == "BASE TABLE":
         cnxn.execute(f'DROP TABLE "{name}"')
     cnxn.execute(f'CREATE OR REPLACE VIEW "{name}" AS {query}')
 
@@ -56,11 +81,15 @@ def build_search_features(cnxn, full=False):
         _replace_view(cnxn, name)
 
 
-def build_analytics_views(cnxn):
-    """Migrate atomically, retaining legacy tables if any view fails to bind."""
+def build_analytics_views(cnxn, names=ANALYTICS_VIEWS):
+    """Migrate atomically, retaining legacy tables if any view fails to bind.
+
+    `names` installs a subset (in dependency order), e.g. for a public snapshot.
+    """
     cnxn.execute("BEGIN TRANSACTION")
     try:
-        for name in ANALYTICS_VIEWS:
+        _ensure_view_inputs(cnxn)
+        for name in names:
             _replace_view(cnxn, name)
         cnxn.execute("COMMIT")
     except Exception:
@@ -72,8 +101,9 @@ def main():
     parser = argparse.ArgumentParser(description="Migrate/install analytics SQL views")
     parser.add_argument('--full', action='store_true',
                         help='Accepted for compatibility; views always use current facts')
-    parser.parse_args()
-    with duckdb.connect(str(ANALYTICS_DB)) as cnxn:
+    parser.add_argument('--db', type=Path, help=f'Analytics database (default: {ANALYTICS_DB})')
+    args = parser.parse_args()
+    with duckdb.connect(str(args.db or ANALYTICS_DB)) as cnxn:
         build_analytics_views(cnxn)
     print(f"Installed {len(ANALYTICS_VIEWS)} analytics views (no feature tables built).")
 

@@ -1,6 +1,6 @@
 SELECT
     s.id AS id, s.id AS search_id, s.fen, s.ply, s.engine_id, s.game_id, s.sts_id,
-    s.nodes, s.qnodes, s.tt_hits, s.tt_stores, s.fail_highs, s.fail_lows, s.nmp, s.nmp_failhigh,
+    s.nodes, s.qnodes, s.tt_hits, s.tt_stores, s.tt_fill, s.fail_highs, s.fail_lows, s.nmp, s.nmp_failhigh,
     s.time_ms AS total_time_ms,
     s.eval AS final_eval,
     s.move AS best_move,
@@ -28,20 +28,36 @@ SELECT
     s.fh_index_8plus AS total_fh_index_8plus,
     s.see_prunes AS total_see_prunes,
     s.delta_prunes AS total_delta_prunes,
+    s.pvs_researches AS total_pvs_researches,
     s.nmp AS total_nmp,
     s.nmp_failhigh AS total_nmp_fail,
     s.nmp_failhigh AS total_nmp_failhigh,
     s.tt_overwritten AS total_tt_overwritten,
 
-    -- stockfish ground-truth (added by transform_positions)
+    -- evaluation from the side to move; mate scores are +/-(100000 - plies to mate)
+    s.eval AS eval,
+    CASE WHEN abs(s.eval) < 99000 THEN s.eval END AS eval_cp,
+    CASE WHEN s.eval >= 99000 THEN 1 WHEN s.eval <= -99000 THEN -1 WHEN s.eval IS NOT NULL THEN 0 END AS mate,
+    CASE WHEN abs(s.eval) >= 99000 THEN sign(s.eval) * (100000 - abs(s.eval)) END AS mate_plies,
+    s.depth AS depth,
+
+    -- stockfish ground-truth (added by transform_positions), also from the side to move
     s.sf_eval AS sf_eval,
+    CASE WHEN abs(s.sf_eval) < 99000 THEN s.sf_eval END AS sf_eval_cp,
     s.sf_best_move AS sf_best_move,
     s.sf_pv AS sf_pv,
-    s.eval AS eval,
-    s.depth AS depth,
-    CASE WHEN s.eval IS NOT NULL AND s.sf_eval IS NOT NULL THEN s.eval - s.sf_eval ELSE NULL END AS eval_diff,
-    -- Only the best move is known; a continuation cannot establish MultiPV rank.
-    CASE WHEN s.move = s.sf_best_move THEN 1 ELSE NULL END AS engine_move_rank,
+    CASE WHEN abs(s.eval) < 99000 AND abs(s.sf_eval) < 99000 THEN s.eval - s.sf_eval END AS eval_diff,
+    -- Stockfish's top lines: the engine's move among them (1..sf_multipv, 0 = outside the lines,
+    -- NULL = unknown) and its loss against Stockfish's first line, both evals clamped to +/-1000 cp.
+    s.sf_depth AS sf_depth,
+    s.sf_multipv AS sf_multipv,
+    s.sf_move_rank AS sf_move_rank,
+    s.sf_move_eval AS sf_move_eval,
+    CASE WHEN s.sf_eval IS NOT NULL AND s.sf_move_eval IS NOT NULL
+         THEN CAST(greatest(0, least(1000, greatest(-1000, s.sf_eval))
+                               - least(1000, greatest(-1000, s.sf_move_eval))) AS DOUBLE) END AS sf_cp_loss,
+    -- Older analyses without Stockfish's lines only know whether the move was the first one.
+    coalesce(s.sf_move_rank, CASE WHEN s.move = s.sf_best_move THEN 1 END) AS engine_move_rank,
     CASE WHEN s.move IS NULL OR s.sf_best_move IS NULL THEN NULL
          WHEN s.move = s.sf_best_move THEN 1 ELSE 0 END AS best_move_match,
 
@@ -60,6 +76,16 @@ SELECT
     s.fh_index_8plus / NULLIF(s.fail_highs,0) AS fh_index_8plus_ratio,
     s.fail_high_researches / GREATEST(1, 1 + s.depth - 6) AS fail_high_researches_per_depth,
     s.fail_low_researches / GREATEST(1, 1 + s.depth - 6) AS fail_low_researches_per_depth,
+    s.see_prunes / NULLIF(s.qnodes, 0) AS see_prune_ratio,
+    s.delta_prunes / NULLIF(s.qnodes, 0) AS delta_prune_ratio,
     s.nmp / NULLIF(s.nodes + s.qnodes, 0) AS nmp_ratio,
-    s.nmp_failhigh / NULLIF(s.nmp, 0) AS nmp_failhigh_ratio
+    s.nmp_failhigh / NULLIF(s.nmp, 0) AS nmp_failhigh_ratio,
+
+    -- environment of the game the search was made in (match-runner games only)
+    g.env_core_type,
+    g.env_core_mixed,
+    g.env_mhz_mean,
+    g.env_host,
+    g.env_cpu_model
 FROM search_stats s
+LEFT JOIN game_stats g ON s.game_id = g.id

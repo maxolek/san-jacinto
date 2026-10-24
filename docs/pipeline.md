@@ -21,16 +21,25 @@ graph TD
         RUN["run_analytics_pipeline.py<br/><i>Pipeline orchestrator</i>"]
 
         LOAD["load_analytics.py<br/><i>Import raw tables</i>"]
-        TP["transform_positions.py<br/><i>Position features</i>"]
+        TP["transform_positions.py<br/><i>Position features<br/>+ Stockfish's top lines (cached)</i>"]
         TS["transform_search.py<br/><i>Install SQL analytics views</i>"]
+        AGG["aggregates.py<br/><i>agg_* tables + search_sample</i>"]
+        CHK["validate.py + test_schema.py<br/><i>Data and schema checks</i>"]
 
         RUN -.->|"1"| LOAD
         LOAD -.->|"2"| TP
         TP -.->|"3"| TS
+        TS -.->|"4"| AGG
+        AGG -.->|"5"| CHK
     end
 
     subgraph Analytics["Analytics Layer"]
         DUCK[("chess_analytics.duckdb<br/><b>DuckDB</b>")]
+    end
+
+    subgraph Publish["Publication · data/databases/export_public.py"]
+        SNAP[("snapshots/sha256.duckdb<br/><i>allow-listed tables + aggregates</i>")]
+        MAN["manifest.json"]
     end
 
     subgraph Dashboard["Dashboard · data/dashboard/ (Vite + Mosaic)"]
@@ -50,8 +59,11 @@ graph TD
     LOAD --> DUCK
     TP --> DUCK
     TS --> DUCK
+    AGG --> DUCK
 
-    DUCK -->|".duckdb file<br/>loaded via file picker"| DKWASM
+    DUCK -->|"export_public"| SNAP
+    SNAP --> MAN
+    MAN -->|"published manifest<br/>(or a local .duckdb file)"| DKWASM
     DKWASM --> MOSAIC
     MOSAIC --> VIEWS
     VIEWS --> APP
@@ -67,3 +79,6 @@ graph TD
     style RUN fill:#0a2e1a,stroke:#7fff6b,stroke-width:3px,color:#fff
 
 ```
+
+Commands and the order of the steps are in [data/README.md](../data/README.md).
+The tables the dashboard reads are described in [dashboard-data.md](dashboard-data.md).
