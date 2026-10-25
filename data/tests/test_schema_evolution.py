@@ -447,7 +447,7 @@ class NewStatisticTest(TempDirTest):
         self.cnxn.commit()
         analytics = self.analytics()
         _, out = quietly(load_analytics.load_incremental, analytics)
-        self.assertIn("search_stats: new columns corrhist_hits", out)
+        self.assertIn("search_stats: added new column(s) corrhist_hits", out)
         self.assertEqual(analytics.execute("SELECT corrhist_hits FROM search_stats ORDER BY id").fetchall(),
                          [(None,), (7,)])
         self.assertEqual(analytics.execute(

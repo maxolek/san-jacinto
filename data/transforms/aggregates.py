@@ -332,7 +332,7 @@ WITH it AS (
            LAG(i.eval) OVER w AS prev_eval,
            LAG(i.move) OVER w AS prev_move,
            SUM(i.time_ms) OVER (w ROWS UNBOUNDED PRECEDING) AS cum_time_ms
-    FROM iterative_deepening_stats i
+    FROM search_iteration_metrics i -- iterative_deepening_stats with pvs_researches derived
     WINDOW w AS (PARTITION BY i.search_id ORDER BY i.depth)
 )
 SELECT

@@ -18,6 +18,7 @@ from __future__ import annotations
 import io
 import json
 import re
+import math
 from collections import Counter, defaultdict
 from pathlib import Path
 
@@ -25,7 +26,8 @@ RESULT_CODES = {"1-0": 1, "0-1": 2, "1/2-1/2": 3}
 # utils/match_runner termination classes (tests/sprt.termination_class) -> raw termination codes
 TERMINATION_CODES = {
     "mate": 1, "stalemate": 2, "repetition": 3, "50-move rule": 4, "time forfeit": 5, "resignation": 6,
-    "adjudication": 7, "move limit": 7, "insufficient material": 8, "illegal move": 9, "crash": 10, "stall": 10,
+    "adjudication": 7, "move limit": 7, "tablebase": 7, "insufficient material": 8, "illegal move": 9, 
+    "crash": 10, "stall": 10,
 }
 _TAG = re.compile(r'^\[(\w+)\s+"(.*)"\]\s*$')
 
@@ -73,11 +75,37 @@ def pgn_moves(run_dir):
                 moves.append(move.uci())
                 board.push(move)
                 positions.append(epd(board.fen()))
-            out[key] = (moves, positions)
+            out[key] = (moves, positions, game.headers.get("FEN"))
     return out
 
 
-def link_engine_games(logroot, run_dir, games=None, moves=None, names_by_version=None, min_support=0.5):
+def stored_games(cnxn, run_id, experiment_id, first="Candidate", second="Baseline"):
+    """(games, moves) like read_run / pgn_moves, from a runs played games in the raw database
+    
+    for linking telemetry when the run folder is gone (e.g. a later retry-ingest):
+    game 2k+1 of an opening pair has 'first' as white. withou the folder the engine
+    processes of a game are unknown, so ties are not broken by job
+    """
+    import chess
+    games, moves = [], []
+    rows = cnxn.execute("SELECT run_game, moves, start_fen FROM games WHERE source = 'match' AND run_id = ? "
+                        "AND experiment_id = ?", (run_id, experiment_id)).fetchall()
+    
+    for number, played, fen in rows:
+        board = chess.Board(fen) if fen else chess.Board()
+        ucis, positions = json.loads(played or "[]"), [epd(board.fen())]
+
+        for move in ucis:
+            board.push_uci(move)
+            positions.append(epd(board.fen()))
+
+        white, black = (first, second) if number % 2 else (second, first)
+        games.append(dict(game=number, job=0, job_game=number, white=white, black=black))
+        moves[(0, number)] = (ucis, positions, fen)
+
+    return games, moves
+
+def link_engine_games(logroot, run_dir, games=None, moves=None, names_by_version=None, min_support=0.5, engine_name=None):
     """{engine game_uuid: run game number} for every engine game in logroot's instance logs.
 
     Each search's FEN votes for the runner games that contain that position.
@@ -118,7 +146,8 @@ def link_engine_games(logroot, run_dir, games=None, moves=None, names_by_version
                     continue
                 owner.setdefault(uuid, record.get("instance_id"))
                 searches[uuid] += 1
-                name = (names_by_version or {}).get(record.get("engine_id"))
+                name = engine_name if engine_name is not None else \
+                    (names_by_version or {}).get(record.get("engine_id"))
                 white_to_move = fen.split()[1] == "w" if len(fen.split()) > 1 else True
                 for number in by_position.get(epd(fen), ()):
                     if name is not None:
@@ -142,25 +171,40 @@ def link_engine_games(logroot, run_dir, games=None, moves=None, names_by_version
 
 def _tc_fields(time_control):
     """wtime, btime, winc, binc (ms), depth, movetime (ms) from a run's time control text."""
-    out = dict(wtime=None, btime=None, winc=None, binc=None, depth=None, movetime=None)
+    empty = dict(wtime=None, btime=None, winc=None, binc=None, depth=None, movetime=None)
+    out = dict(empty)
+    
     if not time_control:
         return out
-    text = str(time_control)
-    if text.startswith("depth "):
-        out["depth"] = int(text.split()[1])
-    elif text.endswith("s/move"):
-        out["movetime"] = int(float(text[:-6]) * 1000)
-    else:
-        base, _, inc = text.partition("+")
-        if ":" in base:
-            minutes, seconds = base.split(":", 1)
-            base_s = 60 * float(minutes) + float(seconds)
+    text = str(time_control).strip().split("@")[0].strip()
+    kind, value = None, text 
+    match = re.fullmatch(r"(depth|nodes|st|tc)\s*[= ]\s*(\S+)", text)
+    if match: kind, value = match.groups()
+    try:
+        if kind == "depth":
+            out['depth'] = int(value)
+        elif kind == "nodes":
+            out['nodes'] = int(value)
+        elif kind == "st":
+            out['movetime'] = round(float(value) * 1000)
+        elif value.endswith("s/move"):
+            out['movetime'] = round(float(value[:-6]) * 1000)
         else:
-            base_s = float(base.split("/")[-1])
-        out["wtime"] = out["btime"] = int(base_s * 1000)
-        out["winc"] = out["binc"] = int(float(inc or 0) * 1000)
+            base, _, inc = value.partition("+")
+            base = base.split("/")[-1] # moves/time
+            if ":" in base:
+                minutes, seconds = base.split(':', 1)
+                base_s = 60 * float(minutes) + float(seconds)
+            else:
+                base_s = float(base)
+            increment = float(inc or 0)
+            if not (math.isfinite(base_s) and math.isfinite(increment)):
+                return out 
+            out['wtime'] = out['btime'] = round(base_s * 1000)
+            out['winc'] = out['binc'] = round(increment * 1000)
+    except (ValueError, OverflowError):
+        return dict(empty)
     return out
-
 
 def game_rows(run_dir, engine_ids, experiment_id=None):
     """Rows for the raw `games` table, one per finished runner game (see ingest.bulk_log_match_games)."""
@@ -170,7 +214,7 @@ def game_rows(run_dir, engine_ids, experiment_id=None):
     tc = _tc_fields(meta.get("time_control"))
     rows = []
     for record in games:
-        moves_uci = moves.get((record.get("job"), record.get("job_game")), ((), ()))[0]
+        played = moves.get((record.get("job"), record.get("job_game")), ((), (), None))
         opening = ", ".join(x for x in (record.get("opening"), record.get("variation")) if x)
         rows.append(dict(
             experiment_id=experiment_id,
@@ -180,8 +224,8 @@ def game_rows(run_dir, engine_ids, experiment_id=None):
             result=RESULT_CODES.get(record.get("result"), 0),
             termination=TERMINATION_CODES.get(record.get("termination")),
             opening=opening or None,
-            start_fen=None,
-            moves=json.dumps(list(moves_uci)),
+            start_fen=played[2] if len(played) > 2 else None,
+            moves=json.dumps(list(played[0])),
             run_time_s=record.get("seconds"),
             source="match",
             run_id=record.get("run") or meta.get("run"),

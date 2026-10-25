@@ -173,7 +173,6 @@ class PentanomialSPRT:
         self.sequential = sequential
         self.lbound = math.log(beta / (1 - alpha))
         self.ubound = math.log((1 - beta) / alpha)
-        self.counts = [0] * 5
         self.tally = PairTally()
         self.games = {}
         self.voided = set()

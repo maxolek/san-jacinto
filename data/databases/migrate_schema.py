@@ -422,6 +422,15 @@ MIGRATIONS = [
             )
         """],
     ),
+    Migration(
+        id="2026_10_25_match_results_penta_wl",
+        description="match_results.penta_wl: pairs one win and one loss. rows with it have "
+                    "penta_dd = two draws; rows without it (NULL : the runner didnt split the middle bin) "
+                    "keep both in penta_dd. middle bin = penta_dd + coalesce(penta_wl, 0) (data/ratings.py)",
+                    db="raw",
+                    table="match_results",
+                    columns=_nullable([("penta_wl","INTERGER")]),
+    )
 ]
 
 

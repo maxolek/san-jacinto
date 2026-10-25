@@ -31,6 +31,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 from utils import cpu_slots, uci_probe  # noqa: E402
 from utils.fastchess_match import FASTCHESS, Side, limit_args, limit_label, prepare_match, run_match, tb_args  # noqa: E402
 from utils.pentanomial import PentanomialSPRT  # noqa: E402
+from utils.openings import OpeningBook
 
 LOGS_DIR = PROJECT_ROOT / "logs"
 Z95 = 1.959964

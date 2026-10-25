@@ -116,6 +116,31 @@ def release():
     for cpu in list(_claims):
         _unclaim(cpu)
 
+# the same claims for other planners (utils.match_runner.plan_slots) so runs of either
+# kind never pin games to a cpu another run holds
+
+def claim(cpu):
+    """hold 'cpu' for this process
+    false if nother run holds it (true if this one does)
+    """
+    return _claim(cpu)
+
+def unclaim(cpu):
+    """give back one cpu this process claimed (no-opp if it holds none)"""
+    if cpu in _claims:
+        _unclaim(cpu)
+
+def claimed():
+    """the cpus this process holds"""
+    return set(_claims)
+
+def held_elsewhere(cpu):
+    """true if another process holds cpu (checked by briefly taking its lock)"""
+    if cpu in _claims: return False 
+    if _claim(cpu):
+        _unclaim(cpu)
+        return False 
+    return True
 
 def physical_slots(engine, threads):
     """How many slots of `threads` cpus fit on the physical cores this process may use (no SMT sharing)."""

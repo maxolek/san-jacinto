@@ -432,7 +432,7 @@ def save_engine_config(engine_path, config_name, timeout=10.0):
     system = platform.system()
     engine_path = os.path.abspath(engine_path)
 
-    if system == "Windows" and not engine_path.lower().endswith(".exe"):
+    if system == "Windows" and not engine_path.lower().endswith((".exe", ".py")):
         if os.path.exists(engine_path + ".exe"):
             engine_path += ".exe"
 
@@ -440,7 +440,7 @@ def save_engine_config(engine_path, config_name, timeout=10.0):
         raise FileNotFoundError(f"Engine not found at path: {engine_path}")
 
     p = subprocess.Popen(
-        [engine_path],
+        [sys.executable, engine_path] if engine_path.lower().endswith(".py") else [engine_path],
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL,

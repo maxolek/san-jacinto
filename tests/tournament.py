@@ -240,6 +240,8 @@ def run_fastchess_tournament(candidate_path, opponents, tc, games_per_pair, fast
         "-rounds", str(rounds),
         "-maxmoves", "200",
         "-concurrency", f"{concurrency}", "-force-concurrency",
+        # an engine that crashes or stalls is resetarted: the tournament goes on
+        "-recover",
         "-pgnout", f"file={pgn_path or TOURNAMENT_LOG_DIR / 'tournament.pgn'}",
     ] + book_args(book, 16) + list(extra) + list(affinity)
 

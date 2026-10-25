@@ -2,20 +2,13 @@ import argparse
 from pathlib import Path
 from ..etl.paths import RAW_DB, connect_raw
 from ..etl.schema import ensure_schema
-from .migrate_schema import GAMES_MATCH_COLUMNS, MIGRATIONS, SPRT_PENTANOMIAL_COLUMNS, migrate
-
-def _column_defs(columns, indent=12):
-    """CREATE TABLE lines for a shared (name, type) column set."""
-    pad = " " * indent
-    return ",\n".join(f"{pad}{name:<27} {sql_type}" for name, sql_type in columns)
-
 
 def _resolve_db_path(db_path=None) -> Path:
     """A file path, or a directory (for which `<dir>/chess.db` is used)."""
     if db_path is None:
         return Path(RAW_DB)
     path = Path(db_path)
-    if path.is_dir():
+    if path.is_dir() or not path.suffix:
         return path / "chess.db"
     return path
 
@@ -26,10 +19,10 @@ def _resolve_db_path(db_path=None) -> Path:
 # change is a migration in migrate_schema.py, which init_raw_db applies right after
 # creating these, so new and upgraded databases always have the same schema.
 
-def init_raw_db(db_path=None) -> None:
+def init_raw_db(db_path=None) -> Path:
     """
         input: database file (default: CHESS_RAW_DB / data.etl.paths.RAW_DB);
-               an existing directory means <dir>/chess.db
+               a directory (or a path without an extension) means <dir>/chess.db
         output: path of the database
 
         executed: creates the raw database and its tables (if missing)
@@ -48,7 +41,6 @@ def init_raw_db(db_path=None) -> None:
     db_path = _resolve_db_path(db_path)
     db_path.parent.mkdir(parents=True, exist_ok=True)
     print(f"[DB] Initializing raw database at: {db_path}")
-    print(f"[DB] Initializing raw database at: {db_path}")
 
     cnxn = connect_raw(db_path)
     create_base_tables(cnxn)
@@ -56,6 +48,7 @@ def init_raw_db(db_path=None) -> None:
     ensure_schema(cnxn, recheck=True)
     cnxn.close()
     print(f"[DB] Raw database initialized with schema at {db_path}")
+    return db_path
 
 
 def create_base_tables(cnxn) -> None:
@@ -334,9 +327,6 @@ def create_base_tables(cnxn) -> None:
             start_fen                   TEXT, -- typically START_POS but sometimes games are loaded from position
             moves                       TEXT, -- array ["e2e4", "e7e5", etc.]
             run_time_s                  REAL,
-        -- prevoenance (match runner) and the environment the game ran in
-        );
-    """ + _column_defs(GAMES_MATCH_COLUMNS) + """,
 
             ingestion_timestamp_utc     DATETIME DEFAULT CURRENT_TIMESTAMP,
             
@@ -380,8 +370,6 @@ def create_base_tables(cnxn) -> None:
         -- summaries
             games_played                    INTEGER,
             run_time_s                      REAL,
-        -- pentanomial model, per-core-type summary and machine
-    """ + _column_defs(SPRT_PENTANOMIAL_COLUMNS) + """,
 
             ingestion_timestamp_utc         DATETIME DEFAULT CURRENT_TIMESTAMP,
             
@@ -465,9 +453,7 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description="Create the raw SQLite schema and apply migrations")
     parser.add_argument("--db", type=Path, help=f"Raw database file or directory (default: {RAW_DB})")
     args = parser.parse_args(argv)
-    db_path = init_raw_db(args.db)
-    # existing databases created by older versions get the newer columns here
-    migrate(raw_db=db_path, migrations=[m for m in MIGRATIONS if m.db == "raw"])
+    return init_raw_db(args.db)
 
 if __name__ == "__main__":
     main()

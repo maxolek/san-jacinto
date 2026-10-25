@@ -11,7 +11,9 @@ pandas>=2.1
 
 # Optional: statistical tests in data/transforms/stats_tests.py (falls back to summary statistics)
 scipy>=1.11
-#optional: plots (utils/plotting.py, util/sprt_plot.py, tuning/, nnue/plot.py)
+# optional: plots (utils/plotting.py, util/sprt_plot.py, tuning/, nnue/plot.py)
 matplotlib>=3.8
-# opptional: CPU clock/utilization samling for the match runner (utils/environment.py, utils/cpu_topology.py)
+# optional: CPU clock/utilization samling for the match runner (utils/environment.py, utils/cpu_topology.py)
 psutil>=5.9
+# optional: nnue/hpo.py (hyperparameter search)
+optuna>=3.6

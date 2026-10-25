@@ -102,13 +102,15 @@ def run_make(args, build_type):
 # SPRT
 # ============================================================
 
-def _sprt_namespace(args, tc, threads, params=None, nodes=None):
+def _sprt_namespace(
+        args, threads, params=None, 
+        tc=None, time=None, depth=None, nodes=None):
     return argparse.Namespace(
         engine_a=args.prod_engine,
         engine_b=args.base_engine,
         concurrency=args.concurrency,
-        depth=args.sprt_depth,
-        time=args.sprt_time,
+        depth=depth,
+        time=time,
         tc=tc,
         nodes=nodes,
         elo0=args.elo0,
@@ -119,10 +121,11 @@ def _sprt_namespace(args, tc, threads, params=None, nodes=None):
         book=args.opening_book,
         book_depth=args.sprt_book_depth,
         logroot=SPRT_LOG_DIR,
+        db=DB_PATH,
         fastchess=args.fastchess,
         log=True,
         plot=True,
-        params=params or {},
+        params=dict(params or {}),
         threads=threads,
         no_pin=args.no_pin,
         tb=args.tb,
@@ -136,7 +139,8 @@ def run_sprt(args):
     accepted = True
     for threads in args.sprt_threads:
         print(f"[SPRT] {threads} thread(s)")
-        result = sprt.main(_sprt_namespace(args, args.sprt_tc, threads, nodes=args.sprt_nodes))
+        result = sprt.main(_sprt_namespace(args, threads, tc=args.sprt_tc, time=args.sprt_time, 
+                                           depth=args.sprt_depth, nodes=args.sprt_nodes))
         accepted = accepted and result["accepted"]
     return accepted
 
@@ -146,7 +150,7 @@ def run_sprt_gate(args, tc, params=None, threads=1):
     print(f"[SPRT] Gate TC: {tc}, {threads} thread(s)")
     print("============================\n")
 
-    return sprt.main(_sprt_namespace(args, tc, threads, params))
+    return sprt.main(_sprt_namespace(args, threads, params, tc=tc))
 
 def run_gated_sprt(args, params=None):
 
@@ -241,11 +245,9 @@ def run_tune(args):
     # through the tuner's own parser, so every option it reads gets its default
     tune_args = spsa_tuner.parse_args([
         "--engine", args.dev_engine,
-        "--baseline", args.dev_engine,
         "--fastchess", args.fastchess,
         "--tc", "0:20+.2",
-        "--iterations", "5000",
-        "--games-per-iter", "4",
+        "--pairs", "10000", # 20k games (formerly 5k iterations * 4 games)
         "--concurrency", "4",
         "--output", os.path.join(LOGS_DIR, "dev_logs", "spsa_results.json"),
         "--plot",
@@ -257,7 +259,7 @@ def run_tune(args):
 # Main
 # ============================================================
 
-def main():
+def build_parser():
     parser = argparse.ArgumentParser("Release pipeline")
 
     parser.add_argument("--version", required=True)
@@ -330,7 +332,10 @@ def main():
     # TUNING
     parser.add_argument("--tune", action="store_true", help="Run SPSA tuning on search parameters after release. Re-run SPRT to see if improvement.")
 
-    args = parser.parse_args()
+    return parser
+
+def main():
+    args = build_parser().parse_args()
 
     #args.engine = os.path.join(ENGINES_DIR, f"{args.version}.exe")
 

@@ -38,7 +38,10 @@ EPD_BOOK_MOVES = ("c2c3", "b7b5", "b3c2", "d7d6")
 EPD_BOOK_OPENING = ("Ruy Lopez", "Closed")
 # A local path in an engine description: must never reach the public export.
 PRIVATE_DESCRIPTION = r"Auto-registered from C:\Users\someone\engines\dev\{version}.exe"
-
+# builds that log three kinds of pvs re-search (share of the nodes) instead of one count
+# as newer builds do (include/search_stats.h); the others log pvs_researches
+PVS_KIND_VERSIONS = ("1.2.0")
+PVS_KINDS = {'depth': 0.0006, "full": 0.0003, "root": 0.0001}
 
 def write_logs(directory, n_games=12, seed=7):
     """Write the four JSONL logs to `directory`; returns (games, searches)."""
@@ -107,6 +110,14 @@ def write_logs(directory, n_games=12, seed=7):
                     treedepth_delta_prunes=[1] * depth, treedepth_pvs_researches=[1] * depth,
                     treedepth_nmp=[1] * depth, treedepth_nmp_failhigh=[1] * depth,
                 )
+                if version in PVS_KIND_VERSIONS:
+                    for kind, share in PVS_KINDS.items():
+                        values = [int(x * share) for x in nodes]
+                        record.update({f"pvs_researches_{kind}": sum(values), f"itdepth_pvs_researches_{kind}": values,
+                                       f"treedepth_pvs_researches_{kind}": [1] * depth})
+                else:
+                    values = [int(x * 0.001) for x in nodes]
+                    record.update(Pvs_researches=sum(values), itdepth_pvs_researches=values, treedepth_pvs_researches=[1] * depth)
                 files["search"].write(json.dumps(record) + "\n")
                 timing = {"type": "timing", "search_uuid": search_uuid, "game_uuid": game_uuid,
                           "engine_id": version, "total_search_time_ms": sum(times)}

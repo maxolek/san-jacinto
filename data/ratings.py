@@ -33,7 +33,8 @@ CATEGORIES = ("ultra_fast", "bullet", "blitz", "rapid", "classical")  # mirrored
 DEFAULT_SOURCES = ("tournament", "manual")
 ANCHOR_ELO = 1500.0
 Z95 = 1.959964
-
+# the five pentanomial bins (LL, LD, DD + WL, DW, WW) of a match results row, NULL when not recoreded
+PENTA_SQL = "penta_ll, penta_ld, penta_dd + COALESCE(penta_wl, 0), penta_wd, penta_ww"
 
 def classify_tc(tc_str):
     """Classify a time control string into ultra_fast/bullet/blitz/rapid/classical.

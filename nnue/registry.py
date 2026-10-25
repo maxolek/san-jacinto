@@ -58,33 +58,40 @@ def find_net_file(path):
 
 def load_losses(run_dir):
     """{superbatch: {"train": mean loss, "val": mean loss}} from metrics*.csv of a training run."""
-    rows = {}
-    for csv_path in sorted(Path(run_dir).glob("metrics*.csv")):
-        with open(csv_path, newline="", encoding="utf-8") as f:
-            for r in csv.DictReader(f):
-                try:
-                    split = "val" if r["split"].strip().lower() in VAL_SPLITS else "train"
-                    rows[(split, int(r["superbatch"]), int(r.get("batch") or 0))] = float(r["loss"])
-                except (KeyError, ValueError):
-                    continue
+
+    from nnue.plot import load_checkpoint_logs
+
+    series = load_checkpoint_logs(str(run_dir))   
     sums = {}
-    for (split, superbatch, _), loss in rows.items():
-        total = sums.setdefault(superbatch, {}).setdefault(split, [0.0, 0])
+    for x, loss in series.get("train", []):
+        total = sums.setdefault(int(x), [0.0, 0])
         total[0] += loss
         total[1] += 1
-    return {sb: {split: s / n for split, (s, n) in splits.items()} for sb, splits in sums.items()}
+    losses =  {sb: {"train": s / n} for sb, (s, n) in sums.items()}
+    for x, loss in series.get("val", []):
+        losses.setdefault(int(x), [])['val'] = loss 
+    return losses
 
+def load_best_info(folder):
+    """best.json of a best-validation folder train.py keeps (best/, best <val_set>/, best*_previous_<time>/)"""
+    try:
+        info = json.loads((Path(folder) / "best.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None 
+    return info if isinstance(info, dict) and isinstance(info.get("superbatch"), int) else None
 
 def _run_info(net_file, run_id=None, superbatch=None):
     """Run id, superbatch and run folder of a checkpoint <run dir>/<run>-<superbatch>/quantised.bin."""
-    checkpoint = net_file.parent
-    match = CHECKPOINT_NAME.match(checkpoint.name)
-    if match:
-        run_id = run_id or match["run"]
-        superbatch = superbatch if superbatch is not None else int(match["superbatch"])
-        return run_id, superbatch, checkpoint.parent
-    return run_id, superbatch, None
+    folder = net_file.parent
+    best = load_best_info(folder)
+    if best is not None:
+        run_id = run_id or best.get('net_id')
+        superbatch = superbatch if superbatch is not None else best["superbatch"]
+        return run_id, superbatch, folder.parent, best
+    return run_id, superbatch, None, None
 
+def _same_loss(a, b):
+    return a is not None and b is not None and math.isclose(a, b, rel_tol=1e-6, abs_tol=1e-12)
 
 def register_net(cnxn, path, run_id=None, superbatch=None, notes=None):
     """Register (or refresh) a net; returns its id."""
@@ -93,13 +100,18 @@ def register_net(cnxn, path, run_id=None, superbatch=None, notes=None):
     if net_file is None:
         raise FileNotFoundError(f"no net file in {path}")
     digest = sha256_file(net_file)
-    run_id, superbatch, run_dir = _run_info(net_file, run_id, superbatch)
+    run_id, superbatch, run_dir, best = _run_info(net_file, run_id, superbatch)
     losses = load_losses(run_dir) if run_dir else {}
-    at = losses.get(superbatch, {})
-    val = {sb: v["val"] for sb, v in losses.items() if "val" in v}
-    best_sb = min(val, key=val.get) if val else None
     config_path = run_dir / "train_config.json" if run_dir else None
     config = config_path.read_text(encoding="utf-8") if config_path and config_path.is_file() else None
+    if best is not None and not _same_loss(losses.get(superbatch, {}).get('val'), best.get('val_loss')):
+        # runs logs do not show this state
+        # only best.json describes it, and its loss is by definition that runs best
+        losses = {superbatch: {'val': best['val_loss']}} if best.get('val_loss') is not None else {}
+        config = None
+        at = losses.get(superbatch, {})
+    val = {sb: v["val"] for sb, v in losses.items() if "val" in v}
+    best_sb = min(val, key=val.get) if val else None
     values = (run_id, superbatch, str(net_file), at.get("val"), at.get("train"),
               val.get(best_sb), best_sb, config, notes)
     row = cnxn.execute("SELECT id FROM nets WHERE net_sha256 = ?", (digest,)).fetchone()
@@ -117,13 +129,29 @@ def register_net(cnxn, path, run_id=None, superbatch=None, notes=None):
     cnxn.commit()
     return net_id
 
+def _copy_of_existing_checkpoint(net_file):
+    """true for the net of a best folder whose checkpoint still holds the same net"""
+    best = load_best_info(net_file.parent)
+    if best is None or not best.get('checkpoint'):
+        return False 
+    source = net_file.parent.parent / Path(str(best['checkpoint'])).name / net_file.name
+    if not source.is_file():
+        return False 
+    try:
+        if source.samefile(net_file):
+            return True 
+    except OSError:
+        pass 
+    return sha256_file(source) == sha256_file(net_file)
+
 
 def scan(cnxn, root=CHECKPOINTS, run_id=None):
     """Register every checkpoint under root (one training run's folder, or all of them)."""
     pattern = f"{run_id}/*/quantised.bin" if run_id else "**/quantised.bin"
     ids = []
     for net_file in sorted(Path(root).glob(pattern)):
-        ids.append(register_net(cnxn, net_file))
+        if not _copy_of_existing_checkpoint(net_file):
+            ids.append(register_net(cnxn, net_file))
     return ids
 
 
@@ -139,7 +167,6 @@ def _ranks(values):
             ranks[order[k]] = (i + j) / 2 + 1
         i = j + 1
     return ranks
-
 
 def pearson(x, y):
     n = len(x)

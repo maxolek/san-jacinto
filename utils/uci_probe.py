@@ -16,9 +16,11 @@ import queue
 import subprocess
 import threading
 import time
+import re
 
 _cache = {}
-
+_OPTION = re.compile(r"^option name (.+?) type (\S+)(.*)$")
+_KEYWORDS = ("default", "min", "max", "var")
 
 class _Session:
     def __init__(self, exe):
@@ -102,6 +104,67 @@ def require_threads(exe, threads):
         raise ValueError(f"{exe} accepts at most Threads={spec['max']}, not {threads}; the games would silently "
                          "be played with fewer threads")
 
+def _option_fields(line):
+    """(type, {'default': text, 'min': text, 'max': text}, [var, ...]) of an option name ..."""
+    match = _OPTION.match(line.strip())
+    if not match: return None, {}, []
+    fields, varlist, key, words = {}, [], None, []
+
+    def flush():
+        if key == "var":
+            varlist.append(" ".join(words))
+        elif key:
+            fields[key] = " ".join(words)
+
+        for token in match.group(3).split():
+            if token in _KEYWORDS:
+                flush()
+                key, words = token, []
+            else:
+                words.append(token)
+
+        flush()
+        return match.group(2), fields, varlist
+
+def option_problems(declared, values):
+    """values fastchess would not send to an engine; empty if it sends them all
+    
+    declares: {name: line} with the engines option name ... type ...
+    values: {name: value} or {name: (low, high)} for every value of a spin range
+    
+    fastchess skips an option the engine does not declare (case sensitive)
+    """
+    problems = []
+    for name, value in values.items():
+        line = declared.get(name)
+        if line is None:
+            near = next((o for o in declared if o.lower() == name.lower()), None)
+            problems.append(f"{name}: not declared" + (f" (the engine calls it {near})" if near else ""))
+            continue 
+        kind, fields, varlist = _option_fields(line)
+        if kind == "spin":
+            try:
+                low, high = float(fields['min']), float(fields['max'])
+            except (KeyError, ValueError):
+                continue # bounds fastchess cannot read either
+            wanted = value if isinstance(value, tuple) else (value,)
+            try:
+                numbers = [float(v) for v in wanted]
+            except (TypeError, ValueError):
+                problems.append(f"{name}={value}: not a number (spin option)")
+                continue 
+            if min(numbers) < low or max(numbers) > high:
+                what = f"range [{wanted[0]}, {wanted[1]}]" if isinstance(value, tuple) else f"value {value}"
+                problems.append(f"{name}: {what} exceeds the engines [{fields['min']}, {fields['max']}]")
+            elif isinstance(value, tuple):
+                continue #a range is only checked against a spins bounds
+            elif kind == "check" and str(value) not in ("true", "false"):
+                problems.append(f"{name}={value}: a check option takes true or false")
+            elif kind == "combo" and str(value) not in varlist:
+                problems.append(f"{name}={value}: not one of {', '.join(varlist)}")
+            elif kind == "button" and str(value) != "true":
+                problems.append(f"{name}={value}: a button option takes true")
+        return problems
 
 def honors_node_limit(exe, timeout=15.0):
     """True / False as described above; None if the engine could not be checked."""

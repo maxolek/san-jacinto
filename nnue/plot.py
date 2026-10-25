@@ -33,10 +33,11 @@ from pathlib import Path
 from collections import deque
 from dataclasses import dataclass
 from typing import Dict, List, Tuple
-from matplotlib.ticker import MaxNLocator
 
 # Also support direct execution: python nnue/plot.py ...
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+# matplotlib is imported inside the drawing functions only
+# so the log loading used by nnue/registery works without it
 from utils.plotting import PALETTE, TEAL, enable_hover, style_dashboard
 
 
@@ -187,7 +188,8 @@ def checkpoint_dirs(directory: str) -> Dict[int, str]:
     for name in names:
         _, sep, tail = name.rpartition("-")
         path = os.path.join(directory, name)
-        if sep and tail.isdigit() and os.path.isdir(path):
+        if sep and tail.isdigit() and os.path.isdir(path) \
+                and not os.path.isfile(os.path.join(path, "best.json")):
             out[int(tail)] = path
     return out
 
@@ -394,6 +396,8 @@ def _global_stage_end(stages, series: Series, config: PlotConfig | None) -> floa
 
 
 def _set_integer_x_axis(ax) -> None:
+    from matplotlib.ticker import MaxNLocator
+
     ax.xaxis.set_major_locator(
         MaxNLocator(integer=True)
     )

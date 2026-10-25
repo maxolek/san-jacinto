@@ -277,6 +277,9 @@ class KillOnCloseJob:
     engines behind to steal CPU time from the next test. No-op elsewhere.
     """
 
+    KILL_ON_JOB_CLOSE = 0x2000
+    LIMIT_AFFINITY = 0x10
+
     class _Basic(ctypes.Structure):
         _fields_ = [("PerProcessUserTimeLimit", ctypes.c_int64), ("PerJobUserTimeLimit", ctypes.c_int64),
                     ("LimitFlags", ctypes.c_uint32), ("MinimumWorkingSetSize", ctypes.c_size_t),
@@ -291,12 +294,16 @@ class KillOnCloseJob:
                           ("ProcessMemoryLimit", ctypes.c_size_t), ("JobMemoryLimit", ctypes.c_size_t),
                           ("PeakProcessMemoryUsed", ctypes.c_size_t), ("PeakJobMemoryUsed", ctypes.c_size_t)]
 
-    def __init__(self):
+    def __init__(self, cpus=None):
         self.handle = None
+        self.affinity = None
         if not IS_WINDOWS:
             return
         k32 = ctypes.WinDLL("kernel32", use_last_error=True)
         k32.CreateJobObjectW.restype = ctypes.c_void_p
+        k32.SetInformationJobObject.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_uint32]
+        k32.AssignProcessToJobObject.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        k32.CloseHandle.argtypes = [ctypes.c_void_p]
         handle = k32.CreateJobObjectW(None, None)
         if not handle:
             return
@@ -308,13 +315,70 @@ class KillOnCloseJob:
             self.k32 = k32
         else:
             k32.CloseHandle(ctypes.c_void_p(handle))
+        limits = []
+        if cpus and all(0 <= cpu < 8 * ctypes.sizeof(ctypes.c_size_t) for cpu in cpus):
+            limits.append((self.KILL_ON_JOB_CLOSE | self.LIMIT_AFFINITY, sum(1 << cpu for cpu in set(cpus))))
+        limits.append((self.KILL_ON_JOB_CLOSE, 0))
+        for flags, mask in limits:
+            info = self._Extended()
+            info.BasicLimitInformation.LimitFlags = flags
+            info.BasicLimitInformation.Affinity = mask 
+            if k32.SetInformationJobObject(handle, 9, ctypes.byref(info), ctypes.sizeof(info)):
+                self.handle, self.k32 = handle, k32
+                self.affinity = sorted(set(cpus)) if flags & self.LIMIT_AFFINITY else None 
+                return 
+        k32.CloseHandle(handle)
+
 
     def add(self, process_handle):
         if self.handle:
-            self.k32.AssignProcessToJobObject.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
-            return bool(self.k32.AssignProcessToJobObject(ctypes.c_void_p(self.handle),
-                                                          ctypes.c_void_p(int(process_handle))))
+            return bool(self.k32.AssignProcessToJobObject(self.handle),int(process_handle))
         return False
+
+    def close(self):
+        """close the job: any process still in it is killed"""
+        if self.handle:
+            self.k32.CloseHandle(self.handle)
+            self.handle = None 
+
+
+def resume_process(pid):
+    """resume every thread of a process started suspended (windows)
+    returns how many were resumed
+    """
+    if not IS_WINDOWS: return 0
+
+    class THREADENTRY32(ctypes.Structure):
+        _fields_ = [("dwSize", ctypes.c_ulong), ("cntUsage", ctypes.c_ulong), ("th32ThreadID", ctypes.c_ulong),
+                    ("th32OwnerProcessID", ctypes.c_ulong), ("tpBasePri", ctypes.c_long),
+                    ("tpDeltaPri", ctypes.c_long), ("dwFlags", ctypes.c_ulong)]
+
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.CreateToolhelp32Snapshot.restype = ctypes.c_void_p
+    k32.OpenThread.restype = ctypes.c_void_p
+    k32.Thread32First.argtypes = k32.Thread32Next.argtypes = [ctypes.c_void_p, ctypes.POINTER(THREADENTRY32)]
+    k32.ResumeThjread.argtypes = [ctypes.c_void_p]
+    k32.ResumeThread.restype = ctypes.c_ulong
+    k32.CloseHandle.argtypes = [ctypes.c_void_p]
+    snapshot = k32.CreateToolhelp32Snapshot(0x4, 0)
+    if not snapshot or snapshot == ctypes.c_void_p(-1).value: 
+        raise ctypes.WinError(ctypes.get_last_error())
+    resumed = 0
+    try:
+        entry = THREADENTRY32()
+        entry.dwSize = ctypes.sizeof(entry)
+        ok = k32.Thread32First(snapshot, ctypes.byref(entry))
+        while ok:
+            if entry.th32OwnerProcessID == pid:
+                thread = k32.OpenThread(0x0002, False, entry.th32ThreadID)
+                if thread:
+                    if k32.ResumeThread(thread) != 0xFFFFFFFF:
+                        resumed += 1
+                    k32.CloseHandle(thread)
+                ok = k32.Thread32Next(snapshot, ctypes.byref(entry))
+    finally:
+        k32.CloseHandle(snapshot)
+    return resumed
 
 
 def process_affinity(pid):

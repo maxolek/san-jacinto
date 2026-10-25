@@ -73,7 +73,11 @@ class MigrationTest(unittest.TestCase):
         _old_raw_db(raw)
         with _quiet():
             first = migrate(raw_db=raw, analytics_db=self.dir / "missing.duckdb")
-        self.assertEqual(set(first.values()), {"applied"})
+        # the old database has only games, sprt, and searches: migrations of other tables
+        # wait for them (init_raw_db creates them), the rest apply or are recorded as no-ops
+        absent = {m.id for m in MIGRATIONS if m.table and m.tables not in ("games", "sprt", "searches")}
+        self.assertEqual({mid for mid, status  in first.items() if status == "missing-table"}, absent)
+        self.assertTrue({status for mid, status in first.items() if mid not in absent} <= {"applied", "recorded"})
         games = _sqlite_columns(raw, "games")
         self.assertTrue({name for name, _ in GAMES_MATCH_COLUMNS} <= set(games))
         self.assertTrue({name for name, _ in SPRT_PENTANOMIAL_COLUMNS} <= set(_sqlite_columns(raw, "sprt")))
@@ -83,10 +87,10 @@ class MigrationTest(unittest.TestCase):
                              [("1", "7", None)])
             self.assertEqual(cnxn.execute("SELECT elo_diff, pairs FROM sprt").fetchall(), [(12.5, None)])
             recorded = {r[0] for r in cnxn.execute("SELECT id FROM schema_migrations")}
-        self.assertEqual(recorded, {m.id for m in MIGRATIONS})
+        self.assertEqual(recorded, {m.id for m in MIGRATIONS} - absent)
         with _quiet():
             second = migrate(raw_db=raw, analytics_db=self.dir / "missing.duckdb")
-        self.assertEqual(set(second.values()), {"skipped"})
+        self.assertEqual(second, {mid: "missing-table" if mid in absent else "skipped" for mid in first})
         self.assertEqual(_sqlite_columns(raw, "games"), games)
         self.assertFalse((self.dir / "missing.duckdb").exists())
 
@@ -101,7 +105,8 @@ class MigrationTest(unittest.TestCase):
         before = raw.read_bytes()
         with _quiet():
             result = migrate(raw_db=raw, dry_run=True)
-        self.assertEqual(set(result.values()), {"pending"})
+        absent = {m.id for m in MIGRATIONS if m.table and m.table not in ("games", "sprt", "searches")}
+        self.assertEqual(result, {m.id: "missing-table" if m.id in absent else "pending" for m in MIGRATIONS})
         self.assertEqual(raw.read_bytes(), before)
         with contextlib.closing(sqlite3.connect(raw)) as cnxn:
             tables = {r[0] for r in cnxn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}

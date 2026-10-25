@@ -444,6 +444,8 @@ def log_sprt(cnxn, experiment_id, candidate_engine_id, baseline_engine_id, **kwa
         time_control=kwargs.get("tc"),
         time_per_move=kwargs.get("time"),
         depth_per_move=kwargs.get("depth"),
+        nodes_per_move=kwargs.get("nodes"),
+        threads=kwargs.get("threads"),
         elo0=kwargs.get("elo0"),
         elo1=kwargs.get("elo1"),
         alpha=kwargs.get("alpha"),
@@ -500,7 +502,7 @@ def _table_columns(cnxn, table):
     return {row[1] for row in cnxn.execute(f"PRAGMA table_info({table})").fetchall()}
 
 
-def bulk_log_match_games(cnxn, run_dir, experiment_id, engine_ids) -> dict:
+def bulk_log_match_games(cnxn, run_dir, experiment_id, engine_ids, commit=True) -> dict:
     """Insert one `games` row per game recorded by the match runner in `run_dir`.
 
     These rows carry the authoritative result and termination (also for
@@ -508,10 +510,12 @@ def bulk_log_match_games(cnxn, run_dir, experiment_id, engine_ids) -> dict:
     the opening, the moves from the run's PGN, and the environment: logical cpu,
     P/E core type, measured clock, host and CPU model. `engine_ids` maps the
     engine names used in the run (e.g. Candidate, Baseline) to engine ids.
+    commit=False leaves the rows in the callers open transaction
     Returns {(run_id, run_game): games.id}.
     """
     from .match_games import game_rows
 
+    ensure_schema(cnxn) # before any row: applying a migration commits an open transaction
     rows = game_rows(run_dir, engine_ids, experiment_id)
     if not rows:
         return {}
@@ -527,7 +531,7 @@ def bulk_log_match_games(cnxn, run_dir, experiment_id, engine_ids) -> dict:
         cur = cnxn.execute(f"INSERT INTO games ({', '.join(columns)}) VALUES ({placeholders})",
                            [row[c] for c in columns])
         mapping[(row["run_id"], row["run_game"])] = cur.lastrowid
-    cnxn.commit()
+    if commit: cnxn.commit()
     return mapping
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -588,7 +592,7 @@ def bulk_log_sts(cnxn, path, sts_id, **kwargs) -> None:
 
 
 def bulk_log_game(cnxn, path, experiment_id=None, second_engine_id=None, engine_id=None, commit=True,
-                  engine_ids_by_version=None) -> dict:
+                  engine_ids_by_version=None, skip_uuids=None, source=None) -> dict:
     """
     Bulk-load games from a JSONL file. Returns {game_uuid: game_id} mapping.
     
@@ -600,6 +604,9 @@ def bulk_log_game(cnxn, path, experiment_id=None, second_engine_id=None, engine_
     engine_ids_by_version ({version: engine id}) attributes records exactly when several
     builds share a version (e.g. a release's DEV and Prod builds).
     commit=False leaves the rows in the caller's open transaction.
+    skip_uuids: games stored already (e.g. linked to the match runners record of the game)
+        they get no row and are not in the returned mapping
+    source: the games.source label of the new rows (e.g. 'engine'), where the column exists
     """
     cursor = cnxn.cursor()
     passthrough = _PassThrough(cnxn, "games", GAME_COLUMNS)
@@ -610,6 +617,7 @@ def bulk_log_game(cnxn, path, experiment_id=None, second_engine_id=None, engine_
 
     for data in _iter_json_objects_from_path(path):
         uuid = data['game_uuid']
+        if uuid in skip_uuids: continue
         if uuid not in game_records:
             game_records[uuid] = []
             game_order.append(uuid)

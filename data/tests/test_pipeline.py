@@ -18,14 +18,14 @@ import duckdb
 
 from data import etl
 from data.databases.load_analytics import load, path_basename, replays_from_start
-from data.databases.test_schema import VIEW_COLUMNS, check_schema, validate_schema
+from data.tests.test_schema import VIEW_COLUMNS, check_schema, validate_schema
 from data.transforms import transform_positions as positions
 from data.transforms.aggregates import (AGG_COLUMNS, LOSS_BUCKETS, SAMPLE_SIZE, STOCKFISH_TABLES, allocate_sample,
                                         build_aggregates)
-from data.transforms.transform_search import ANALYTICS_VIEWS, build_analytics_views
+from data.transforms.transform_search import ANALYTICS_VIEWS, build_analytics_views, PVS_RESEARCH_KINDS
 from data.transforms.validate import run_validation
 
-from .fixtures import EPD_BOOK_OPENING, FALLBACK_OPENING, analytics_fixture, write_logs
+from .fixtures import EPD_BOOK_OPENING, FALLBACK_OPENING, PVS_KIND_VERSIONS, analytics_fixture, write_logs
 
 
 def _columns(cnxn, relation):
@@ -250,6 +250,44 @@ class PipelineTest(unittest.TestCase):
         self.assertEqual([round(r[1]) for r in per_engine], [t[0] for t in totals])
 
 
+def _pvs_researches(count, *kinds):
+    """the pvs-researches count of a row: logged (older builds), else the sum of the kinds newer
+    builds log when any was logged, else unknown"""
+    if count is not None: return count 
+    return sum(kind or 0 for kind in kinds) if any(kind is not None for kind in kinds) else None 
+
+class PvsResearchesTest(unittest.TestCase):
+    """older builds log pvs_researches, newer ones (fixtures.PVS_KIND_VERSIONS) three kinds
+    
+    the views and aggregates use the count, else the kinds' sum, else NULL
+
+    analytics databases pre-date the kinds, so update opportunities there
+    """
+    KINDS = ", ".join(PVS_RESEARCH_KINDS)
+    # (fact_table, its key, view, the views key, the views count col)
+    VIEWS = (
+        ("search_stats", "id", "search_metrics", "search_id", "total_pvs_researches"),
+        ("iterative_deepening_stats", "search_id, depth", "search_iteration_metrics", "search_id, depth", "pvs_researches"),
+        ("search_tree_stats", "search_id, depth", "search_tree_features", "search_id, depth", "pvs_researches"),
+    )
+
+    @classmethod
+    def setUpClass(cls):
+        _, _, cls.analytics, _ = analytics_fixture()
+        cls.db = duckdb.connect(str(cls.analytics, read_only=True))
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.db.close()
+
+    def expected_views(self, cnxn, table, key):
+        width = len(key.split(","))
+        return [(*row[:width], _pvs_researches(*row[width:])) for row in cnxn.execute(
+            f"SELECT {key}, pvs_researches, {self.KINDS} FROM {table} ORDER BY ALL").fetchall()]
+
+    def expected_rates(self, ncxn, table, key_sql):
+        
+                                
 class StockfishPipelineTest(unittest.TestCase):
     """The positions step with a (fake) Stockfish, then the views, aggregates and checks, on a copy."""
     LINES = 3
