@@ -113,7 +113,8 @@ class OpeningBook:
         if self.path.suffix.lower() not in (".pgn", ".epd"):
             raise ValueError(f"Opening book must be .pgn or .epd (got {self.path.name}); "
                              "polyglot .bin books are engine books, not opening suites")
-        text = self.path.read_text(encoding="utf-8", errors="replace")
+        # utf-8-sig: a byte order mark (editors on Windows write one) is not part of the first opening
+        text = self.path.read_text(encoding="utf-8-sig", errors="replace")
         self.plies = plies
         self.openings = parse_pgn_book(text, plies) if self.format == "pgn" else parse_epd_book(text)
         if not self.openings:
@@ -138,7 +139,7 @@ class OpeningBook:
         return out
 
     def write(self, openings, path):
-        """A book file with exactly these openings, in order (for cutechess order=sequential)."""
+        """A book file with exactly these openings, in order (for fastchess order=sequential)."""
         sep = "\n" if self.format == "pgn" else ""
         Path(path).write_text(sep.join(o.text.rstrip("\n") + "\n" for o in openings), encoding="utf-8")
 

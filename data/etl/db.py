@@ -439,6 +439,7 @@ def save_engine_config(engine_path, config_name, timeout=10.0):
     if not os.path.exists(engine_path):
         raise FileNotFoundError(f"Engine not found at path: {engine_path}")
 
+    # Python UCI engines (e.g. tests/unit/mock_uci_engine.py) run with this interpreter, as in the probe.
     p = subprocess.Popen(
         [sys.executable, engine_path] if engine_path.lower().endswith(".py") else [engine_path],
         stdin=subprocess.PIPE,

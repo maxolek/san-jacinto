@@ -23,6 +23,12 @@ the Stockfish source); the mapping depends on time control and hardware, so
 compare estimates only at the same settings. The default 60+0.6 is a common
 blitz setting. Games on P-cores and E-cores are also estimated separately.
 
+Games are played with fastchess (utils/match_runner), one game per core: each
+job's fastchess process starts on its slot's CPU, so its engines inherit that
+process mask; the candidate also gets option.Affinity if it declares it.
+Stockfish has no Affinity option and is kept on the slot by the mask alone.
+Results go to <results-dir>/<run>/ (default logs/strength_results).
+
 Examples:
   python -m tests.strength_estimator --engine tomahawk.exe --stockfish stockfish.exe
   python -m tests.strength_estimator --engine tomahawk.exe --stockfish stockfish.exe --tc 10+0.1 --target-ci 40
@@ -42,13 +48,15 @@ PROJECT_ROOT = TESTS_DIR.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from utils import environment  # noqa: E402
-from utils.match_runner import (EngineSpec, JobSpec, MatchRunner, describe_slots, plan_slots,  # noqa: E402
-                                print_line, probe_uci, tc_arguments)
+from utils.match_runner import (EngineSpec, JobSpec, MatchRunner, describe_slots, find_fastchess,  # noqa: E402
+                                plan_slots, print_line, probe_uci, release_slots, tc_arguments)
 from utils.openings import OpeningBook, OpeningRegister  # noqa: E402
 from utils.pentanomial import PairTally, Z95  # noqa: E402
 
 RESULTS_DIR = PROJECT_ROOT / "logs" / "strength_results"
 LN10_400 = math.log(10) / 400
+# fastchess's warning when a bestmove is not the first move of the last PV (Stockfish's weakened moves)
+PV_MISMATCH = "Bestmove does not match beginning of last PV"
 
 
 def expected_score(rating, level, slope=1.0):
@@ -318,7 +326,12 @@ class EstimatorController:
             self.failures = 0
 
     def on_warning(self, job, text):
-        print_line(f"[cutechess] {text}")
+        if text.startswith(PV_MISMATCH):
+            # UCI_LimitStrength plays a weaker move than its PV on purpose: expected, about one per move.
+            # The runner passes on one warning of each kind and counts them all (pv_mismatch_warnings).
+            print_line(f"[fastchess] {text} (expected with UCI_LimitStrength; further ones are only counted)")
+            return
+        print_line(f"[fastchess] {text}")
 
     def finished(self):
         if self.decision is None and len(self.voided) > max(20, self.max_pairs // 20):
@@ -400,7 +413,8 @@ def build_parser():
     p.add_argument("--stockfish", default=os.environ.get("STOCKFISH"), help="Stockfish executable ($STOCKFISH)")
     p.add_argument("--stockfish-option", action="append", default=[], metavar="NAME=VALUE",
                    help="Extra Stockfish options (Threads=1 and Hash=16 by default)")
-    p.add_argument("--cutechess-cli", default=None)
+    p.add_argument("--fastchess", default=None,
+                   help="fastchess executable (default: $FASTCHESS, libs/fastchess, or fastchess on PATH)")
     tc = p.add_argument_group("time control (choose one; default tc 60+0.6)")
     tc.add_argument("--tc", default=None)
     tc.add_argument("--time", type=float, default=None, help="Seconds per move")
@@ -415,6 +429,7 @@ def build_parser():
     c = p.add_argument_group("CPU")
     c.add_argument("--concurrency", type=int, default=None,
                    help="Cores to use = concurrent games (default: every physical core but one)")
+    c.add_argument("--no-pin", action="store_true", help="Leave the placement of games to the OS")
     b = p.add_argument_group("openings / run")
     b.add_argument("--book", default=PROJECT_ROOT / "bin" / "opening_books" / "8moves_v3.pgn")
     b.add_argument("--book-depth", type=int, default=16)
@@ -422,6 +437,8 @@ def build_parser():
     b.add_argument("--maxmoves", type=int, default=150)
     b.add_argument("--status-every", type=float, default=30)
     b.add_argument("--quiet", action="store_true")
+    b.add_argument("--results-dir", default=RESULTS_DIR,
+                   help="Where run folders go (default logs/strength_results)")
     return p
 
 
@@ -431,7 +448,9 @@ def main(argv=None):
         raise SystemExit("Pass --stockfish or set STOCKFISH")
     if args.tc is None and args.time is None and args.depth is None:
         args.tc = "60+0.6"
+    # everything that can be refused is checked before cpus are claimed or folders created
     tc_args = tc_arguments(depth=args.depth, movetime=args.time, tc=args.tc)
+    fastchess = find_fastchess(args.fastchess)
 
     def options(items):
         out = {}
@@ -452,25 +471,40 @@ def main(argv=None):
     lo = int(elo_line.split(" min ")[1].split()[0]) if " min " in elo_line else 1320
     hi = int(elo_line.split(" max ")[1].split()[0]) if " max " in elo_line else 3190
     args.start_elo = min(max(args.start_elo, lo), hi)
-
-    slots = plan_slots(concurrency=args.concurrency)
     book = OpeningBook(args.book, plies=args.book_depth, seed=args.seed)
-    run_dir = RESULTS_DIR / datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    slots = plan_slots(concurrency=args.concurrency, pin=not args.no_pin)
+    try:
+        return _run(args, slots, candidate, stockfish, info, (lo, hi), book, fastchess, tc_args)
+    finally:
+        release_slots(slots)
+
+
+def _run(args, slots, candidate, stockfish, info, level_range, book, fastchess, tc_args):
+    lo, hi = level_range
+    run_dir = Path(args.results_dir) / datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     run_dir.mkdir(parents=True)
     machine = environment.machine_info()
+    pinned = slots[0].cpu is not None
     meta = dict(engine=args.engine, stockfish=args.stockfish, stockfish_name=info["name"],
                 uci_elo_range=[lo, hi], time_control=args.tc or (f"{args.time}s/move" if args.time else f"depth {args.depth}"),
-                machine=machine, slots=[vars(s) | {"label": s.label} for s in slots],
+                fastchess=fastchess, machine=machine, slots=[vars(s) | {"label": s.label} for s in slots],
+                pinning={e.name: ("Affinity option + process mask" if e.pin_option and pinned else
+                                  "process mask" if pinned else "none") for e in (candidate, stockfish)},
                 book=str(args.book), book_seed=book.seed)
     (run_dir / "config.json").write_text(json.dumps(dict(arguments=vars(args), meta=meta), indent=2, default=str),
                                          encoding="utf-8")
     print_line(f"[STRENGTH] {args.engine} vs {info['name']} (UCI_Elo {lo}-{hi}), {meta['time_control']}")
     print_line(f"[STRENGTH] machine {machine['cpu_model']}; {describe_slots(slots)}")
+    for engine in (candidate, stockfish):
+        if pinned and not engine.pin_option:
+            print_line(f"[STRENGTH] note: {engine.name} has no Affinity option; its process mask keeps it on the core")
+    print_line(f"[STRENGTH] fastchess {fastchess}")
     print_line(f"[STRENGTH] target 95% CI +/-{args.target_ci:g} Elo, {args.min_games}-{args.max_games} games; "
                f"results {run_dir}")
 
     controller = EstimatorController(args, candidate, stockfish, book, slots, run_dir, (lo, hi))
-    runner = MatchRunner(args.cutechess_cli, slots, run_dir, tc_args, plies=args.book_depth,
+    runner = MatchRunner(fastchess, slots, run_dir, tc_args, plies=args.book_depth,
                          extra_args=["-maxmoves", str(args.maxmoves)])
     started = time.time()
     try:
@@ -481,6 +515,10 @@ def main(argv=None):
         controller.close()
         summary = controller.summary()
         summary["meta"] = meta
+        summary["repinned_games"] = runner.repinned_games
+        summary["mixed_core_games"] = runner.mixed_games
+        summary["excluded_pairs"] = len(controller.voided)
+        summary["pv_mismatch_warnings"] = runner.warning_count(PV_MISMATCH)  # every one, not one per kind
         (run_dir / "summary.json").write_text(json.dumps(summary, indent=2, default=str), encoding="utf-8")
         controller.register.save(run_dir, run_meta=dict(run=run_dir.name, candidate=args.engine,
                                                         baseline=info["name"], time_control=meta["time_control"]))
@@ -489,4 +527,10 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        sys.exit(130)
+    except Exception as e:
+        print(f"[STRENGTH] ERROR: {e}", file=sys.stderr)
+        sys.exit(1)

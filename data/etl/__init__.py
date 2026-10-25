@@ -8,8 +8,9 @@ Submodules:
   - schema: bring the raw database up to the current schema (data/databases/migrate_schema.py)
   - columns: log values stored by their column's declared type
   - provenance: build identity (binary + net hash) and how a build was made
-  - ingest: bulk logging and ingestion functions (games, searches, timing, STS, SPRT)
   - match_games: games recorded by the match runner (utils/match_runner.py) and how engine logs link to them
+  - ingest: bulk logging and ingestion functions (games, searches, timing, STS, SPRT, match-runner games)
+  - telemetry: a match-runner run's engine logs (one folder per engine), linked to its played games
 """
 from .paths import (
     DATA_DIR, PROJECT_ROOT, LOGS_DIR, GAMES_LOG_DIR,
@@ -32,6 +33,7 @@ from .ingest import (
     log_sprt,
     bulk_log_sts,
     bulk_log_game,
-    bulk_log_search_and_timing,,
+    bulk_log_search_and_timing,
     bulk_log_match_games,
 )
+from .telemetry import ingest_telemetry, retry_ingest, telemetry_ids

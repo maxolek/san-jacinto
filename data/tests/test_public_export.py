@@ -109,6 +109,31 @@ class PublicExportTest(unittest.TestCase):
             self.assertEqual(cnxn.execute("SELECT count(*) FROM stockfish_moves WHERE fen NOT IN "
                                           "(SELECT fen FROM search_stats)").fetchone()[0], 0)
 
+    def test_full_snapshot_publishes_pvs_researches_of_every_build_but_not_its_kinds(self):
+        """Newer builds log three kinds of PVS re-search instead of pvs_researches (fixtures.PVS_KIND_VERSIONS):
+        the snapshot holds their sum as pvs_researches, the same value the source's views derive."""
+        derived = {
+            "search_stats": "SELECT search_id, total_pvs_researches FROM search_metrics",
+            "iterative_deepening_stats": "SELECT search_id, depth, pvs_researches FROM search_iteration_metrics",
+            "search_tree_stats": "SELECT search_id, depth, pvs_researches FROM search_tree_features",
+        }
+        keys = {"search_stats": "id", "iterative_deepening_stats": "search_id, depth",
+                "search_tree_stats": "search_id, depth"}
+        with duckdb.connect(str(self.source), read_only=True) as source, \
+                duckdb.connect(str(self.full_file), read_only=True) as snapshot:
+            for table, sql in derived.items():
+                with self.subTest(table=table):
+                    self.assertFalse({c for c in _columns(snapshot, table) if c.startswith("pvs_researches_")})
+                    self.assertTrue({c for c in _columns(source, table) if c.startswith("pvs_researches_")})
+                    published = snapshot.execute(
+                        f"SELECT {keys[table]}, pvs_researches FROM {table} ORDER BY ALL").fetchall()
+                    self.assertEqual(published, source.execute(f"{sql} ORDER BY ALL").fetchall())
+                    self.assertNotIn(None, {row[-1] for row in published})  # every fixture build logs them
+            # the snapshot's own views agree with the source's
+            self.assertEqual(snapshot.execute("SELECT search_id, total_pvs_researches FROM search_metrics "
+                                              "ORDER BY ALL").fetchall(),
+                             source.execute(f"{derived['search_stats']} ORDER BY ALL").fetchall())
+
     def test_full_snapshot_keeps_only_stockfish_lines_of_published_positions(self):
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
             source = Path(tmp) / "source.duckdb"

@@ -22,8 +22,8 @@ import duckdb
 from ..etl.paths import ANALYTICS_DB
 from ..transforms.aggregates import AGG_COLUMNS, SAMPLE_SIZE
 from ..transforms.transform_search import ANALYTICS_VIEWS
-from ..databases.migrate_schema import GAMES_MATCH_COLUMNS, SPRT_PENTANOMIAL_COLUMNS
-from ..databases.public_schema import (FORBIDDEN_COLUMNS, FORBIDDEN_RELATIONS, FULL_VIEWS, SNAPSHOT_INFO,
+from .migrate_schema import GAMES_MATCH_COLUMNS, SPRT_PENTANOMIAL_COLUMNS
+from .public_schema import (FORBIDDEN_COLUMNS, FORBIDDEN_RELATIONS, FULL_VIEWS, SNAPSHOT_INFO,
                             public_tables)
 
 PROFILES = ("analytics", "public-lite", "public-full")

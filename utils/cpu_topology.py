@@ -244,10 +244,11 @@ def launch_affinity(cpus):
     """Start processes inside this block restricted to `cpus` (None/empty: no change).
 
     Child processes inherit the affinity of the process (Windows) or thread
-    (Linux) that starts them, and cutechess passes its own affinity on to the
-    engines it starts, so an engine never runs outside its slot even before it
-    has read its options. Other threads of this process are briefly restricted
-    too on Windows, which is harmless for the match runner's reader threads.
+    (Linux) that starts them, and fastchess passes its own affinity on to the
+    engines it starts (when it is not given -use-affinity), so an engine never
+    runs outside its slot even before it has read its options. Other threads of
+    this process are briefly restricted too on Windows, which is harmless for the
+    match runner's reader threads.
     """
     if not cpus or not (IS_WINDOWS or hasattr(os, "sched_setaffinity")):
         yield
@@ -270,11 +271,20 @@ def launch_affinity(cpus):
 
 
 class KillOnCloseJob:
-    """Windows job object whose processes all die when this Python process exits.
+    """Windows job object whose processes all die when it is closed or this Python process exits.
 
-    Every cutechess process (and the engines it starts, which join the job
-    automatically) is assigned to it, so a crashed or killed runner never leaves
-    engines behind to steal CPU time from the next test. No-op elsewhere.
+    Every fastchess process (and the engines it starts, which join the job
+    automatically) is assigned to one, so a crashed or killed runner never leaves
+    engines behind to steal CPU time from the next test.
+
+    With `cpus` the job also carries JOB_OBJECT_LIMIT_AFFINITY: its processes run
+    only on those CPUs and cannot widen that. SetProcessAffinityMask fails inside
+    such a job and a thread may only pick a subset, so an engine that pins itself
+    elsewhere (old Tomahawk builds pin to the P-cores at startup) keeps running on
+    its slot. `affinity` is the enforced CPU list, or None (no limit: not Windows,
+    CPUs beyond the first processor group, or the limit was refused). Linux has no
+    unprivileged equivalent (it would take a cpuset cgroup): there the match
+    runner's guard finds such engines and their games are excluded. No-op elsewhere.
     """
 
     KILL_ON_JOB_CLOSE = 0x2000
@@ -307,46 +317,37 @@ class KillOnCloseJob:
         handle = k32.CreateJobObjectW(None, None)
         if not handle:
             return
-        info = self._Extended()
-        info.BasicLimitInformation.LimitFlags = 0x2000  # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
-        k32.SetInformationJobObject.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_uint32]
-        if k32.SetInformationJobObject(ctypes.c_void_p(handle), 9, ctypes.byref(info), ctypes.sizeof(info)):
-            self.handle = handle
-            self.k32 = k32
-        else:
-            k32.CloseHandle(ctypes.c_void_p(handle))
         limits = []
         if cpus and all(0 <= cpu < 8 * ctypes.sizeof(ctypes.c_size_t) for cpu in cpus):
             limits.append((self.KILL_ON_JOB_CLOSE | self.LIMIT_AFFINITY, sum(1 << cpu for cpu in set(cpus))))
         limits.append((self.KILL_ON_JOB_CLOSE, 0))
-        for flags, mask in limits:
+        for flags, mask in limits:  # an affinity outside an enclosing job's is refused: then kill-on-close only
             info = self._Extended()
             info.BasicLimitInformation.LimitFlags = flags
-            info.BasicLimitInformation.Affinity = mask 
+            info.BasicLimitInformation.Affinity = mask
             if k32.SetInformationJobObject(handle, 9, ctypes.byref(info), ctypes.sizeof(info)):
                 self.handle, self.k32 = handle, k32
-                self.affinity = sorted(set(cpus)) if flags & self.LIMIT_AFFINITY else None 
-                return 
+                self.affinity = sorted(set(cpus)) if flags & self.LIMIT_AFFINITY else None
+                return
         k32.CloseHandle(handle)
 
-
     def add(self, process_handle):
+        """Put a process (and every process it starts from now on) in the job; False if that failed."""
         if self.handle:
-            return bool(self.k32.AssignProcessToJobObject(self.handle),int(process_handle))
+            return bool(self.k32.AssignProcessToJobObject(self.handle, int(process_handle)))
         return False
 
     def close(self):
-        """close the job: any process still in it is killed"""
+        """Close the job: any process still in it is killed."""
         if self.handle:
             self.k32.CloseHandle(self.handle)
-            self.handle = None 
+            self.handle = None
 
 
 def resume_process(pid):
-    """resume every thread of a process started suspended (windows)
-    returns how many were resumed
-    """
-    if not IS_WINDOWS: return 0
+    """Resume every thread of a process started suspended (Windows); returns how many were resumed."""
+    if not IS_WINDOWS:
+        return 0
 
     class THREADENTRY32(ctypes.Structure):
         _fields_ = [("dwSize", ctypes.c_ulong), ("cntUsage", ctypes.c_ulong), ("th32ThreadID", ctypes.c_ulong),
@@ -357,11 +358,11 @@ def resume_process(pid):
     k32.CreateToolhelp32Snapshot.restype = ctypes.c_void_p
     k32.OpenThread.restype = ctypes.c_void_p
     k32.Thread32First.argtypes = k32.Thread32Next.argtypes = [ctypes.c_void_p, ctypes.POINTER(THREADENTRY32)]
-    k32.ResumeThjread.argtypes = [ctypes.c_void_p]
+    k32.ResumeThread.argtypes = [ctypes.c_void_p]
     k32.ResumeThread.restype = ctypes.c_ulong
     k32.CloseHandle.argtypes = [ctypes.c_void_p]
-    snapshot = k32.CreateToolhelp32Snapshot(0x4, 0)
-    if not snapshot or snapshot == ctypes.c_void_p(-1).value: 
+    snapshot = k32.CreateToolhelp32Snapshot(0x4, 0)  # TH32CS_SNAPTHREAD
+    if not snapshot or snapshot == ctypes.c_void_p(-1).value:
         raise ctypes.WinError(ctypes.get_last_error())
     resumed = 0
     try:
@@ -370,12 +371,12 @@ def resume_process(pid):
         ok = k32.Thread32First(snapshot, ctypes.byref(entry))
         while ok:
             if entry.th32OwnerProcessID == pid:
-                thread = k32.OpenThread(0x0002, False, entry.th32ThreadID)
+                thread = k32.OpenThread(0x0002, False, entry.th32ThreadID)  # THREAD_SUSPEND_RESUME
                 if thread:
                     if k32.ResumeThread(thread) != 0xFFFFFFFF:
                         resumed += 1
                     k32.CloseHandle(thread)
-                ok = k32.Thread32Next(snapshot, ctypes.byref(entry))
+            ok = k32.Thread32Next(snapshot, ctypes.byref(entry))
     finally:
         k32.CloseHandle(snapshot)
     return resumed

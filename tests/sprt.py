@@ -1,29 +1,49 @@
 #!/usr/bin/env python3
-"""SPRT between two engines, one game per CPU core, pentanomial statistics.
+"""SPRT between two engines with fastchess, one game per CPU core, pentanomial statistics.
 
 Every concurrent game runs on its own physical core (see utils/match_runner.py):
-the cutechess process of each game is started on that core's CPU and engines
+the fastchess process of each game is started on that core's CPU and engines
 with a UCI `Affinity` option are told the same CPU, so both engines of a game
 alternate on one core. A game is therefore always P-core vs P-core or E-core vs
-E-core, and the whole machine can be used. Every game reports its core type,
-CPU and measured clock. The only placement setting is --concurrency, the number
-of cores to use (default: every physical core but one).
+E-core, and the whole machine can be used. On Windows each fastchess process and
+its engines also run in a job object whose affinity limit is the slot, so an
+engine cannot leave it (old Tomahawk builds pin themselves to the P-cores at
+startup); on Linux such an engine's games are found by the runner's guard and
+excluded. Every game reports its core type,
+CPU and measured clock. --concurrency is the number of games at once (default:
+every physical core but one); --threads N gives each game N CPUs of one core
+type and both engines option.Threads=N. CPUs another run holds (utils/cpu_slots
+lock files) are left alone; --no-pin leaves placement to the OS.
+
+Per-move limit: exactly one of --tc, --time, --depth or --nodes. --nodes needs an
+engine that honours `go nodes` (checked before the run). --tb adds Syzygy
+adjudication (WDL files are enough). fastchess reports the --maxmoves limit as
+"Draw by adjudication".
 
 All statistics use opening pairs (pentanomial model): LLR, Elo and normalized
 Elo with 95% intervals, LOS, and the same per core type and per opening.
 Pairs are tested in the order they started, never the order they finished.
 
+Results go to <results-dir>/<run>/ (default logs/sprt_results). The raw database
+gets the SPRT row, every played game (games, source 'match', with its core type,
+CPU and clock), the pairwise result (match_results, source 'sprt'), and with
+--log the engines' telemetry: each side from its own log folder
+<logroot>/<run>/<side>/, attributed to its own build and linked to the played
+games by position. Telemetry that fails to load is kept for
+`--retry-ingest <logroot>/<run>`.
+
 Examples:
   python -m tests.sprt --engine-a new.exe --engine-b base.exe --tc 10+0.1 --elo0 0 --elo1 5
   python -m tests.sprt --engine-a new.exe --engine-b base.exe --tc 10+0.1 --concurrency 10
-  python -m tests.sprt --engine-a new.exe --engine-b base.exe --depth 8 --concurrency 4 --no-db
+  python -m tests.sprt --engine-a new.exe --engine-b base.exe --nodes 20000 --concurrency 4 --no-db
+  python -m tests.sprt --retry-ingest logs/sprt_logs/20261025_101129_354256
 """
 import argparse
 import json
 import math
 import os
-import platform
-import sqlite3
+import re
+import shutil
 import sys
 import time
 from datetime import datetime, timezone
@@ -33,9 +53,12 @@ TESTS_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = TESTS_DIR.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from utils import environment  # noqa: E402
-from utils.match_runner import (EngineSpec, JobSpec, MatchRunner, describe_slots, plan_slots,  # noqa: E402
-                                print_line, tc_arguments)
+from utils import environment, uci_probe  # noqa: E402
+from utils.fastchess_match import FASTCHESS, limit_label, tb_args  # noqa: E402,F401  (FASTCHESS: tests/release.py)
+from utils.fixed_match import require_node_limit  # noqa: E402
+from utils.match_runner import (EngineSpec, JobSpec, MatchRunner, describe_slots, find_fastchess,  # noqa: E402
+                                plan_slots, print_line, probe_uci, release_slots, tc_arguments,
+                                termination_class)
 from utils.openings import OpeningBook, OpeningRegister, classify, display_name  # noqa: E402
 from utils.pentanomial import FINISHED_GAME, LABELS, PairTally, PentanomialSPRT  # noqa: E402
 
@@ -43,11 +66,13 @@ LOGS_DIR = PROJECT_ROOT / "logs"
 SPRT_LOG_DIR = LOGS_DIR / "sprt_logs"
 RESULTS_DIR = LOGS_DIR / "sprt_results"
 OPENING_HISTORY = LOGS_DIR / "opening_register.csv"
+# (log folder of the side, its engine name in the run)
+SIDES = (("candidate", "Candidate"), ("baseline", "Baseline"))
 
 
-def parse_cutechess_output(output, candidate_name="Candidate", elo0=0, elo1=10,
+def parse_fastchess_output(output, candidate_name="Candidate", elo0=0, elo1=10,
                            alpha=0.05, beta=0.05):
-    """Rebuild pentanomial evidence from a single cutechess transcript (game numbers in order)."""
+    """Rebuild pentanomial evidence from a single fastchess transcript (game numbers in order)."""
     state = PentanomialSPRT(elo0, elo1, alpha, beta)
     for line in output.splitlines():
         match = FINISHED_GAME.search(line)
@@ -62,21 +87,6 @@ def parse_cutechess_output(output, candidate_name="Candidate", elo0=0, elo1=10,
 # ----------------------------------------------------------------------------
 # Presentation helpers
 # ----------------------------------------------------------------------------
-
-def termination_class(reason):
-    """Coarse class of a cutechess termination text, and the side at fault if any."""
-    text = (reason or "").lower()
-    side = "white" if text.startswith("white") else "black" if text.startswith("black") else None
-    for key, label in (("loses on time", "time forfeit"), ("disconnects", "crash"),
-                       ("connection stalls", "stall"), ("illegal move", "illegal move"),
-                       ("resigns", "resignation"), ("mates", "mate"), ("stalemate", "stalemate"),
-                       ("3-fold", "repetition"), ("fifty", "50-move rule"),
-                       ("insufficient", "insufficient material"), ("maximal game length", "move limit"),
-                       ("adjudication", "adjudication")):
-        if key in text:
-            return label, (side if label in ("time forfeit", "crash", "stall", "illegal move") else None)
-    return (text or "unknown"), None
-
 
 def fmt_elo(value, low=None, high=None):
     if value is None:
@@ -125,8 +135,6 @@ class SprtController:
 
     def next_job(self, slot):
         if self.state.result != "inconclusive" or self.planned >= self.max_pairs or self.stop_reason:
-            return None
-        if self.failures >= max(3, len(self.slots)):
             return None
         remaining = self.max_pairs - self.planned
         size = max(1, min(self.args.pairs_per_job, math.ceil(remaining / len(self.slots))))
@@ -243,8 +251,9 @@ class SprtController:
             tail = job.log_path.read_text(encoding="utf-8", errors="replace").splitlines()[-8:]
             print_line(f"[SPRT] job {job.id} on {job.slot.label} exited with code {job.returncode} "
                        f"after {len(job.games)} games; last output:\n    " + "\n    ".join(tail))
-            if self.failures >= max(3, len(self.slots)):
-                print_line("[SPRT] too many failed jobs, not starting new ones")
+            if self.failures >= max(3, len(self.slots)) and self.stop_reason is None:
+                self.stop_reason = f"{self.failures} jobs in a row failed (see the job logs)"
+                print_line(f"[SPRT] stopping: {self.stop_reason}")
         else:
             self.failures = 0
         if voided:
@@ -252,7 +261,7 @@ class SprtController:
                        "(unfinished, or an engine left its core)")
 
     def on_warning(self, job, text):
-        print_line(f"[cutechess] {text}")
+        print_line(f"[fastchess] {text}")
 
     def tick(self):
         if self.plotter:
@@ -349,76 +358,93 @@ class SprtController:
 # Database
 # ----------------------------------------------------------------------------
 
-def upload_logs(args, cute_chess_stats, runtime=None, run_dir=None, run_meta=None):
-    from data import etl
+def _raw_db(db=None):
     from data.etl.paths import RAW_DB
+    return Path(db or RAW_DB)
 
-    db_path = Path(getattr(args, "db", None) or RAW_DB)
+
+def ingest_telemetry(cnxn, run_logs, ids):
+    """Load one run's engine logs (<run_logs>/candidate/ and baseline/), each side attributed to its own build.
+
+    `ids`: the run's engine and experiment ids, as in its engines.json, and (when the
+    runner's games were stored) its run_dir / run_id. An engine game is linked to the
+    played game (games row, source 'match') its searches were made in; only an engine
+    game that matches no played game gets a row of its own (source 'engine'). Each side
+    is one transaction, recorded in telemetry_loads, so a retry loads each side exactly
+    once. data/etl/telemetry.py, which also loads runs of more engines (tests/tournament.py).
+    Returns True if everything was loaded.
+    """
+    from data.etl.telemetry import ingest_telemetry as ingest
+    return ingest(cnxn, run_logs, ids)
+
+
+def retry_ingest(run_logs, db=None):
+    """Load a run's preserved telemetry with the engine ids recorded for it (engines.json)."""
+    from data.etl.telemetry import retry_ingest as retry
+    return retry(run_logs, db=db)
+
+
+def upload_logs(args, fastchess_stats, runtime=None, run_dir=None, run_meta=None, run_logs=None):
+    """Store the run: SPRT row with its played games, pairwise result, then (--log) telemetry."""
+    from data import etl, ratings
+
+    db_path = _raw_db(getattr(args, "db", None))
     if not db_path.exists():
         print(f"[DATA] Database {db_path} not found; skipping upload (set CHESS_RAW_DB or pass --db).")
         return None
     print(f"[DATA] Uploading to {db_path} ...")
-    cnxn = sqlite3.connect(db_path)
+    cnxn = etl.connect_raw(db_path)  # waits for another run's write instead of failing after 5 s
+    try:
+        etl.ensure_schema(cnxn)
+        # engines are identified by their build (binary + net hash), not their version string;
+        # the baseline first: it is usually the canonical build of its version (legacy rows)
+        print("[DATA] Identifying engine builds...")
+        baseline_engine_id = etl.resolve_engine(cnxn, args.engine_b)
+        candidate_engine_id = etl.resolve_engine(cnxn, args.engine_a)
+        sprt_id = etl.start_experiment(cnxn, "SPRT", candidate_engine_id, comparison_engine_id=baseline_engine_id,
+                                       info=json.dumps(run_meta or {}, default=str))
 
-    candidate_version = etl.probe_engine_metadata(args.engine_a)["version"]
-    baseline_version = etl.probe_engine_metadata(args.engine_b)["version"]
-    candidate_engine_id = etl.get_engine_id(cnxn, version=candidate_version)
-    baseline_engine_id = etl.get_engine_id(cnxn, version=baseline_version)
-    if candidate_engine_id is None:
-        print(f"[DATA] Candidate engine {candidate_version} not registered, registering now...")
-        candidate_engine_id = etl.register_engine(cnxn, {"engine_path": args.engine_a})
-    if baseline_engine_id is None:
-        print(f"[DATA] Baseline engine {baseline_version} not registered, registering now...")
-        baseline_engine_id = etl.register_engine(cnxn, {"engine_path": args.engine_b})
-
-    sprt_id = etl.start_experiment(cnxn, "SPRT", candidate_engine_id,
-                                   comparison_engine_id=baseline_engine_id,
-                                   info=json.dumps(run_meta or {}, default=str))
-
-    # Every game the runner played, with its authoritative result, opening, moves and the
-    # environment it ran in (cpu, P/E core, measured clock) - also without engine telemetry.
-    match_games = {}
-    if run_dir is not None:
-        match_games = etl.bulk_log_match_games(cnxn, run_dir, sprt_id,
-                                               {"Candidate": candidate_engine_id, "Baseline": baseline_engine_id})
+        # The results first: telemetry below can fail and be retried, they cannot. Every game the
+        # runner played, with its authoritative result, opening, moves and the environment it ran
+        # in (cpu, P/E core, measured clock), goes in with the SPRT row (one transaction).
+        match_games = {}
+        if run_dir is not None:
+            match_games = etl.bulk_log_match_games(cnxn, run_dir, sprt_id, {"Candidate": candidate_engine_id,
+                                                                            "Baseline": baseline_engine_id},
+                                                   commit=False)
+        args_dict = {k: (str(v) if isinstance(v, Path) else v) for k, v in vars(args).items()}
+        etl.log_sprt(cnxn, sprt_id, candidate_engine_id, baseline_engine_id,
+                     **{**args_dict, **fastchess_stats}, runtime=runtime)
         print(f"[DATA] Logged {len(match_games)} games with their core type, cpu and clock")
+        # pairwise result; rating fits leave SPRT results out unless asked (early stopping biases them)
+        limit = dict(tc=args.tc, depth=args.depth, time=args.time, nodes=getattr(args, "nodes", None))
+        if candidate_engine_id == baseline_engine_id:
+            print(f"[DATA] Candidate and baseline are the same build (engine id {candidate_engine_id}): no "
+                  "match_results row (a build against itself would only distort the rating fits)")
+        else:
+            ratings.record_snapshot(cnxn, source="sprt", engine_a=candidate_engine_id, engine_b=baseline_engine_id,
+                                    snapshot=fastchess_stats,
+                                    tc_category=ratings.category(**limit, threads=getattr(args, "threads", 1)),
+                                    time_control=limit_label(**limit), experiment_id=sprt_id)
+        etl.update_experiment(cnxn, sprt_id, {"end_time_utc": datetime.now(timezone.utc).isoformat()})
 
-    ingestion_ok = False
-    if args.log:
-        try:
-            game_map = {}
-            if run_dir is not None:
-                from data.etl.match_games import link_engine_games
-                run_id = Path(run_dir).name
-                names = ({candidate_version: "Candidate", baseline_version: "Baseline"}
-                         if candidate_version != baseline_version else None)
-                links = link_engine_games(args.logroot, run_dir, names_by_version=names)
-                game_map = {uuid: match_games[(run_id, number)] for uuid, number in links.items()
-                            if (run_id, number) in match_games}
-                print(f"[DATA] Linked {len(game_map)} engine game logs to the played games")
-            etl.consolidate_instance_logs(args.logroot)
-            search_json = Path(args.logroot) / "search.jsonl"
-            if search_json.exists():
-                timing = Path(args.logroot) / "timing.jsonl"
-                roots = Path(args.logroot) / "root_moves.jsonl"
-                etl.bulk_log_search_and_timing(cnxn, search_json, game_map,
-                                               timing_path=timing if timing.exists() else None,
-                                               root_moves_path=roots if roots.exists() else None)
-            ingestion_ok = True
-        except Exception as e:
-            print(f"[DATA] JSONL ingestion failed: {e}")
-            print("[DATA] Log files preserved for retry.")
-    else:
-        print("[DATA] Engine logging was disabled, skipping JSONL ingestion.")
-
-    args_dict = {k: (str(v) if isinstance(v, Path) else v) for k, v in vars(args).items()}
-    etl.log_sprt(cnxn, sprt_id, candidate_engine_id, baseline_engine_id,
-                 **{**args_dict, **cute_chess_stats}, runtime=runtime)
-    etl.update_experiment(cnxn, sprt_id, {"end_time_utc": datetime.now(timezone.utc).isoformat()})
-    if args.log and ingestion_ok:
-        etl.clear_log_dir(args.logroot)
-    print(f"[DATA] Logged SPRT experiment {sprt_id}.")
-    cnxn.close()
+        # this run's engine logs only
+        run_logs = Path(run_logs) if run_logs else None
+        if not args.log:
+            print("[DATA] Engine logging was disabled, skipping JSONL ingestion.")
+        elif run_logs and run_logs.is_dir():
+            ids = dict(candidate=candidate_engine_id, baseline=baseline_engine_id, experiment=sprt_id, loaded=[],
+                       run_dir=str(Path(run_dir).resolve()) if run_dir else None,
+                       run_id=Path(run_dir).name if run_dir else None)
+            (run_logs / "engines.json").write_text(json.dumps(ids), encoding="utf-8")  # a retry attributes the logs
+            if ingest_telemetry(cnxn, run_logs, ids):
+                shutil.rmtree(run_logs, ignore_errors=True)
+                print(f"[DATA] Telemetry loaded for SPRT {sprt_id}.")
+            else:
+                print(f"[DATA] Log files preserved; retry with: python -m tests.sprt --retry-ingest {run_logs}")
+        print(f"[DATA] Logged SPRT experiment {sprt_id}.")
+    finally:
+        cnxn.close()
     return sprt_id
 
 
@@ -438,17 +464,22 @@ def parse_params(values):
 
 def build_parser():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--engine-a", required=True, help="Candidate engine path")
-    p.add_argument("--engine-b", required=True, help="Baseline engine path")
+    p.add_argument("--engine-a", help="Candidate engine path")
+    p.add_argument("--engine-b", help="Baseline engine path")
     p.add_argument("--param", dest="param_list", action="append", metavar="NAME=VALUE",
                    help="UCI option for the candidate only (repeatable), e.g. tuned values")
-    p.add_argument("--cutechess-cli", default=None,
-                   help="cutechess-cli path (default: $CUTECHESS_CLI, PATH, or the standard install folder)")
+    p.add_argument("--fastchess", default=None,
+                   help="fastchess executable (default: $FASTCHESS, libs/fastchess, or fastchess on PATH)")
+    p.add_argument("--retry-ingest", metavar="RUN_LOG_DIR",
+                   help="Only load the preserved telemetry of an earlier run (<logroot>/<run>) into the database")
 
-    tc = p.add_argument_group("time control (choose one)")
+    tc = p.add_argument_group("per-move limit (choose one)")
     tc.add_argument("--depth", type=int, default=None, help="Depth per move")
     tc.add_argument("--time", type=float, default=None, help="Seconds per move")
     tc.add_argument("--tc", type=str, default=None, help="Time control (e.g. 10+0.1)")
+    tc.add_argument("--nodes", type=int, default=None,
+                    help="Nodes per move: hardware-independent, for eval/NNUE changes (the engine must honour "
+                         "go nodes)")
 
     s = p.add_argument_group("SPRT")
     s.add_argument("--elo0", type=float, default=0)
@@ -459,8 +490,12 @@ def build_parser():
 
     c = p.add_argument_group("CPU")
     c.add_argument("--concurrency", type=int, default=None,
-                   help="Cores to use = concurrent games (default: every physical core but one). "
-                        "The runner pins each game to its own core: P-cores first, then E-cores")
+                   help="Concurrent games (default: every physical core but one, divided by --threads). "
+                        "The runner pins each game to its own core(s): P-cores first, then E-cores")
+    c.add_argument("--threads", type=int, default=1,
+                   help="Search threads per engine (option.Threads); each pinned game gets this many cpus "
+                        "of one core type")
+    c.add_argument("--no-pin", action="store_true", help="Leave the placement of games to the OS")
 
     b = p.add_argument_group("openings")
     b.add_argument("--book", default=PROJECT_ROOT / "bin" / "opening_books" / "8moves_v3.pgn",
@@ -468,17 +503,27 @@ def build_parser():
     b.add_argument("--book-depth", type=int, default=16, help="Plies used from each book line")
     b.add_argument("--seed", type=int, default=None, help="Book shuffle seed (default: random, recorded)")
 
+    a = p.add_argument_group("adjudication")
+    a.add_argument("--maxmoves", type=int, default=100,
+                   help="Adjudicate a draw after this many moves (fastchess: 'Draw by adjudication')")
+    a.add_argument("--tb", default=None,
+                   help="Syzygy tablebase dir(s) for adjudication (';'-separated on Windows); WDL files are enough")
+    a.add_argument("--tbpieces", type=int, default=None, help="Only adjudicate positions with at most this many pieces")
+
     r = p.add_argument_group("run")
     r.add_argument("--pairs-per-job", type=int, default=4,
-                   help="Opening pairs per cutechess process (amortizes engine start-up)")
-    r.add_argument("--maxmoves", type=int, default=100, help="Adjudicate a draw after this many moves")
+                   help="Opening pairs per fastchess process (amortizes engine start-up)")
     r.add_argument("--status-every", type=float, default=15, help="Seconds between status lines")
     r.add_argument("--quiet", action="store_true", help="No per-game lines")
     r.add_argument("--log", action="store_true", help="Engine telemetry logging (uploaded to the database)")
     r.add_argument("--plot", action="store_true", help="Show live SPRT plots (LLR, Elo)")
     r.add_argument("--no-db", action="store_true", help="Do not upload results to the database")
     r.add_argument("--db", default=None, help="Raw SQLite database (default: CHESS_RAW_DB or platform default)")
-    r.add_argument("--logroot", default=SPRT_LOG_DIR, help="Directory for engine telemetry logs")
+    r.add_argument("--logroot", default=SPRT_LOG_DIR,
+                   help="Root of the engine telemetry logs (each run logs into <logroot>/<run>/<side>/)")
+    r.add_argument("--results-dir", default=RESULTS_DIR,
+                   help="Where run folders go (default logs/sprt_results); the opening register CSV "
+                        "(opening_register.csv) goes into its parent folder")
     return p
 
 
@@ -486,72 +531,146 @@ def resolve_args(args=None):
     """Accept argv, None (sys.argv) or a Namespace from release.py (missing fields get defaults)."""
     parser = build_parser()
     if isinstance(args, argparse.Namespace):
-        defaults = vars(parser.parse_args(["--engine-a", "x", "--engine-b", "y"]))
+        defaults = vars(parser.parse_args([]))
         merged = {**defaults, **{k: v for k, v in vars(args).items() if v is not None or k not in defaults}}
         args = argparse.Namespace(**merged)
     else:
         args = parser.parse_args(args)
+    if not args.retry_ingest and not (args.engine_a and args.engine_b):
+        parser.error("--engine-a and --engine-b are required")
     params = dict(getattr(args, "params", None) or {})
     params.update(parse_params(getattr(args, "param_list", None)))
     args.params = params
     return args
 
 
+def _declared_threads(engine):
+    """(declared, max) of the engine's Threads option, read with the runner's own probe."""
+    line = probe_uci(engine.cmd, engine.args)["options"].get("Threads")
+    if line is None:
+        return False, None
+    found = re.search(r"\bmax\s+(\d+)", line)
+    return True, int(found.group(1)) if found else None
+
+
+def require_threads(engine, threads):
+    """Refuse a thread count the engine would silently ignore (fastchess only warns)."""
+    if not engine.args:
+        uci_probe.require_threads(engine.cmd, threads)
+        return
+    declared, most = _declared_threads(engine)  # a script run by an interpreter: uci_probe starts executables
+    if not declared:
+        raise ValueError(f"{engine.name} declares no Threads option, so it cannot search with {threads} threads")
+    if most is not None and most < threads:
+        raise ValueError(f"{engine.name} accepts at most Threads={most}, not {threads}")
+
+
+def require_options(engine, values):
+    """Refuse candidate options (--param) fastchess would skip with only a warning: an undeclared
+    option (names are case-sensitive) or a value the option refuses would leave the candidate
+    on its defaults, and the SPRT would silently test something else."""
+    problems = uci_probe.option_problems(probe_uci(engine.cmd, engine.args)["options"], values)
+    if problems:
+        where = engine.args[-1] if engine.args else engine.cmd  # a script's path, not its interpreter's
+        raise ValueError(f"--param for the candidate ({where}): " + "; ".join(problems))
+
+
 def main(args=None):
     args = resolve_args(args)
+    if args.retry_ingest:
+        return retry_ingest(args.retry_ingest, db=args.db)
     if args.max_games < 2 or args.max_games % 2:
         raise ValueError("--max-games must be a positive even number (complete opening pairs)")
     if args.concurrency is not None and args.concurrency < 1:
         raise ValueError("--concurrency must be positive")
-    tc_args = tc_arguments(depth=args.depth, movetime=args.time, tc=args.tc)
-    Path(args.logroot).mkdir(parents=True, exist_ok=True)
+    # Threads: --threads for both engines; tuned params may give the candidate its own
+    params = dict(args.params)
+    threads_b = args.threads or 1
+    threads_a = int(params.pop("Threads", threads_b))
+    if min(threads_a, threads_b) < 1:
+        raise ValueError("--threads must be positive")
+    threads = max(threads_a, threads_b)
+    # everything that can be refused is checked before cpus are claimed or folders created
+    tc_args = tc_arguments(depth=args.depth, movetime=args.time, tc=args.tc, nodes=args.nodes)
+    extra_args = ["-maxmoves", str(args.maxmoves)] + tb_args(args.tb, args.tbpieces)
+    fastchess = find_fastchess(args.fastchess)
+    run_id = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    run_logs = Path(args.logroot).resolve() / run_id  # this run's engine logs only, one folder per side
 
-    slots = plan_slots(concurrency=args.concurrency)
-    logging_options = {"log_dir": str(args.logroot), "uci_logging": str(bool(args.log)).lower()}
-    candidate = EngineSpec.from_path("Candidate", args.engine_a, {**logging_options, **args.params}).resolve()
-    baseline = EngineSpec.from_path("Baseline", args.engine_b, logging_options).resolve()
+    def side_options(side, threads):
+        return {"log_dir": str(run_logs / side), "uci_logging": str(bool(args.log)).lower(), "Threads": threads}
+
+    candidate = EngineSpec.from_path("Candidate", args.engine_a, {**side_options("candidate", threads_a), **params})
+    baseline = EngineSpec.from_path("Baseline", args.engine_b, side_options("baseline", threads_b))
+    candidate.resolve()
+    baseline.resolve()
+    require_options(candidate, params)
+    if args.nodes is not None:
+        require_node_limit([candidate, baseline], label="SPRT")
+    for engine, count in ((candidate, threads_a), (baseline, threads_b)):
+        if count > 1:
+            require_threads(engine, count)
     book = OpeningBook(args.book, plies=args.book_depth, seed=args.seed)
 
-    run_dir = RESULTS_DIR / datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    slots = plan_slots(concurrency=args.concurrency, threads=threads, pin=not args.no_pin)
+    try:
+        return _run(args, slots, candidate, baseline, book, fastchess, tc_args, extra_args, run_id, run_logs,
+                    threads)
+    finally:
+        release_slots(slots)
+
+
+def _run(args, slots, candidate, baseline, book, fastchess, tc_args, extra_args, run_id, run_logs, threads):
+    results_dir = Path(args.results_dir)
+    run_dir = results_dir / run_id
     run_dir.mkdir(parents=True)
+    if args.log:
+        for side, _ in SIDES:
+            (run_logs / side).mkdir(parents=True, exist_ok=True)
     machine = environment.machine_info()
     pinned = slots[0].cpu is not None
+    hard = pinned and os.name == "nt"  # each job in a job object with the slot as its affinity limit
+    mask = "job affinity limit + process mask" if hard else "process mask"
+    limit = dict(tc=args.tc, depth=args.depth, time=args.time, nodes=args.nodes)
     meta = dict(run=run_dir.name, candidate=args.engine_a, baseline=args.engine_b,
-                time_control=args.tc or (f"{args.time}s/move" if args.time else f"depth {args.depth}"),
+                time_control=limit_label(**limit), threads=threads, fastchess=fastchess,
                 machine=machine, slots=[vars(s) | {"label": s.label} for s in slots],
-                pinning={e.name: ("Affinity option + process mask" if e.pin_option and pinned else
-                                  "process mask" if pinned else "none") for e in (candidate, baseline)},
-                book=str(args.book), book_openings=len(book), book_seed=book.seed, model="pentanomial-logistic")
+                pinning={e.name: (f"Affinity option + {mask}" if e.pin_option and pinned else
+                                  mask if pinned else "none") for e in (candidate, baseline)},
+                book=str(args.book), book_openings=len(book), book_seed=book.seed, model="pentanomial-logistic",
+                engine_logs=str(run_logs) if args.log else None)
 
     print_line(f"[SPRT] Candidate {args.engine_a}\n[SPRT] Baseline  {args.engine_b}")
     print_line(f"[SPRT] H0 Elo {args.elo0:+g}  H1 Elo {args.elo1:+g}  alpha {args.alpha}  beta {args.beta}  "
-               f"max {args.max_games:,} games  {meta['time_control']}")
+               f"max {args.max_games:,} games  {meta['time_control']}"
+               + (f"  {threads} threads" if threads > 1 else ""))
     print_line(f"[SPRT] book {Path(args.book).name}: {len(book):,} openings, {args.book_depth} plies, seed {book.seed}")
     print_line(f"[SPRT] machine {machine['cpu_model']}; {machine['topology']}; power {machine['power_source'] or '?'}")
     print_line(f"[SPRT] {describe_slots(slots)}")
     if pinned:
-        print_line("[SPRT] each game runs on one core: P-cores only play P-cores, E-cores only E-cores")
+        print_line("[SPRT] each game runs on one core type: P-cores only play P-cores, E-cores only E-cores"
+                   + ("; engines cannot leave their slot (job affinity limit)" if hard else ""))
     for engine in (candidate, baseline):
         if pinned and not engine.pin_option:
             print_line(f"[SPRT] note: {engine.name} has no Affinity option; its process mask keeps it on the core")
+    print_line(f"[SPRT] engine logging {'enabled: ' + str(run_logs) if args.log else 'disabled'}")
+    print_line(f"[SPRT] fastchess {fastchess}")
     print_line(f"[SPRT] results {run_dir}")
 
     (run_dir / "config.json").write_text(json.dumps(dict(arguments=vars(args), meta=meta), indent=2,
                                                     default=str), encoding="utf-8")
     plotter = None
     if args.plot:
-        from utils.match_runner import probe_uci
         from utils.sprt_plot import LivePlotter
 
         def label(engine):
             info = probe_uci(engine.cmd, engine.args)
             return {"version": info.get("version") or info.get("name") or engine.name}
         plotter = LivePlotter(args.elo0, args.elo1, args.alpha, args.beta, label(candidate), label(baseline),
-                              args.time, args.depth, args.tc)
+                              args.time, args.depth, args.tc or (f"{args.nodes} nodes / move" if args.nodes else None))
 
     controller = SprtController(args, (candidate, baseline), book, slots, run_dir, plotter)
-    runner = MatchRunner(args.cutechess_cli, slots, run_dir, tc_args, plies=args.book_depth,
-                         extra_args=["-maxmoves", str(args.maxmoves)])
+    runner = MatchRunner(fastchess, slots, run_dir, tc_args, plies=args.book_depth, extra_args=extra_args)
     start_time = time.time()
     failure = None
     try:
@@ -568,24 +687,32 @@ def main(args=None):
         stats["repinned_games"] = runner.repinned_games
         stats["mixed_core_games"] = runner.mixed_games
         stats["excluded_pairs"] = len(controller.tainted)
-        stats.update(run_id=run_dir.name, book_seed=book.seed, slots=len(slots),
+        stats.update(run_id=run_dir.name, book_seed=book.seed, slots=len(slots), threads=threads,
                      env_host=machine.get("host"), env_cpu_model=machine.get("cpu_model"))
         stats["terminations"] = [dict(termination=t, fault=f, count=n)
                                  for (t, f), n in sorted(controller.terminations.items(), key=lambda kv: -kv[1])]
         (run_dir / "summary.json").write_text(json.dumps(stats, indent=2, allow_nan=False, default=str),
                                               encoding="utf-8")
-        controller.register.save(run_dir, run_meta=meta, history_csv=OPENING_HISTORY)
+        controller.register.save(run_dir, run_meta=meta, history_csv=results_dir.parent / OPENING_HISTORY.name)
         controller.report(stats, run_time)
 
     if plotter:
         plotter.finalize(stats, run_dir / "sprt.png")
     if failure is None and controller.stop_reason is None and not args.no_db:
-        upload_logs(args, cute_chess_stats=stats, runtime=run_time, run_dir=run_dir, run_meta=meta)
+        upload_logs(args, fastchess_stats=stats, runtime=run_time, run_dir=run_dir, run_meta=meta, run_logs=run_logs)
+    if not args.log:
+        shutil.rmtree(run_logs, ignore_errors=True)  # engines may create their log folder with logging off
+    elif run_logs.is_dir():
+        print_line(f"[SPRT] engine logs kept in {run_logs}")
     print_line(f"[SPRT] {stats['result']}: {stats['pairs']} pairs, LLR {stats['llr']:+.4f}  ({run_dir})")
     if plotter:
         plotter.show_final()
     if failure:
         raise KeyboardInterrupt
+    if controller.stop_reason:
+        # an error, like a stopped SPSA: not an inconclusive test that release gating would read as "not accepted"
+        raise RuntimeError(f"SPRT stopped after {stats['pairs']} pairs: {controller.stop_reason} (not uploaded; "
+                           f"results in {run_dir})")
     return {"accepted": stats["result"] == "pass", "elo": stats["elo_diff"], "games": stats["games_played"],
             "result": stats["result"], "run_dir": str(run_dir)}
 

@@ -1,6 +1,6 @@
+[submodule "libs/bullet"]
+	path = libs/bullet
+	url = https://github.com/jw1912/bullet.git
 [submodule "libs/fastchess"]
 	path = libs/fastchess
 	url = https://github.com/Disservin/fastchess.git
-[submodule "libs/bullet"]
-	path = libs/bullet
-	url = https://github.com/maxolek/bullet.git

@@ -10,9 +10,17 @@ A net is identified by the sha256 of the file the engine loads (bullet's
 quantised.bin, copied to the engine's weights folder). Engines registered with
 provenance record the hash of the net they load (engines.net_sha256), which links
 every net to the ratings (data/ratings.py) and SPRT results of the engines that
-used it. Validation loss comes from the run's metrics*.csv (written during
-training), the training settings from train_config.json (written by train.py,
-which also registers the run's checkpoints when it finishes).
+used it. Losses come from the logs the bullet fork writes into every checkpoint
+(<run>-<N>/log.txt and val_log.txt, stitched across curriculum stages by
+nnue/plot.py's loader, which works without matplotlib), the training settings from
+train_config.json (written by train.py, which also registers the run's
+checkpoints when it finishes).
+
+train.py's best-validation folders (<run>/best/, best_<val set>/ and, for an
+earlier run with the same net id, best*_previous_<time>/) hold hard links to the
+files of checkpoint <run>-<N>, described by their best.json. A scan registers
+such a folder as that checkpoint (run and superbatch from best.json) once the
+checkpoint itself has been pruned, and skips it while the checkpoint exists.
 
 The report answers "does lower validation loss mean more Elo?": per net, its
 loss and the Elo of engines using it, with Spearman and Pearson correlations.
@@ -22,15 +30,16 @@ engine declares on plain `uci` (fastchess skips undeclared options). Tomahawk
 declares nnue_weight_file only for DEV engines and resolves a name under
 bin/nnue_wgts/, so `match` refuses with that explanation until it is declared on
 `uci` (--net-option and --net-value choose the option and how the net is named).
+The games run on the match runner (utils/fixed_match.py: one game per core, each
+with its core type, cpu and clock); the run folder goes to --results-dir (default
+logs/net_matches).
 """
 import argparse
-import csv
 import json
 import math
 import re
 import sqlite3
 import sys
-from datetime import datetime
 from pathlib import Path
 
 NNUE_ROOT = Path(__file__).resolve().parent
@@ -41,8 +50,8 @@ from data.etl.provenance import sha256_file  # noqa: E402
 from data.etl.schema import ensure_schema  # noqa: E402
 
 CHECKPOINTS = NNUE_ROOT / "checkpoints"
+DEFAULT_BOOK = PROJECT_ROOT / "bin" / "opening_books" / "8moves_v3.pgn"
 CHECKPOINT_NAME = re.compile(r"^(?P<run>.+)-(?P<superbatch>\d+)$")
-VAL_SPLITS = {"val", "validation", "test"}
 
 
 def find_net_file(path):
@@ -57,41 +66,57 @@ def find_net_file(path):
 
 
 def load_losses(run_dir):
-    """{superbatch: {"train": mean loss, "val": mean loss}} from metrics*.csv of a training run."""
+    """{superbatch: {"train": mean training loss, "val": validation loss}} of a training run.
 
+    Read from the loss logs bullet writes into each checkpoint (<run>-<N>/log.txt,
+    val_log.txt) with nnue/plot.py's loader, which stitches curriculum stages
+    together. "val" is the superbatch's last validation, measured on the weights
+    saved at its end (as train.py's best tracking does).
+    """
     from nnue.plot import load_checkpoint_logs
 
-    series = load_checkpoint_logs(str(run_dir))   
+    # Without batches_per_superbatch, (superbatch, batch) is placed at superbatch + batch / (max batch + 1).
+    series = load_checkpoint_logs(str(run_dir))
     sums = {}
     for x, loss in series.get("train", []):
         total = sums.setdefault(int(x), [0.0, 0])
         total[0] += loss
         total[1] += 1
-    losses =  {sb: {"train": s / n} for sb, (s, n) in sums.items()}
-    for x, loss in series.get("val", []):
-        losses.setdefault(int(x), [])['val'] = loss 
+    losses = {sb: {"train": s / n} for sb, (s, n) in sums.items()}
+    for x, loss in series.get("val", []):  # sorted: the superbatch's last validation wins
+        losses.setdefault(int(x), {})["val"] = loss
     return losses
 
+
 def load_best_info(folder):
-    """best.json of a best-validation folder train.py keeps (best/, best <val_set>/, best*_previous_<time>/)"""
+    """best.json of a best-validation folder train.py keeps (best/, best_<val set>/, best*_previous_<time>/)."""
     try:
         info = json.loads((Path(folder) / "best.json").read_text(encoding="utf-8"))
     except (OSError, ValueError):
-        return None 
+        return None
     return info if isinstance(info, dict) and isinstance(info.get("superbatch"), int) else None
 
+
 def _run_info(net_file, run_id=None, superbatch=None):
-    """Run id, superbatch and run folder of a checkpoint <run dir>/<run>-<superbatch>/quantised.bin."""
+    """Run id, superbatch, run folder and best.json (None for a checkpoint) of a net file:
+    <run dir>/<run>-<superbatch>/quantised.bin, or a best folder <run dir>/best*/quantised.bin."""
     folder = net_file.parent
-    best = load_best_info(folder)
+    best = load_best_info(folder)  # first: a best_<val set> folder name can look like <run>-<N>
     if best is not None:
-        run_id = run_id or best.get('net_id')
+        run_id = run_id or best.get("net_id")
         superbatch = superbatch if superbatch is not None else best["superbatch"]
         return run_id, superbatch, folder.parent, best
+    match = CHECKPOINT_NAME.match(folder.name)
+    if match:
+        run_id = run_id or match["run"]
+        superbatch = superbatch if superbatch is not None else int(match["superbatch"])
+        return run_id, superbatch, folder.parent, None
     return run_id, superbatch, None, None
+
 
 def _same_loss(a, b):
     return a is not None and b is not None and math.isclose(a, b, rel_tol=1e-6, abs_tol=1e-12)
+
 
 def register_net(cnxn, path, run_id=None, superbatch=None, notes=None):
     """Register (or refresh) a net; returns its id."""
@@ -104,12 +129,13 @@ def register_net(cnxn, path, run_id=None, superbatch=None, notes=None):
     losses = load_losses(run_dir) if run_dir else {}
     config_path = run_dir / "train_config.json" if run_dir else None
     config = config_path.read_text(encoding="utf-8") if config_path and config_path.is_file() else None
-    if best is not None and not _same_loss(losses.get(superbatch, {}).get('val'), best.get('val_loss')):
-        # runs logs do not show this state
-        # only best.json describes it, and its loss is by definition that runs best
-        losses = {superbatch: {'val': best['val_loss']}} if best.get('val_loss') is not None else {}
+    if best is not None and not _same_loss(losses.get(superbatch, {}).get("val"), best.get("val_loss")):
+        # The run's logs do not show this state (an archived best of an earlier run with
+        # this net id, whose logs and train_config.json the later run replaced): only its
+        # best.json describes it, and its loss is by definition that run's best.
+        losses = {superbatch: {"val": best["val_loss"]}} if best.get("val_loss") is not None else {}
         config = None
-        at = losses.get(superbatch, {})
+    at = losses.get(superbatch, {})
     val = {sb: v["val"] for sb, v in losses.items() if "val" in v}
     best_sb = min(val, key=val.get) if val else None
     values = (run_id, superbatch, str(net_file), at.get("val"), at.get("train"),
@@ -129,24 +155,29 @@ def register_net(cnxn, path, run_id=None, superbatch=None, notes=None):
     cnxn.commit()
     return net_id
 
+
 def _copy_of_existing_checkpoint(net_file):
-    """true for the net of a best folder whose checkpoint still holds the same net"""
+    """True for the net of a best folder whose checkpoint (best.json's "checkpoint") still holds the same net."""
     best = load_best_info(net_file.parent)
-    if best is None or not best.get('checkpoint'):
-        return False 
-    source = net_file.parent.parent / Path(str(best['checkpoint'])).name / net_file.name
+    if best is None or not best.get("checkpoint"):
+        return False
+    source = net_file.parent.parent / Path(str(best["checkpoint"])).name / net_file.name
     if not source.is_file():
-        return False 
+        return False
     try:
-        if source.samefile(net_file):
-            return True 
+        if source.samefile(net_file):  # train.py hard-links best folders
+            return True
     except OSError:
-        pass 
+        pass
     return sha256_file(source) == sha256_file(net_file)
 
 
 def scan(cnxn, root=CHECKPOINTS, run_id=None):
-    """Register every checkpoint under root (one training run's folder, or all of them)."""
+    """Register every checkpoint under root (one training run's folder, or all of them).
+
+    A best folder is registered as the checkpoint it was copied from only once that
+    checkpoint is gone; while it exists, the checkpoint's own entry is the same net.
+    """
     pattern = f"{run_id}/*/quantised.bin" if run_id else "**/quantised.bin"
     ids = []
     for net_file in sorted(Path(root).glob(pattern)):
@@ -167,6 +198,7 @@ def _ranks(values):
             ranks[order[k]] = (i + j) / 2 + 1
         i = j + 1
     return ranks
+
 
 def pearson(x, y):
     n = len(x)
@@ -229,14 +261,20 @@ def format_report(rows, tc_category, fit_id):
     return "\n".join(lines)
 
 
-def play_match(engine, net_a, net_b, *, limits, label, pairs, concurrency, net_option="nnue_weight_file",
-               net_value="path", fastchess=None, book=None, db=None, pin=True):
-    """Fixed-length match: the same engine with net A (Candidate) vs net B; stored in net_matches."""
-    from utils import uci_probe
-    from utils.fastchess_match import FASTCHESS, Side, prepare_match, run_match
-    from utils.pentanomial import PentanomialSPRT
+def play_match(engine, net_a, net_b, *, limits, label, pairs, concurrency=None, net_option="nnue_weight_file",
+               net_value="path", fastchess=None, book=None, db=None, pin=True, results_dir=None):
+    """Fixed-length match: the same engine with net A (Candidate) vs net B; stored in net_matches.
 
-    if net_option not in uci_probe.uci_options(engine):
+    Played on the match runner (utils/fixed_match.py): every game pinned to its own core, with its
+    core type, cpu and clock in <results_dir>/<run>/games.jsonl (default logs/net_matches);
+    concurrency None is the runner's default (every physical core but one).
+    """
+    from utils.fastchess_match import FASTCHESS
+    from utils.fixed_match import Pairing, run_fixed_match
+    from utils.match_runner import EngineSpec, probe_uci
+
+    base = EngineSpec.from_path("Candidate", engine).resolve()
+    if net_option not in probe_uci(base.cmd, base.args)["options"]:
         raise ValueError(
             f"{engine} does not declare the UCI option '{net_option}' on `uci`, so fastchess cannot load a net "
             "through it. Tomahawk declares nnue_weight_file only for DEV engines and takes a name under "
@@ -246,16 +284,21 @@ def play_match(engine, net_a, net_b, *, limits, label, pairs, concurrency, net_o
         net = Path(net).resolve()
         return str(net) if net_value == "path" else net.stem
 
-    run_dir = LOGS_DIR / "net_matches" / datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-    match = prepare_match(Side(engine, [f"option.{net_option}={value(net_a)}"]),
-                          Side(engine, [f"option.{net_option}={value(net_b)}"]),
-                          limits=limits, pairs=pairs, concurrency=concurrency, run_dir=run_dir,
-                          fastchess=fastchess or FASTCHESS, book=book, pin=pin,
-                          meta=dict(net_a=str(net_a), net_b=str(net_b), limit=label))
-    stats = run_match(match, PentanomialSPRT(0, 10, sequential=False))
+    def side(name, net):  # one binary, two nets: told apart by name
+        return EngineSpec(name, base.cmd, base.args, {"Threads": 1, net_option: value(net)}, workdir=base.workdir,
+                          pin_option=base.pin_option)
+
+    key = "net A vs net B"
+    result = run_fixed_match([Pairing(side("Candidate", net_a), side("Baseline", net_b), pairs, key=key)],
+                             tc_args=limits, book=book or DEFAULT_BOOK, plies=16, concurrency=concurrency, pin=pin,
+                             fastchess=fastchess or FASTCHESS, results_dir=results_dir or LOGS_DIR / "net_matches",
+                             extra_args=["-maxmoves", "100"], label="NET", time_control=label,
+                             meta=dict(net_a=str(net_a), net_b=str(net_b), limit=label, engine=str(engine)))
+    stats = result["pairings"][key]
     cnxn = connect_raw(db or RAW_DB)
     try:
         ids = [register_net(cnxn, net) for net in (net_a, net_b)]
+        # net_matches has no penta_wl: penta_dd holds the combined DD + WL bin (stats["pentanomial"][2]).
         cnxn.execute("""INSERT INTO net_matches (net_a_id, net_b_id, engine_path, time_control, wins, draws, losses,
                             penta_ll, penta_ld, penta_dd, penta_wd, penta_ww, elo, elo_low, elo_high)
                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
@@ -290,21 +333,30 @@ def main(argv=None):
     m.add_argument("--tc", default=None)
     m.add_argument("--depth", type=int, default=None)
     m.add_argument("--pairs", type=int, default=200)
-    m.add_argument("--concurrency", type=int, default=2)
+    m.add_argument("--concurrency", type=int, default=None,
+                   help="Concurrent games (default: every physical core but one); each game gets its own core")
     m.add_argument("--net-option", default="nnue_weight_file")
     m.add_argument("--net-value", choices=["path", "stem"], default="path",
                    help="pass the net's full path, or its file name without extension")
-    m.add_argument("--book", default=str(PROJECT_ROOT / "bin" / "opening_books" / "8moves_v3.pgn"))
-    m.add_argument("--no-pin", action="store_true")
+    m.add_argument("--book", default=str(DEFAULT_BOOK))
+    m.add_argument("--no-pin", action="store_true", help="Leave the placement of games to the OS")
+    m.add_argument("--fastchess", default=None,
+                   help="fastchess executable (default: utils.fastchess_match.FASTCHESS: $FASTCHESS, "
+                        "libs/fastchess, or fastchess on PATH)")
+    m.add_argument("--results-dir", default=None,
+                   help="where the match's run folder goes (default logs/net_matches)")
     args = parser.parse_args(argv)
 
     if args.command == "match":
         from utils.fastchess_match import limit_args, limit_label
+        if args.pairs < 1:
+            parser.error("--pairs must be positive")
         limits = limit_args(args.depth, None, args.tc, args.nodes)
         label = limit_label(args.depth, None, args.tc, args.nodes)
         stats = play_match(args.engine, args.net_a, args.net_b, limits=limits, label=label, pairs=args.pairs,
                            concurrency=args.concurrency, net_option=args.net_option, net_value=args.net_value,
-                           book=args.book, db=args.db, pin=not args.no_pin)
+                           book=args.book, db=args.db, pin=not args.no_pin, fastchess=args.fastchess,
+                           results_dir=args.results_dir)
         print(f"net A vs net B, {label}: {stats['pairs']} pairs, Elo {stats['elo_diff']:+.1f} "
               f"[{stats['elo_low']:+.1f}, {stats['elo_high']:+.1f}]")
         return

@@ -87,5 +87,18 @@ SELECT
     g.env_mhz_mean,
     g.env_host,
     g.env_cpu_model
-FROM search_stats s
+FROM (
+    -- PVS re-searches: older builds log one count (pvs_researches), newer ones three kinds instead
+    -- (after an LMR reduction, full-window interior, full-window root). pvs_researches is the count,
+    -- else the kinds' sum when any was logged, else NULL (not measured, not 0). UNION BY NAME gives
+    -- tables without the kinds (older analytics databases, public snapshots) NULL ones.
+    SELECT * REPLACE (coalesce(pvs_researches,
+               CASE WHEN pvs_researches_depth IS NOT NULL OR pvs_researches_full IS NOT NULL
+                         OR pvs_researches_root IS NOT NULL
+                    THEN coalesce(pvs_researches_depth, 0) + coalesce(pvs_researches_full, 0)
+                         + coalesce(pvs_researches_root, 0) END) AS pvs_researches)
+    FROM (SELECT * FROM search_stats UNION ALL BY NAME
+          SELECT NULL::BIGINT AS pvs_researches_depth, NULL::BIGINT AS pvs_researches_full,
+                 NULL::BIGINT AS pvs_researches_root WHERE false)
+) s
 LEFT JOIN game_stats g ON s.game_id = g.id

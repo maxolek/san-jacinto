@@ -213,7 +213,7 @@ class TrainEvaluator:
     def __call__(self, trial_id, rung, budget, params, last_rung):
         net_id = f"t{trial_id:04d}_r{rung}"
         final = budget * self.stages
-        # --no-register: trial runs are deleted after scoring, so they stay out of the net registry
+        # --no-register: trial runs are deleted after scoring, so they stay out of the net registry.
         cmd = [sys.executable, str(HERE / "train.py"), "--example", self.args.example, "--net-id", net_id,
                "--output-dir", str(self.runs), "--superbatches", str(budget), "--save-rate", str(budget),
                "--no-plot", "--no-best", "--no-register", *train_flags(params)]

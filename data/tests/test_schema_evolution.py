@@ -319,6 +319,48 @@ class ConcurrencyTest(TempDirTest):
         self.assertEqual(cnxn.execute("SELECT count(*) FROM games").fetchone()[0], 2)
         self.assertFalse((run / "candidate").exists() or (run / "baseline").exists())
 
+    def test_a_side_with_a_record_the_schema_refuses_keeps_its_logs_until_a_retry_loads_it(self):
+        from tests import sprt
+        cnxn = self.init("raw")
+        cnxn.execute("INSERT INTO engines (name, version) VALUES ('candidate', '1'), ('baseline', '2')")
+        cnxn.execute("INSERT INTO experiments (engine_id, type) VALUES (1, 'SPRT')")
+        cnxn.commit()
+        run = self.dir / "run"
+        for side in ("candidate", "baseline"):
+            (run / side).mkdir(parents=True)
+            (run / side / "game_1.jsonl").write_text(
+                json.dumps(dict(CURRENT_GAME, game_uuid=f"{side}-game")) + "\n", encoding="utf-8")
+        good = dict(CURRENT_SEARCH, game_uuid="candidate-game", search_uuid="s1")
+        bad = {k: v for k, v in dict(good, search_uuid="s2").items() if k != "fen"}  # searches.fen is NOT NULL
+        searches = run / "candidate" / "search_1.jsonl"
+        searches.write_text(json.dumps(good) + "\n" + json.dumps(bad) + "\n", encoding="utf-8")
+        ids = dict(candidate=1, baseline=2, experiment=1, loaded=[])
+        (run / "engines.json").write_text(json.dumps(ids), encoding="utf-8")
+        db = self.dir / "raw" / "chess.db"
+
+        ok, out = quietly(sprt.ingest_telemetry, cnxn, run, ids)
+        self.assertFalse(ok)
+        self.assertIn("ingestion failed (candidate)", out)
+        self.assertNotIn("loaded already", out)
+        self.assertTrue(searches.exists())  # kept for a retry
+        self.assertFalse((run / "baseline").exists())
+        self.assertEqual(ids["loaded"], ["baseline"])
+        self.assertEqual(cnxn.execute("SELECT side FROM telemetry_loads").fetchall(), [("baseline",)])
+        self.assertEqual(cnxn.execute("SELECT count(*) FROM searches").fetchone()[0], 0)  # the side rolled back
+        cnxn.close()
+
+        # the record fixed, a retry loads the candidate's telemetry, once
+        searches.write_text(json.dumps(good) + "\n" + json.dumps(dict(good, search_uuid="s2")) + "\n",
+                            encoding="utf-8")
+        ok, out = quietly(sprt.retry_ingest, run, db=db)
+        self.assertTrue(ok, out)
+        self.assertFalse(run.exists())
+        check = self.connect("raw")
+        self.assertEqual(sorted(check.execute("SELECT side FROM telemetry_loads").fetchall()),
+                         [("baseline",), ("candidate",)])
+        self.assertEqual(check.execute("SELECT count(*) FROM searches").fetchone()[0], 2)
+        self.assertEqual(check.execute("SELECT count(*) FROM games").fetchone()[0], 2)
+
 
 class NewStatisticTest(TempDirTest):
     """A statistic a new engine version logs needs only a migration to be stored."""

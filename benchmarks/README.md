@@ -127,8 +127,8 @@ python smp.py out\new.exe --threads 1,2,4,8
 ```powershell
 python affinity_check.py out\new.exe                                 # auto placement for 1, 2, 4, 8 threads
 python affinity_check.py out\new.exe --threads 4 --affinity 0,6,8,1  # an explicit list
-python affinity_check.py out\new.exe --threads 4 --cpus 2-5          # inside a restricted process, as a match runner would
-python affinity_check.py out\new.exe --threads 4 --cpus 2-5 --cpu-sets   # restricted with a CPU set (fastchess on Windows 11)
+python affinity_check.py out\new.exe --threads 4 --cpus 2-5          # inside a restricted process (affinity mask), as the SPRT/SPSA match runner starts fastchess
+python affinity_check.py out\new.exe --threads 4 --cpus 2-5 --cpu-sets   # restricted with a CPU set, as fastchess -use-affinity does on Windows 11 (no tool here uses CPU sets now: every one plays on the match runner)
 ```
 
 It prints the detected topology and the automatic order, then for each thread count runs a short search and checks that the busy threads' OS affinity masks match the placement the engine announced. Any `MISMATCH` means the engine did not place its threads as it said. The check is Windows-only.

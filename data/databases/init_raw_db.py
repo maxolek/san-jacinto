@@ -3,12 +3,14 @@ from pathlib import Path
 from ..etl.paths import RAW_DB, connect_raw
 from ..etl.schema import ensure_schema
 
+
 def _resolve_db_path(db_path=None) -> Path:
-    """A file path, or a directory (for which `<dir>/chess.db` is used)."""
+    """A database file, or a directory (an existing one, or a new path without a file
+    extension) for which `<dir>/chess.db` is used."""
     if db_path is None:
         return Path(RAW_DB)
     path = Path(db_path)
-    if path.is_dir() or not path.suffix:
+    if path.is_dir() or (not path.exists() and not path.suffix):
         return path / "chess.db"
     return path
 
@@ -118,11 +120,11 @@ def create_base_tables(cnxn) -> None:
             engine_id                   INTEGER NOT NULL,
 
             -- elo by time control
-            elo_ultra_fast              INTEGER, -- < 15 sec/game
-            elo_bullet                  INTEGER, -- < 1 min/game
-            elo_blitz                   INTEGER, -- < 10 min/game
-            elo_rapid                   INTEGER, -- < 30 min/game
-            elo_classical               INTEGER, -- >= 30 min/game
+            elo_ultra_fast              REAL, -- < 15 sec/game
+            elo_bullet                  REAL, -- < 1 min/game
+            elo_blitz                   REAL, -- < 10 min/game
+            elo_rapid                   REAL, -- < 30 min/game
+            elo_classical               REAL, -- >= 30 min/game
 
             -- supporting stats
             games_ultra_fast            INTEGER DEFAULT 0,
@@ -329,7 +331,7 @@ def create_base_tables(cnxn) -> None:
             run_time_s                  REAL,
 
             ingestion_timestamp_utc     DATETIME DEFAULT CURRENT_TIMESTAMP,
-            
+
             FOREIGN KEY (experiment_id) REFERENCES experiments(id),
             FOREIGN KEY (white_engine_id) REFERENCES engines(id),
             FOREIGN KEY (black_engine_id) REFERENCES engines(id)

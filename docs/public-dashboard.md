@@ -197,7 +197,7 @@ URL (the remote host must permit the request). Production displays an error
 if its default publication is unavailable; it does not silently show demo data.
 
 ```sh
-python -m unittest discover -s data -p "test_*.py"
+python -m unittest discover -s data -t . -p "test_*.py"
 cd data/dashboard
 npm ci
 npm test

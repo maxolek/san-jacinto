@@ -19,6 +19,12 @@ earlier value.
 SPRT results are recorded too but left out of fits unless asked for: a test that
 stops when it crosses a bound overestimates the engines that pass.
 
+Pentanomial counts (penta_*): the middle bin, pairs scoring 1/2, holds two draws
+(DD) or a win and a loss (WL). When the runner split it (PentanomialSPRT's
+pentanomial_detail), penta_dd = DD and penta_wl = WL; otherwise penta_dd holds
+the whole bin and penta_wl is NULL (tournament results, rows from before
+2026-10-25). Read the middle bin as penta_dd + COALESCE(penta_wl, 0) (PENTA_SQL).
+
     python -m data.ratings fit [--tc blitz ...] [--include-sprt] [--anchor ENGINE] [--anchor-elo 1500]
     python -m data.ratings show [--tc blitz]
     python -m data.ratings backfill-sprt
@@ -33,8 +39,9 @@ CATEGORIES = ("ultra_fast", "bullet", "blitz", "rapid", "classical")  # mirrored
 DEFAULT_SOURCES = ("tournament", "manual")
 ANCHOR_ELO = 1500.0
 Z95 = 1.959964
-# the five pentanomial bins (LL, LD, DD + WL, DW, WW) of a match results row, NULL when not recoreded
+# The five pentanomial bins (LL, LD, DD + WL, WD, WW) of a match_results row; NULL when not recorded.
 PENTA_SQL = "penta_ll, penta_ld, penta_dd + COALESCE(penta_wl, 0), penta_wd, penta_ww"
+
 
 def classify_tc(tc_str):
     """Classify a time control string into ultra_fast/bullet/blitz/rapid/classical.
@@ -81,29 +88,56 @@ def category(tc=None, depth=None, time=None, nodes=None, threads=1):
     return label if not threads or threads <= 1 else f"{label}@T{threads}"
 
 
+def penta_columns(penta, detail=None):
+    """match_results' (penta_ll, penta_ld, penta_dd, penta_wl, penta_wd, penta_ww) of five bins.
+
+    The middle bin is split (penta_dd = DD, penta_wl = WL) when `detail` (LL, LD, DD, WL,
+    WD, WW counts) has DD and WL adding up to it; otherwise penta_dd keeps the whole bin
+    and penta_wl is NULL. All NULL without counts.
+    """
+    if not penta:
+        return (None,) * 6
+    ll, ld, middle, wd, ww = penta
+    dd, wl = middle, None
+    if detail and detail.get("DD") is not None and detail.get("WL") is not None \
+            and detail["DD"] + detail["WL"] == middle:
+        dd, wl = detail["DD"], detail["WL"]
+    return ll, ld, dd, wl, wd, ww
+
+
 def record_match(cnxn, *, source, engine_a, engine_b, wins, draws, losses, tc_category,
-                 time_control=None, penta=None, experiment_id=None):
-    """Store one pairwise result (engine a's wins/draws/losses); returns its id."""
+                 time_control=None, penta=None, experiment_id=None, penta_detail=None, commit=True):
+    """Store one pairwise result (engine a's wins/draws/losses); returns its id.
+
+    penta: engine a's five pentanomial bins (LL, LD, DD + WL, WD, WW), if known;
+    penta_detail: the six counts splitting the middle bin, if known (see penta_columns).
+    commit=False leaves the row in the caller's open transaction (call ensure_schema before
+    opening it: applying a migration commits an open transaction).
+    """
     ensure_schema(cnxn)
-    penta = list(penta) if penta else [None] * 5
     cur = cnxn.execute(
         """INSERT INTO match_results (experiment_id, source, engine_a_id, engine_b_id, time_control, tc_category,
-               wins, draws, losses, penta_ll, penta_ld, penta_dd, penta_wd, penta_ww)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-        (experiment_id, source, engine_a, engine_b, time_control, tc_category, wins, draws, losses, *penta))
-    cnxn.commit()
+               wins, draws, losses, penta_ll, penta_ld, penta_dd, penta_wl, penta_wd, penta_ww)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (experiment_id, source, engine_a, engine_b, time_control, tc_category, wins, draws, losses,
+         *penta_columns(penta, penta_detail)))
+    if commit:
+        cnxn.commit()
     return cur.lastrowid
 
 
 def record_snapshot(cnxn, *, source, engine_a, engine_b, snapshot, tc_category, time_control=None,
-                    experiment_id=None):
-    """Store a PentanomialSPRT snapshot (candidate = engine a)."""
+                    experiment_id=None, commit=True):
+    """Store a PentanomialSPRT snapshot (candidate = engine a), with DD and WL apart when it
+    has pentanomial_detail. commit: as record_match's."""
     if not snapshot.get("games_played"):
         return None
     return record_match(cnxn, source=source, engine_a=engine_a, engine_b=engine_b,
                         wins=snapshot["candidate_wins"], draws=snapshot["candidate_draws"],
-                        losses=snapshot["candidate_losses"], penta=snapshot["pentanomial"],
-                        tc_category=tc_category, time_control=time_control, experiment_id=experiment_id)
+                        losses=snapshot["candidate_losses"], penta=snapshot.get("pentanomial"),
+                        penta_detail=snapshot.get("pentanomial_detail"),
+                        tc_category=tc_category, time_control=time_control, experiment_id=experiment_id,
+                        commit=commit)
 
 
 def load_results(cnxn, tc_category, sources=DEFAULT_SOURCES):

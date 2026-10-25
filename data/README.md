@@ -4,12 +4,14 @@ The data side of San Jacinto. It turns engine telemetry into an analytics
 database and a public dashboard snapshot.
 
 ```text
-engine logs (JSONL)            match-runner runs (games.jsonl + PGN)
+engine logs (JSONL)            match-runner runs (games.jsonl + PGN, tests/sprt.py)
         \                         /
          etl/  ingest.py, match_games.py
                    |
                    v
    raw SQLite  (chess.db)                       databases/init_raw_db.py, migrate_schema.py
+     also: match_results / rating_fits / ratings (ratings.py),
+           nets / net_matches (nnue/registry.py)
                    |
                    v  databases/run_analytics_pipeline.py
    1 load_analytics        raw tables -> analytics tables (incremental or --full)
@@ -40,9 +42,17 @@ and `~/Documents/databases/` elsewhere.
 
 ```sh
 # raw database: create it, or add new columns to an existing one
-python -m data.databases.init_raw_db            # also runs the migrations
-python -m data.databases.migrate_schema --dry-run
+python -m data.databases.init_raw_db [--db FILE_OR_DIR]   # also runs the migrations; a directory (or a path without an extension) means <dir>/chess.db
+python -m data.databases.migrate_schema --dry-run         # preview; without --dry-run: apply
+```
 
+The base tables in `init_raw_db.py` are frozen: every schema change is a new
+migration in `databases/migrate_schema.py` (its docstring has the rules;
+[docs/databases.md](../docs/databases.md#how-the-schema-changes) lists the
+migrations). Programs that write to the raw database apply pending migrations
+themselves.
+
+```sh
 # analytics database (Stockfish is optional: --stockfish PATH, $STOCKFISH or PATH)
 python -m data.databases.run_analytics_pipeline            # incremental
 python -m data.databases.run_analytics_pipeline --full     # reload everything
@@ -59,9 +69,17 @@ python -m data.databases.test_schema [--db FILE]
 
 # public snapshot for the dashboard (keeps the newest 3; --full adds per-search tables)
 python -m data.databases.export_public --archive /tmp/analytics-public.tar.gz
+python -m data.databases.publish [--refresh]     # export, GitHub release and Pages deploy in one step (needs gh)
 
-# tests (synthetic data, no Stockfish needed)
-python -m unittest discover -s data -p "test_*.py"
+# dashboard on http://localhost:3000 (Node.js 18+; installs its npm packages on first use)
+python -m data.dashboard
+
+# ratings over match_results (tournament and manual results; SPRT only with --include-sprt)
+python -m data.ratings fit [--tc blitz] [--include-sprt]
+python -m data.ratings show --tc blitz
+
+# tests (synthetic data, no Stockfish needed); keep -t .
+python -m unittest discover -s data -t . -p "test_*.py"
 ```
 
 ## Folders
@@ -74,6 +92,7 @@ python -m unittest discover -s data -p "test_*.py"
 | `tests/` | Unit tests with a synthetic log generator (`fixtures.py`) and a fake UCI engine |
 | `dashboard/` | The static dashboard. See its README. |
 | `openings/` | The ECO opening database |
+| `ratings.py` | Global Elo fits over `match_results` (`rating_fits`, `ratings`, mirrored into `engine_ratings`) |
 
 More detail:
 

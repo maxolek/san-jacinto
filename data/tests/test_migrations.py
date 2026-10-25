@@ -73,10 +73,12 @@ class MigrationTest(unittest.TestCase):
         _old_raw_db(raw)
         with _quiet():
             first = migrate(raw_db=raw, analytics_db=self.dir / "missing.duckdb")
-        # the old database has only games, sprt, and searches: migrations of other tables
-        # wait for them (init_raw_db creates them), the rest apply or are recorded as no-ops
-        absent = {m.id for m in MIGRATIONS if m.table and m.tables not in ("games", "sprt", "searches")}
-        self.assertEqual({mid for mid, status  in first.items() if status == "missing-table"}, absent)
+        # the old database has only games, sprt and searches: migrations of other tables
+        # wait for them (init_raw_db creates them), the rest apply or are recorded as no-ops;
+        # match_results is created by an earlier migration (2026_10_15_rating_tables)
+        absent = {m.id for m in MIGRATIONS
+                  if m.table and m.table not in ("games", "sprt", "searches", "match_results")}
+        self.assertEqual({mid for mid, status in first.items() if status == "missing-table"}, absent)
         self.assertTrue({status for mid, status in first.items() if mid not in absent} <= {"applied", "recorded"})
         games = _sqlite_columns(raw, "games")
         self.assertTrue({name for name, _ in GAMES_MATCH_COLUMNS} <= set(games))
@@ -150,11 +152,12 @@ class MigrationTest(unittest.TestCase):
             path = init_raw_db(self.dir / "custom.db")
             result = migrate(raw_db=path, migrations=[m for m in MIGRATIONS if m.db == "raw"])
         self.assertEqual(path, self.dir / "custom.db")
-        self.assertEqual(set(result.values()), {"recorded"})  # already in the CREATE TABLEs
+        self.assertEqual(set(result.values()), {"skipped"})  # init_raw_db applies every migration
         self.assertTrue({name for name, _ in GAMES_MATCH_COLUMNS} <= set(_sqlite_columns(path, "games")))
         self.assertTrue({name for name, _ in SPRT_PENTANOMIAL_COLUMNS} <= set(_sqlite_columns(path, "sprt")))
         with _quiet():
             self.assertEqual(init_raw_db(self.dir), self.dir / "chess.db")
+            self.assertEqual(init_raw_db(self.dir / "fresh"), self.dir / "fresh" / "chess.db")
 
     def test_pipeline_runs_on_an_unmigrated_raw_database(self):
         """REAL Elo in INTEGER columns, missing environment columns and analytics tables derived by

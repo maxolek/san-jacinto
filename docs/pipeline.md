@@ -3,11 +3,13 @@ graph TD
     subgraph Sources["Sources"]
         ENG["Chess Engine<br/><i>C++ / UCI Protocol</i>"]
         LOGS["Engine Logs<br/><i>game.jsonl / search.jsonl / timing.jsonl</i>"]
+        RUNNER["Match runner (fastchess)<br/><i>tests/sprt.py run: games.jsonl + games.pgn</i>"]
     end
 
     subgraph ETL["ETL Package · data/etl/"]
-        RAW["init_raw_db.py<br/><i>Initialize SQLite schema</i>"]
+        RAW["init_raw_db.py + migrate_schema.py<br/><i>Base tables + migrations (data/databases/)</i>"]
         ING["ingest.py<br/><i>Parse & bulk insert</i>"]
+        MG["match_games.py<br/><i>Played games; links engine logs to them</i>"]
         PATHS["paths.py<br/><i>Single source of truth</i>"]
         DB["db.py<br/><i>SQLite helpers</i>"]
         OPEN["openings.py<br/><i>ECO classification</i>"]
@@ -45,14 +47,17 @@ graph TD
     subgraph Dashboard["Dashboard · data/dashboard/ (Vite + Mosaic)"]
         DKWASM["DuckDB-WASM<br/><i>In-browser engine</i>"]
         MOSAIC["Mosaic Coordinator<br/><i>Cross-filtered views</i>"]
-        VIEWS["View Modules<br/><i>overview / search / games / trends<br/>compare / iterations / tree / timing / sprt</i>"]
+        VIEWS["View Modules<br/><i>19 tabs: Results / Search / Engine</i>"]
         APP["Vite Dev Server<br/><i>localhost:3000</i>"]
     end
 
     ENG -->|"UCI stdout"| LOGS
     LOGS -->|"bulk parse"| ING
+    RUNNER -->|"played games"| MG
+    LOGS -.->|"searches linked by position"| MG
     RAW --> SQLITE
     ING --> SQLITE
+    MG --> SQLITE
 
     SQLITE -->|"source data"| RUN
 
@@ -81,4 +86,5 @@ graph TD
 ```
 
 Commands and the order of the steps are in [data/README.md](../data/README.md).
+The raw tables and the migration rule are in [databases.md](databases.md).
 The tables the dashboard reads are described in [dashboard-data.md](dashboard-data.md).

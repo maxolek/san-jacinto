@@ -8,10 +8,14 @@ and shows a live-updating loss plot fed by the loss logs bullet writes into
 every checkpoint (<net>/<net_id>-<superbatch>/log.txt and val_log.txt), so the
 plot advances each time a checkpoint is saved (--save-rate).
 
-Training scripts: --example NAME runs nnue/NAME.rs (v2, v3) through the small
-cargo package in nnue/Cargo.toml, which builds against libs/bullet; any other
-NAME is run as an example of the bullet workspace itself. Tuning flags are
-forwarded to the script as environment variables.
+Training scripts: --example NAME runs `cargo run --release --example NAME` in
+libs/bullet. The fork registers san-jacinto's scripts nnue/v2.rs and
+nnue/v3.rs as its examples v2 and v3 (libs/bullet/crates/bullet_lib/Cargo.toml);
+any other NAME is one of bullet's own examples. Tuning flags are forwarded to
+the script as environment variables; settings not given are left to the
+script's defaults, except the WDL blend and the net id, which train.py needs
+itself: it reads their defaults from nnue/NAME.rs and always passes them, so a
+run through train.py trains what `cargo run --example NAME` would.
 
 Multi-dataset (curriculum) runs:
     Pass --train-data with more than one path (or a folder) and each dataset is
@@ -63,7 +67,6 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 # train.py lives in /san-jacinto/nnue/
 SAN_JACINTO_ROOT = os.path.dirname(HERE)
 NNUE_SJ_ROOT = os.path.join(SAN_JACINTO_ROOT, "nnue")
-NNUE_MANIFEST = os.path.join(NNUE_SJ_ROOT, "Cargo.toml")
 # Bullet lives in /san-jacinto/libs/bullet/
 BULLET_ROOT = os.path.join(SAN_JACINTO_ROOT, "libs", "bullet")
 DATA_ROOT = os.path.join(BULLET_ROOT, "data")
@@ -162,8 +165,8 @@ def _cosine_lr(
     Deliberately mirrors plot._cosine_lr (same formula, same clamping) so
     the per-stage diagnostic rates line up with the curve the dashboard
     draws. Kept as a plain-math duplicate rather than importing
-    plot.py, since plot.py pulls in matplotlib at import time and this
-    needs to work even in --no-plot / no-matplotlib setups.
+    plot.py, so this part of train.py does not depend on the plotting module
+    (which itself imports matplotlib only when drawing).
     """
     if final_superbatch <= 0:
         return final_lr
@@ -179,14 +182,15 @@ def build_plot_config(args, train_data, val_data, final_superbatch):
     import plot
 
     initial_lr, final_lr = resolve_lr_bounds(args)
+    wdl_start, wdl_end = effective_wdl(args)
 
     return plot.PlotConfig(
         initial_lr=initial_lr,
         final_lr=final_lr,
         final_superbatch=final_superbatch,
 
-        wdl_start=args.wdl_start if args.wdl_start is not None else 0.25,
-        wdl_end=args.wdl_end if args.wdl_end is not None else 0.25,
+        wdl_start=wdl_start,
+        wdl_end=wdl_end,
 
         batch_size=args.batch_size if args.batch_size is not None else 16_384,
         batches_per_superbatch=args.batches if args.batches is not None else 6104,
@@ -208,20 +212,48 @@ def build_plot_config(args, train_data, val_data, final_superbatch):
 def local_script(example: str) -> str | None:
     """nnue/<example>.rs if the example is one of san-jacinto's training scripts."""
     path = os.path.join(NNUE_SJ_ROOT, f"{example}.rs")
-    return path if os.path.isfile(path) and os.path.isfile(NNUE_MANIFEST) else None
+    return path if os.path.isfile(path) else None
+
+
+# `env_f32("wdl_start", 0.0)`, `env_string("net_id", "...")`: a setting's literal default in a script.
+_ENV_DEFAULT = re.compile(
+    r'\benv_\w+\(\s*"(?P<key>\w+)"\s*,\s*(?:"(?P<text>[^"]*)"|(?P<number>[-+]?[\d_]*\.?[\d_]+(?:[eE][-+]?\d+)?))\s*\)')
+
+
+def script_defaults(example: str) -> dict:
+    """Literal defaults of the env settings of nnue/<example>.rs, e.g. {"wdl_start": 0.0, "net_id": "..."}.
+
+    The scripts are the source of truth for their defaults; settings given as an
+    expression (lr_final) are left out, and so is everything for bullet's own examples.
+    """
+    path = local_script(example)
+    if path is None:
+        return {}
+    try:
+        with open(path, encoding="utf-8") as f:
+            source = f.read()
+    except OSError:
+        return {}
+    source = re.sub(r"/\*.*?\*/", "", source, flags=re.S)
+    source = re.sub(r"//[^\n]*", "", source)
+    defaults = {}
+    for match in _ENV_DEFAULT.finditer(source):
+        if match["text"] is not None:
+            value = match["text"]
+        else:
+            number = match["number"].replace("_", "")
+            try:
+                value = float(number) if any(c in number for c in ".eE") else int(number)
+            except ValueError:
+                continue
+        defaults.setdefault(match["key"], value)
+    return defaults
 
 
 def build_command(args) -> list:
-    if local_script(args.example):
-        # nnue/Cargo.toml builds nnue/*.rs against libs/bullet. Seed its lock file from
-        # the fork's, so the dependencies are the versions the fork was tested with.
-        lock = os.path.join(NNUE_SJ_ROOT, "Cargo.lock")
-        bullet_lock = os.path.join(BULLET_ROOT, "Cargo.lock")
-        if not os.path.exists(lock) and os.path.exists(bullet_lock):
-            shutil.copy2(bullet_lock, lock)
-        cmd = ["cargo", "run", "--release", "--manifest-path", NNUE_MANIFEST, "--bin", args.example]
-    else:
-        cmd = ["cargo", "run", "--release", "--example", args.example]
+    # The fork registers nnue/v2.rs and nnue/v3.rs as bullet_lib examples, so every
+    # script, ours or bullet's, is a cargo example run from libs/bullet.
+    cmd = ["cargo", "run", "--release", "--example", args.example]
     if args.features:
         cmd += ["--features", args.features]
     return cmd
@@ -309,11 +341,50 @@ _ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 _SAVED = re.compile(r"Saved \[(.+)-(\d+)\]")
 
 
+FALLBACK_WDL = 0.25  # for bullet's own examples, whose defaults train.py does not read
+FALLBACK_NET_ID = "1024x16x32_25wdl"
+
+# Windows refuses to rename or delete a directory while any process has a file in it open
+# (WinError 5 "Access is denied"; 32, a sharing violation; 145, "directory not empty" for a file
+# deleted while open), and os.replace cannot rename onto an existing directory. An antivirus or the
+# search indexer opening the files just written (best.json, new hard links) does that for a moment,
+# longer when the machine is busy, so the best-checkpoint renames are retried there.
+_TRANSIENT_WINERRORS = (5, 32, 145)
+
+
+def retry_on_windows(action, *args, attempts: int = 12, delay: float = 0.05):
+    """action(*args), retried for a few seconds on Windows while it fails with a transient lock error."""
+    for attempt in range(attempts):
+        try:
+            return action(*args)
+        except OSError as exc:
+            if os.name != "nt" or getattr(exc, "winerror", None) not in _TRANSIENT_WINERRORS \
+                    or attempt == attempts - 1:
+                raise
+            time.sleep(min(delay * 2 ** attempt, 0.5))
+
+
+def _remove_tree(path: str) -> None:
+    if os.path.lexists(path):
+        shutil.rmtree(path)
+
+
 def effective_wdl(args) -> tuple[float, float]:
-    """WDL start/end as the training scripts see them (their default is a constant 0.25)."""
-    start = args.wdl_start if args.wdl_start is not None else 0.25
-    end = args.wdl_end if args.wdl_end is not None else 0.25
-    return start, end
+    """WDL start/end of the run: --wdl-start/--wdl-end, else the wdl_start/wdl_end environment
+    variables (which the script would read too), else the script's own defaults (nnue/<example>.rs)."""
+    defaults = script_defaults(args.example)
+
+    def resolve(flag, key):
+        if flag is not None:
+            return float(flag)
+        for value in (os.environ.get(key), defaults.get(key)):
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                continue
+        return FALLBACK_WDL
+
+    return resolve(args.wdl_start, "wdl_start"), resolve(args.wdl_end, "wdl_end")
 
 
 class BestTracker:
@@ -359,7 +430,7 @@ class BestTracker:
             print(f"[train] continuing best tracking: {self.best_loss:.6f} at superbatch {self.best_superbatch}")
         else:
             stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            os.replace(self.best_dir, f"{self.best_dir}_previous_{stamp}")
+            retry_on_windows(os.replace, self.best_dir, f"{self.best_dir}_previous_{stamp}")
             print(f"[train] earlier best/ was for other settings; kept as best_previous_{stamp}")
 
     def on_line(self, line: str) -> None:
@@ -404,8 +475,10 @@ class BestTracker:
             json.dump(dict(net_id=self.net_id, superbatch=superbatch, val_loss=loss, val_data=self.val_data,
                            wdl=list(self.wdl), checkpoint=f"{self.net_id}-{superbatch}",
                            saved=datetime.now().isoformat(timespec="seconds")), f, indent=2)
-        shutil.rmtree(self.best_dir, ignore_errors=True)
-        os.replace(staging, self.best_dir)
+        # the old best goes first (os.replace cannot overwrite a directory); a failure is raised, not
+        # ignored, as the rename would then fail anyway
+        retry_on_windows(_remove_tree, self.best_dir)
+        retry_on_windows(os.replace, staging, self.best_dir)
         self.best_loss, self.best_superbatch = loss, superbatch
 
     def _prune(self, superbatch: int) -> None:
@@ -655,7 +728,8 @@ def run_stage(
 def main() -> int:
     p = argparse.ArgumentParser(description="Launch + visualise a bullet training run.")
     p.add_argument("--example", default="v3",
-                   help="training script: nnue/<name>.rs (v2, v3) or a bullet workspace example")
+                   help="cargo example run in libs/bullet: v2/v3 are nnue/v2.rs and nnue/v3.rs "
+                        "(registered by the fork); other names are bullet's own examples")
     p.add_argument("--features", default=None, help="cargo features, e.g. cuda / rocm / metal")
 
     # tuning control
@@ -666,15 +740,18 @@ def main() -> int:
                         "e.g. 200 400 800 (default: 800 per stage)")
     p.add_argument("--lr_start", type=float, default=None)
     p.add_argument("--lr_final", type=float, default=None)
-    p.add_argument("--wdl-start", type=float, default=None)
-    p.add_argument("--wdl-end", type=float, default=None)
+    p.add_argument("--wdl-start", type=float, default=None,
+                   help="WDL blend at superbatch 1 (default: $wdl_start, else the script's own default)")
+    p.add_argument("--wdl-end", type=float, default=None,
+                   help="WDL blend at the last superbatch (default: $wdl_end, else the script's own default)")
     p.add_argument("--reset-optimiser", action="store_true",
                    help="at each stage boundary / resume, load only the weights (fresh AdamW moments)")
     p.add_argument("--no-best", action="store_true",
                    help="do not keep the lowest-validation state in <net>/best/ (tracked only with a constant WDL)")
 
     # data
-    p.add_argument("--net-id", default=os.environ.get("net_id", "1024x16x32_25wdl"))
+    p.add_argument("--net-id", default=None,
+                   help="run name and checkpoint prefix (default: $net_id, else the script's net_id)")
     p.add_argument("--output-dir", default="checkpoints",
                    help="output root; each net writes to <output-dir>/<net-id>/")
     p.add_argument(
@@ -720,6 +797,12 @@ def main() -> int:
     p.add_argument("--no-register", action="store_true",
                    help="do not add the run's checkpoints to the net registry when training finishes")
     args = p.parse_args()
+    # Settings train.py needs itself are resolved here and always passed to the script,
+    # with the script's own defaults (nnue/<example>.rs) as the defaults.
+    if args.net_id is None:
+        args.net_id = (os.environ.get("net_id") or script_defaults(args.example).get("net_id")
+                       or FALLBACK_NET_ID)
+    args.wdl_start, args.wdl_end = effective_wdl(args)
     if args.superbatch_start < 1 or any(n < 1 for n in args.superbatches):
         p.error("--superbatch-start and --superbatches must be positive")
     if (not args.net_id or args.net_id in (".", "..", "plot_history")
@@ -752,9 +835,13 @@ def main() -> int:
         print("[train] no dataset files resolved from --train-data")
         return 2
 
-    if not local_script(args.example):
-        print(f"[train] nnue/{args.example}.rs not found; running '{args.example}' as a bullet "
-              "workspace example (it must be registered in libs/bullet)")
+    script = local_script(args.example)
+    if script:
+        print(f"[train] training script: {script} (cargo example '{args.example}' of libs/bullet)")
+    else:
+        print(f"[train] nnue/{args.example}.rs not found; running '{args.example}' as one of bullet's own "
+              "examples (registered in libs/bullet/crates/bullet_lib/Cargo.toml); it ignores train.py's settings "
+              "unless it reads them from the environment")
 
     # stage lengths
 
@@ -778,8 +865,8 @@ def main() -> int:
         f"[train] global LR schedule: {initial_lr:g} -> {final_lr:g} "
         f"over superbatches 1-{final_superbatch} (continuous across stages)"
     )
-    if args.wdl_start is not None or args.wdl_end is not None:
-        print(f"[train] global WDL taper: {args.wdl_start} -> {args.wdl_end} over superbatches 1-{final_superbatch}")
+    print(f"[train] global WDL blend: {args.wdl_start:g} -> {args.wdl_end:g} over superbatches 1-{final_superbatch}"
+          + ("" if args.wdl_start != args.wdl_end else " (constant)"))
 
     val_stages: list
     if val_resolved is None:

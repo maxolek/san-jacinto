@@ -111,7 +111,7 @@ the real ETL. They then run the pipeline without Stockfish, the public export
 and the migrations. From the repository root:
 
 ```sh
-python -m unittest discover -s data -p "test_*.py"
+python -m unittest discover -s data -t . -p "test_*.py"
 ```
 
 They cover:

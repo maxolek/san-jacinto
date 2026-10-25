@@ -30,4 +30,15 @@ SELECT
     (nodes + qnodes) / NULLIF(LAG(nodes + qnodes) OVER (PARTITION BY search_id ORDER BY depth asc), 0) as ebf,
     qnodes / NULLIF(LAG(qnodes) OVER (PARTITION BY search_id ORDER BY depth asc), 0) as qebf
 
-FROM search_tree_stats
+FROM (
+    -- pvs_researches: the count older builds log, else the sum of the three kinds newer builds log
+    -- when any was logged, else NULL (as in search_metrics.sql)
+    SELECT * REPLACE (coalesce(pvs_researches,
+               CASE WHEN pvs_researches_depth IS NOT NULL OR pvs_researches_full IS NOT NULL
+                         OR pvs_researches_root IS NOT NULL
+                    THEN coalesce(pvs_researches_depth, 0) + coalesce(pvs_researches_full, 0)
+                         + coalesce(pvs_researches_root, 0) END) AS pvs_researches)
+    FROM (SELECT * FROM search_tree_stats UNION ALL BY NAME
+          SELECT NULL::BIGINT AS pvs_researches_depth, NULL::BIGINT AS pvs_researches_full,
+                 NULL::BIGINT AS pvs_researches_root WHERE false)
+)

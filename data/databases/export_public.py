@@ -87,11 +87,10 @@ def _stage(source, staging):
         s.execute('BEGIN TRANSACTION')
         try:
             for table in STAGING_TABLES:
-                # pvs_researches as the views and aggs derive it: it is published, its kinds are not
+                # pvs_researches as the views and aggregates derive it: it is published, its kinds are not
                 source_sql = (with_pvs_researches(f'source.main."{table}"') if table in PVS_RESEARCH_TABLES
                               else f'SELECT * FROM source.main."{table}"')
                 s.execute(f'CREATE TABLE "{table}" AS {source_sql}')
-                
             # Stockfish's analysis is optional (databases the pipeline built before it have none);
             # only the positions of the copied searches are kept.
             s.execute(STOCKFISH_MOVES_DDL)

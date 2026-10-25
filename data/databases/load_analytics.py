@@ -46,8 +46,8 @@ TERMINATION_NAMES = {
 # SQLite types of the shared column sets -> the types DuckDB's SQLite scanner reports.
 _DUCKDB_TYPES = {"TEXT": "VARCHAR", "INTEGER": "BIGINT", "REAL": "DOUBLE"}
 
-# sprt columns read as DOUBLE whatever their declared type: older databases
-# declare the measured elo_diff and elo0/elo1 as INTEGER but hold REAL values.
+# sprt columns read as DOUBLE whatever their declared type: the raw database declares
+# the measured elo_diff and elo0/elo1 as INTEGER (init_raw_db) but holds REAL values.
 SPRT_DOUBLE_COLUMNS = {
     "elo0", "elo1", "alpha", "beta", "elo_diff", "llr", "los", "time_per_move", "run_time_s",
     *(name for name, sql_type in SPRT_PENTANOMIAL_COLUMNS if sql_type == "REAL"),

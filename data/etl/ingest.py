@@ -307,8 +307,11 @@ def ingest_all_log_dirs(cnxn):
 # Experiment management
 # ─────────────────────────────────────────────────────────────────────────────
 
-def start_experiment(cnxn, experiment, engine_id, comparison_engine_id=None, info=None):
-    """Start an experiment and return its ID."""
+def start_experiment(cnxn, experiment, engine_id, comparison_engine_id=None, info=None, commit=True):
+    """Start an experiment and return its ID.
+
+    commit=False leaves the row in the caller's open transaction.
+    """
     cursor = cnxn.cursor()
     cursor.execute(
         """
@@ -317,13 +320,14 @@ def start_experiment(cnxn, experiment, engine_id, comparison_engine_id=None, inf
         """,
         (engine_id, experiment, comparison_engine_id, info)
     )
-    cnxn.commit()
+    if commit:
+        cnxn.commit()
     cursor.execute("SELECT last_insert_rowid()")
     return cursor.fetchone()[0]
 
 
-def update_experiment(cnxn, experiment_id, info=None):
-    """Update experiment metadata columns."""
+def update_experiment(cnxn, experiment_id, info=None, commit=True):
+    """Update experiment metadata columns. commit=False leaves the update in the caller's open transaction."""
     if not info:
         return
 
@@ -338,7 +342,8 @@ def update_experiment(cnxn, experiment_id, info=None):
 
     cur = cnxn.cursor()
     cur.execute(sql, values)
-    cnxn.commit()
+    if commit:
+        cnxn.commit()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -510,12 +515,12 @@ def bulk_log_match_games(cnxn, run_dir, experiment_id, engine_ids, commit=True) 
     the opening, the moves from the run's PGN, and the environment: logical cpu,
     P/E core type, measured clock, host and CPU model. `engine_ids` maps the
     engine names used in the run (e.g. Candidate, Baseline) to engine ids.
-    commit=False leaves the rows in the callers open transaction
+    commit=False leaves the rows in the caller's open transaction.
     Returns {(run_id, run_game): games.id}.
     """
     from .match_games import game_rows
 
-    ensure_schema(cnxn) # before any row: applying a migration commits an open transaction
+    ensure_schema(cnxn)  # before any row: applying a migration commits an open transaction
     rows = game_rows(run_dir, engine_ids, experiment_id)
     if not rows:
         return {}
@@ -531,7 +536,8 @@ def bulk_log_match_games(cnxn, run_dir, experiment_id, engine_ids, commit=True) 
         cur = cnxn.execute(f"INSERT INTO games ({', '.join(columns)}) VALUES ({placeholders})",
                            [row[c] for c in columns])
         mapping[(row["run_id"], row["run_game"])] = cur.lastrowid
-    if commit: cnxn.commit()
+    if commit:
+        cnxn.commit()
     return mapping
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -603,13 +609,15 @@ def bulk_log_game(cnxn, path, experiment_id=None, second_engine_id=None, engine_
     its records are attributed to it instead of being looked up by version string.
     engine_ids_by_version ({version: engine id}) attributes records exactly when several
     builds share a version (e.g. a release's DEV and Prod builds).
+    skip_uuids: games stored already (e.g. linked to the match runner's record of the
+    played game); they get no row and are not in the returned mapping.
+    source: the games.source label of the new rows (e.g. 'engine'), where the column exists.
     commit=False leaves the rows in the caller's open transaction.
-    skip_uuids: games stored already (e.g. linked to the match runners record of the game)
-        they get no row and are not in the returned mapping
-    source: the games.source label of the new rows (e.g. 'engine'), where the column exists
     """
     cursor = cnxn.cursor()
     passthrough = _PassThrough(cnxn, "games", GAME_COLUMNS)
+    skip_uuids = set(skip_uuids or ())
+    labels = {"source": source} if source is not None and "source" in passthrough.types else {}
 
     # first pass: collect all records grouped by game_uuid
     game_records = {} # game_uuid -> list of record dicts
@@ -617,7 +625,8 @@ def bulk_log_game(cnxn, path, experiment_id=None, second_engine_id=None, engine_
 
     for data in _iter_json_objects_from_path(path):
         uuid = data['game_uuid']
-        if uuid in skip_uuids: continue
+        if uuid in skip_uuids:
+            continue
         if uuid not in game_records:
             game_records[uuid] = []
             game_order.append(uuid)
@@ -650,7 +659,7 @@ def bulk_log_game(cnxn, path, experiment_id=None, second_engine_id=None, engine_
             black_engine_id = second_engine_id
 
         stored, extra = passthrough.split(
-            {f: v for f, v in primary.items() if f not in GAME_FIELDS and f not in LINK_FIELDS})
+            {**{f: v for f, v in primary.items() if f not in GAME_FIELDS and f not in LINK_FIELDS}, **labels})
         rows.append(((
             experiment_id,
             white_engine_id,

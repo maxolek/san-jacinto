@@ -39,6 +39,28 @@ VIEW_INPUT_COLUMNS = {
     ),
 }
 
+# PVS re-searches. Older Tomahawk builds log one count, pvs_researches; newer ones log three
+# kinds instead (re-search at full depth after an LMR reduction, full-window interior,
+# full-window root) and leave pvs_researches NULL. pvs_researches then means the count, else
+# the kinds' sum when any was logged, else NULL (not measured is not 0): the views spell it out
+# (sql/search_metrics.sql, search_iteration_metrics.sql, search_tree_features.sql), and the public
+# export publishes it through with_pvs_researches. The kinds themselves are not published.
+PVS_RESEARCH_KINDS = ("pvs_researches_depth", "pvs_researches_full", "pvs_researches_root")
+PVS_RESEARCH_TABLES = ("search_stats", "iterative_deepening_stats", "search_tree_stats")
+
+
+def with_pvs_researches(relation):
+    """SQL selecting `relation` (a table) with pvs_researches derived as above.
+
+    It binds whether or not the table has the kinds' columns (UNION BY NAME adds them as
+    NULL), e.g. on analytics databases loaded before the raw database had them.
+    """
+    measured = " OR ".join(f"{kind} IS NOT NULL" for kind in PVS_RESEARCH_KINDS)
+    total = " + ".join(f"coalesce({kind}, 0)" for kind in PVS_RESEARCH_KINDS)
+    kinds = ", ".join(f"NULL::BIGINT AS {kind}" for kind in PVS_RESEARCH_KINDS)
+    return (f"SELECT * REPLACE (coalesce(pvs_researches, CASE WHEN {measured} THEN {total} END) "
+            f"AS pvs_researches) FROM (SELECT * FROM {relation} UNION ALL BY NAME SELECT {kinds} WHERE false)")
+
 
 def _table_kind(cnxn, name):
     kind = cnxn.execute("""

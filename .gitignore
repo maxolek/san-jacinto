@@ -5,6 +5,7 @@ __pycache__/
 
 # etc
 .DS_Store
+*.aider*
 
 # Logs
 logs/
@@ -13,11 +14,6 @@ logs/
 # nnue training
 /nnue/checkpoints/
 /nnue/training_data/
-/nnue/target/
-/nnue/hpo/
-
-# benchmark builds and results
-/benchmarks/out/
 
 # Virtual environments
 .venv/

@@ -13,6 +13,8 @@ SNAPSHOT_INFO = "snapshot_info"   # (key, value): schema_version, profile, expor
 SNAPSHOT_INFO_COLUMNS = ("key", "value")
 
 _FH_INDEX = ("fh_index_0", "fh_index_1", "fh_index_2", "fh_index_3", "fh_index_4to7", "fh_index_8plus")
+# pvs_researches is derived for builds that log three kinds of re-search instead
+# (transform_search.with_pvs_researches); the kinds are not published.
 _PRUNING = ("see_prunes", "delta_prunes", "pvs_researches", "nmp", "nmp_failhigh")
 
 # Small tables, published in every snapshot.

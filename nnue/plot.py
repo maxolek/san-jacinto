@@ -36,8 +36,8 @@ from typing import Dict, List, Tuple
 
 # Also support direct execution: python nnue/plot.py ...
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-# matplotlib is imported inside the drawing functions only
-# so the log loading used by nnue/registery works without it
+# matplotlib is imported inside the drawing functions only, so the log loading
+# (load_checkpoint_logs, used by nnue/registry.py) works without it.
 from utils.plotting import PALETTE, TEAL, enable_hover, style_dashboard
 
 
@@ -179,7 +179,8 @@ def _read_loss_log(path: str) -> List[Tuple[int, int, float]]:
 
 
 def checkpoint_dirs(directory: str) -> Dict[int, str]:
-    """{superbatch: path} of the `<net_id>-<superbatch>` checkpoints in a net's directory."""
+    """{superbatch: path} of the `<net_id>-<superbatch>` checkpoints in a net's directory
+    (not train.py's best-validation folders, e.g. best_<val set>, whose name can end in -<digits>)."""
     out: Dict[int, str] = {}
     try:
         names = os.listdir(directory)

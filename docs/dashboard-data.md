@@ -4,7 +4,7 @@ Shared by the pipeline and the dashboard.
 
 - **Python side** (pipeline): `data/databases/*`, `data/transforms/*`.
 - **Browser side** (dashboard): `data/dashboard/*`.
-- **Ingestion**: `data/etl/ingest.py`, `data/etl/environment.py`, `tests/sprt.py`.
+- **Ingestion**: `data/etl/ingest.py`, `data/etl/match_games.py`, `utils/environment.py`, `tests/sprt.py`.
 
 Sections 1–3 are the agreed contract. Section 3 also lists the exact columns of
 every pre-aggregated table. Sections 4 and 5 describe the public snapshot and
@@ -15,9 +15,11 @@ databases.
 
 ## 1. Raw SQLite additions
 
-These columns are in the `CREATE TABLE` statements of `init_raw_db.py`.
-Existing databases get them from migrations in `migrate_schema.py`:
-`2026_09_28_games_match_environment` and `2026_09_28_sprt_pentanomial`. Run
+These columns come from migrations in `migrate_schema.py`:
+`2026_09_28_games_match_environment` and `2026_09_28_sprt_pentanomial` (the base
+`CREATE TABLE`s in `init_raw_db.py` are frozen; see
+[databases.md](databases.md#how-the-schema-changes)). Every program that writes
+to the raw database applies them first; to apply them by hand run
 `python -m data.databases.migrate_schema`, or `python -m data.databases.init_raw_db`,
 which also migrates.
 
@@ -25,7 +27,7 @@ which also migrates.
 
 | Column | Meaning |
 |---|---|
-| `source` TEXT | `'engine'` (engine log) or `'match'` (match-runner record, which has the authoritative result) |
+| `source` TEXT | `'match'`: a game the match runner played, with the authoritative result. `'engine'`: a game known only from an engine's own log (an SPRT's engine games that match no played game). NULL for older rows and for engine logs loaded outside an SPRT. |
 | `run_id` TEXT | Match-runner run directory name, e.g. `20260928_101129_354256` |
 | `run_game` INTEGER | Game number within the run (SPRT numbering; pairs are (1,2), (3,4), …) |
 | `pair_index` INTEGER | 1-based opening pair within the run |
@@ -43,12 +45,13 @@ Integer result and termination codes:
 
 - **result**: 1 white, 2 black, 3 draw. 0 (ongoing) and 4 (aborted) become NULL.
 - **termination**: 1 checkmate, 2 stalemate, 3 threefold, 4 fiftymove, 5 time,
-  6 resign, 7 adjudication (including the move limit), 8 insufficient_material,
+  6 resign, 7 adjudication (including the move limit, which fastchess reports
+  as "Draw by adjudication", and tablebase adjudication), 8 insufficient_material,
   9 illegal_move, 10 crash (disconnect or stall).
 
-`sprt` (all nullable). `elo_diff` stays the **measured** Elo. New databases
-declare `elo0`, `elo1` and `elo_diff` as REAL. Older ones declare them INTEGER,
-and the loader reads them as DOUBLE anyway.
+`sprt` (all nullable). `elo_diff` stays the **measured** Elo. The base table
+declares `elo0`, `elo1` and `elo_diff` INTEGER, but they hold REAL values (SQLite
+keeps them), and the loader reads them as DOUBLE.
 
 - Counts: `pairs`, `penta_ll`, `penta_ld`, `penta_dd`, `penta_wl`, `penta_wd`, `penta_ww` INTEGER
 - Statistics: `score`, `elo_low`, `elo_high`, `nelo`, `nelo_low`, `nelo_high`, `draw_ratio`, `variance_ratio` REAL
@@ -64,7 +67,7 @@ match-runner experiments. It is not published.
 `load_analytics` creates these tables:
 
 - **`game_stats`**
-  - Every `games` column above except `opening`.
+  - Every raw `games` column (those above included) except `opening`.
   - `result` decoded to `'white'`, `'black'`, `'draw'` or NULL.
   - `termination` decoded to `'checkmate'`, `'stalemate'`, `'threefold'`,
     `'fiftymove'`, `'time'`, `'resign'`, `'adjudication'`,
@@ -101,6 +104,12 @@ match-runner experiments. It is not published.
     searched a different move than the one asked for.
   - `sf_eval_pov = 'stm'` marks the convention. Values stored from White's view
     by older versions are converted once by `transform_positions`.
+  - PVS re-searches: older engine builds log one count, `pvs_researches`;
+    newer ones log three kinds instead (`pvs_researches_depth`, `_full`,
+    `_root`) and leave it NULL. The views (`total_pvs_researches`,
+    `pvs_researches`), the `pvs_research_rate` aggregates and the public
+    snapshots use the count, else the kinds' sum when any was logged, else
+    NULL. The kinds are not published.
 - **`stockfish_moves`**: Stockfish's analysis per position, created by
   `transform_positions` (not by `load_analytics`). One row per (position, move):
   - `fen`, `move` (UCI), `rank` (Stockfish's line, 1 = best; NULL for an engine
@@ -405,10 +414,16 @@ is deterministic: the order is a fixed hash of the search id.
 A snapshot always contains:
 
 - **The small tables, allow-listed columns only.**
-  - `engines`: no `description` or `compile_flags`, which can contain local paths.
+  - `engines`: id, name, version and the UCI/search options. No `description`
+    or `compile_flags`, which can contain local paths, and none of the build
+    provenance (`engine_key`, `binary_sha256`, `binary_path`, `net_sha256`,
+    `net_path`, `git_commit`, `git_branch`, `git_dirty`, `build_type`,
+    `provenance`).
   - `experiments`: no `metadata`.
-  - `game_stats`: no `moves` or `start_fen`.
-  - `engine_ratings`, `sprt_runs`, `sts_runs`: all columns.
+  - `game_stats`: no `moves` or `start_fen` (nor `plies` or `extra_fields`).
+  - `engine_ratings`: all columns. `sprt_runs`, `sts_runs`: all columns except
+    the October 2026 node and thread settings (`nodes_per_move`, `threads`,
+    `search_nodes`), which are not on the allow-list.
 - Every `agg_*` table and `search_sample`, rebuilt from the snapshot's own data.
 - `snapshot_info(key, value)`, with the keys `schema_version`, `profile`
   (`'lite'` or `'full'`), `exported_at`, `searches` and `sample_rows`.
@@ -456,7 +471,7 @@ Storage format:
   - It checks the relations and columns in this document.
   - Public snapshots must match the allow-list exactly: no extra relations or
     columns, and no forbidden columns.
-- **Tests**: `python -m unittest discover -s data -p "test_*.py"`. These build
+- **Tests**: `python -m unittest discover -s data -t . -p "test_*.py"`. These build
   a synthetic raw database from generated logs, then run the pipeline without
   Stockfish (and once more with a fake UCI engine standing in for it), the
   exports and the migrations.

@@ -7,8 +7,17 @@ default (candidate vs each opponent), --round-robin also plays the opponents
 against each other. Every pairing's result (W/D/L and pentanomial counts) is
 stored in match_results, and the ratings of all engines are refitted from every
 stored tournament game (data/ratings.py: one maximum-likelihood fit with 95%
-intervals, anchored at the oldest engine). This replaces per-run K-factor
+intervals, anchored at the previous fit's anchor engine and Elo, so the scale
+stays put from fit to fit; the first fit, or one whose anchor has no games, starts
+from the oldest engine of the largest connected group). This replaces per-run K-factor
 updates, whose results depended on the order games were played in.
+
+The games are played on the match runner (utils/fixed_match.py): one game per
+physical core at a time (--concurrency, default every physical core but one), the
+game's fastchess process and engines pinned to its core (--no-pin leaves placement
+to the OS), every game recorded with its core type, cpu and measured clock. The
+pairings of a time control are played together, interleaved, so a drift of the
+machine favours none of them.
 
 The report shows this run's pairings (pentanomial Elo with 95% interval) and the
 version history: each engine's rating and its gain over the previous version.
@@ -27,25 +36,47 @@ Time control categories:
   - classical:  >= 30 min/game   (default: 30:00+10)
 Short and long time controls in one run: --tc bullet rapid.
 
+Each time control is one run, stored as one experiment (type 'tournament') in one
+transaction (all of it or, if storing fails, none): every
+played game (games, source 'match', with its core type, cpu and clock), each
+pairing's result (match_results, source 'tournament', the middle pentanomial bin
+split into DD and WL), then the rating refit. With --log also the engines'
+telemetry: each engine logs into its own folder <logroot>/<run>/<engine name>/,
+is attributed to its own build and linked to the games it played
+(data/etl/telemetry.py); the run's ids (<logroot>/<run>/engines.json) are written as
+soon as it is stored, so telemetry that fails to load (or is not loaded because the
+refit or the process failed) is kept for `--retry-ingest <logroot>/<run>`.
+
+Results go to <results-dir>/<time>/ (default logs/tournament_results): the games of
+each time control as <category>.pgn (tests/mistakes.py mines them) and its run
+folder <time>_<category>/ (games.jsonl, games.pgn, config.json, summary.json, jobs/).
+A time control that cannot be completed (failing jobs, too many excluded pairs,
+Ctrl-C) stores nothing and ends the tournament with an error
+(utils.fixed_match.MatchStopped, a RuntimeError, or MatchInterrupted, a
+KeyboardInterrupt); the time controls before it stay stored.
+
 Usage (standalone):
   python -m tests.tournament --engine engines/1.0.exe --tc blitz --games 100
+  python -m tests.tournament --retry-ingest logs/tournament_logs/20261025_101129_354256_blitz
 
 Called from release.py as:
   tournament.run_tournament(args, cnxn, engine_id)
 """
 import argparse
-import os
-import subprocess
+import json
+import math
+import shutil
 import sqlite3
-import platform
-from pathlib import Path
+import sys
 from datetime import datetime, timezone
-from data import etl, ratings
-from utils import cpu_slots
-from utils.fastchess_match import FASTCHESS, book_args, tb_args
-from utils.pentanomial import FINISHED_GAME, estimate
+from itertools import combinations
+from pathlib import Path
 
-system = platform.system()
+from data import etl, ratings
+from utils.fastchess_match import FASTCHESS, tb_args
+from utils.fixed_match import Pairing, run_fixed_match
+from utils.match_runner import EngineSpec, tc_arguments
+from utils.openings import OpeningBook
 
 TESTS_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = TESTS_DIR.parent
@@ -55,6 +86,10 @@ ENGINES_DEV_DIR = ENGINES_DIR / "dev"
 ENGINES_PROD_DIR = ENGINES_DIR / "prod"
 LOGS_DIR = PROJECT_ROOT / "logs"
 TOURNAMENT_LOG_DIR = LOGS_DIR / "tournament_logs"
+RESULTS_DIR = LOGS_DIR / "tournament_results"
+DEFAULT_BOOK = PROJECT_ROOT / "bin" / "opening_books" / "8moves_v3.pgn"
+BOOK_PLIES = 16
+MAX_MOVES = 200  # fastchess -maxmoves: a longer game is adjudicated a draw
 
 # Default time controls per category
 TC_DEFAULTS = {
@@ -66,7 +101,6 @@ TC_DEFAULTS = {
 }
 
 classify_tc = ratings.classify_tc
-RESULTS = ("1-0", "0-1", "1/2-1/2")
 SKIP_VERSIONS = {"dev", "test", "debug", "tomahawk"}  # temporary builds, never "earlier versions"
 
 
@@ -164,138 +198,141 @@ def engine_names(opponents):
                             for o in opponents]
 
 
-def pairing_results(output, names):
-    """Per pairing (a, b) with a listed before b in `names`: a's W/D/L and pentanomial counts.
+def pairs_per_pairing(games):
+    """Opening pairs each pairing plays for `games` games: whole pairs (rounded up), at least one."""
+    pairs = max(1, math.ceil(games / 2))
+    if 2 * pairs != games:
+        print(f"[TOURNAMENT] Playing {2 * pairs} games per pairing (complete opening pairs), not {games}")
+    return pairs
 
-    fastchess numbers a pairing's two games of one opening 2k+1 and 2k+2 (colours
-    reversed); only complete pairs enter the pentanomial counts.
+
+def make_pairings(engines, pairs, round_robin=False):
+    """Gauntlet: the first engine (the candidate) against each other one; round robin: every two engines.
+
+    The engine listed first is a pairing's first engine: White in the first game of each
+    pair, and engine a of its match_results row (its wins, draws and losses).
     """
-    order = {name: i for i, name in enumerate(names)}
-    games = {}
-    for line in output.splitlines():
-        match = FINISHED_GAME.search(line)
-        if match and match.group(4) in RESULTS and match.group(2) in order and match.group(3) in order:
-            games[int(match.group(1))] = (match.group(2), match.group(3), match.group(4))
-    stats = {}
-
-    def score(game, player):
-        white, black, result = game
-        points = {"1-0": 1.0, "0-1": 0.0, "1/2-1/2": 0.5}[result]
-        return points if player == white else 1.0 - points
-
-    for white, black, result in games.values():
-        a, b = sorted((white, black), key=order.get)
-        entry = stats.setdefault((a, b), dict(wins=0, draws=0, losses=0, penta=[0] * 5))
-        s = score((white, black, result), a)
-        entry["wins" if s == 1 else "draws" if s == 0.5 else "losses"] += 1
-    for number in games:
-        if number % 2 == 1 and number + 1 in games:
-            first, second = games[number], games[number + 1]
-            if {first[0], first[1]} == {second[0], second[1]} and first[0] != second[0]:
-                a, b = sorted((first[0], first[1]), key=order.get)
-                stats[(a, b)]["penta"][round(2 * (score(first, a) + score(second, a)))] += 1
-    return stats
+    if round_robin:
+        return [Pairing(a, b, pairs) for a, b in combinations(engines, 2)]
+    return [Pairing(engines[0], other, pairs) for other in engines[1:]]
 
 
-def parse_tournament_output(output, engine_names):
-    """Pairwise results in both orientations: {nameA: {nameB: {"wins", "losses", "draws"}}}."""
-    pairwise = {name: {} for name in engine_names}
-    for (a, b), r in pairing_results(output, engine_names).items():
-        pairwise[a][b] = dict(wins=r["wins"], losses=r["losses"], draws=r["draws"])
-        pairwise[b][a] = dict(wins=r["losses"], losses=r["wins"], draws=r["draws"])
-    return pairwise
+def opponents_in(pairings):
+    """{engine name: the name of its only opponent in `pairings`, or None if it has several}."""
+    seen = {}
+    for p in pairings:
+        seen.setdefault(p.first.name, set()).add(p.second.name)
+        seen.setdefault(p.second.name, set()).add(p.first.name)
+    return {name: next(iter(others)) if len(others) == 1 else None for name, others in seen.items()}
 
 
-def run_fastchess_tournament(candidate_path, opponents, tc, games_per_pair, fastchess, concurrency = 2, book=None,
-                             affinity=(), round_robin=False, extra=(), pgn_path=None):
-    """Run candidate vs all opponents using fastchess.
-
-    `affinity`: fastchess options pinning each game to its own cpu (cpu_slots.fastchess_args).
-    `pgn_path`: where the games go (default: the log folder, which is cleared after ingestion).
-    Returns (raw stdout text, engine names).
-    """
-    TOURNAMENT_LOG_DIR.mkdir(parents=True, exist_ok=True)
-    names = engine_names(opponents)
-    engine_blocks = []
-    for name, path in zip(names, [candidate_path] + [o["path"] for o in opponents]):
-        engine_blocks += ["-engine", f"name={name}", f"cmd={os.path.abspath(path)}",
-                          f"dir={os.path.dirname(os.path.abspath(path))}"]
-
-    # fastchess plays every opening twice with colors reversed (-games 2), so the
-    # per-pair game count is set through -rounds; it cannot exceed 2 per round.
-    rounds = max(1, -(-games_per_pair // 2))
-    if 2 * rounds != games_per_pair:
-        print(f"[TOURNAMENT] Playing {2 * rounds} games per opponent (complete opening pairs), "
-              f"not {games_per_pair}")
-
-    schedule = ["-tournament", "roundrobin"] if round_robin else ["-tournament", "gauntlet", "-seeds", "1"]
-    cmd = [
-        str(fastchess),
-        # fastchess saves a resume file on exit; keep it out of the cwd
-        "-config", f"outname={TOURNAMENT_LOG_DIR / 'fastchess.json'}",
-    ] + engine_blocks + [
-        "-each", "proto=uci", f"tc={tc}",
-        *schedule,
-        "-games", "2",
-        "-rounds", str(rounds),
-        "-maxmoves", "200",
-        "-concurrency", f"{concurrency}", "-force-concurrency",
-        # an engine that crashes or stalls is resetarted: the tournament goes on
-        "-recover",
-        "-pgnout", f"file={pgn_path or TOURNAMENT_LOG_DIR / 'tournament.pgn'}",
-    ] + book_args(book, 16) + list(extra) + list(affinity)
-
-    print(f"[TOURNAMENT] Running: tc={tc}, {len(opponents)} opponents, {2 * rounds} games per pairing, "
-          f"{'round robin' if round_robin else 'gauntlet'}")
-    print(f"[TOURNAMENT] cmd: {' '.join(cmd[:6])}...")
-
-    output_lines = []
-    with subprocess.Popen(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        bufsize=1,
-    ) as proc:
-        for line in proc.stdout:
-            print(line, end="")
-            output_lines.append(line)
-        proc.wait()
-
-    if proc.returncode != 0:
-        print(f"[TOURNAMENT] WARNING: fastchess exited with code {proc.returncode}")
-
-    return "".join(output_lines), names
-
-
-def format_pairings(results, names_to_ids):
-    """This run's pairings: W/D/L and pentanomial Elo with a 95% interval."""
+def format_pairings(pairings):
+    """This run's pairings (run_fixed_match's snapshots by key): the first engine's W/D/L and
+    pentanomial Elo with a 95% interval."""
     lines = []
-    for (a, b), r in results.items():
-        pairs = sum(r["penta"])
-        est = estimate(r["penta"]) if pairs else {}
-        elo = (f"Elo {est['elo_diff']:+7.1f} [{est['elo_low']:+.1f}, {est['elo_high']:+.1f}] ({pairs} pairs)"
-               if est.get("elo_diff") is not None else "Elo n/a (no complete pairs)")
-        lines.append(f"  {a:>12} vs {b:<12} +{r['wins']} -{r['losses']} ={r['draws']}  {elo}")
+    for s in pairings.values():
+        elo = (f"Elo {s['elo_diff']:+7.1f} [{s['elo_low']:+.1f}, {s['elo_high']:+.1f}] ({s['pairs']} pairs)"
+               if s.get("elo_diff") is not None else "Elo n/a (no complete pairs)")
+        lines.append(f"  {s['first']:>12} vs {s['second']:<12} +{s['candidate_wins']} -{s['candidate_losses']} "
+                     f"={s['candidate_draws']}  {elo}")
     return "\n".join(lines)
+
+
+def keep_pgn(run_dir, path):
+    """Append a run's games (<run_dir>/games.pgn) to the time control's PGN `path`."""
+    source = Path(run_dir) / "games.pgn"
+    if source.exists():
+        with open(source, "rb") as src, open(path, "ab") as dst:
+            shutil.copyfileobj(src, dst)
+
+
+def store_run(cnxn, result, engine_ids, candidate_id, category, tc, meta):
+    """Store one time control's completed run: an experiment, every played game, each pairing's result.
+
+    The runner's games are authoritative: every one becomes a games row (source 'match')
+    with its engines' ids (`engine_ids`: runner name -> engine id). One transaction: if
+    anything fails (e.g. the database stays locked) none of it is stored, so a rating fit
+    never sees part of a gauntlet. Returns the experiment id.
+    """
+    etl.ensure_schema(cnxn)  # before the transaction: applying a migration commits an open one
+    try:
+        experiment_id = etl.start_experiment(cnxn, "tournament", candidate_id, info=json.dumps(meta, default=str),
+                                             commit=False)
+        games = etl.bulk_log_match_games(cnxn, result["run_dir"], experiment_id, engine_ids, commit=False)
+        recorded = 0
+        for s in result["pairings"].values():
+            if not s["pairs"]:
+                continue
+            ratings.record_match(cnxn, source="tournament", engine_a=engine_ids[s["first"]],
+                                 engine_b=engine_ids[s["second"]], wins=s["candidate_wins"],
+                                 draws=s["candidate_draws"], losses=s["candidate_losses"], penta=s["pentanomial"],
+                                 penta_detail=s.get("pentanomial_detail"), tc_category=category, time_control=tc,
+                                 experiment_id=experiment_id, commit=False)
+            recorded += 1
+        etl.update_experiment(cnxn, experiment_id, {"end_time_utc": datetime.now(timezone.utc).isoformat()},
+                              commit=False)
+        cnxn.commit()
+    except BaseException:
+        cnxn.rollback()
+        print(f"[DATA] {category} (tc={tc}) could not be stored: none of its results are stored")
+        raise
+    print(f"[DATA] Logged {len(games)} games with their core type, cpu and clock, and {recorded} pairing "
+          f"result(s): experiment {experiment_id}")
+    return experiment_id
+
+
+def keep_telemetry_ids(run_logs, experiment_id, engine_ids, opponents, run_dir):
+    """Write the stored run's ids (<run_logs>/engines.json), so its engine logs can be loaded by
+    --retry-ingest whatever happens next. Returns them, or None if the engines left no logs.
+
+    `opponents`: {engine name: its only opponent's name, or None}.
+    """
+    run_logs = Path(run_logs)
+    if not run_logs.is_dir():
+        return None
+    ids = etl.telemetry_ids(experiment_id, engine_ids,
+                            {name: engine_ids.get(other) for name, other in opponents.items()}, run_dir)
+    (run_logs / "engines.json").write_text(json.dumps(ids), encoding="utf-8")
+    return ids
+
+
+def load_telemetry(cnxn, run_logs, ids):
+    """Load a run's engine logs (<run_logs>/<engine name>/), linked to its played games.
+
+    `ids`: keep_telemetry_ids's (None: no logs). Logs that fail to load are kept with
+    engines.json for --retry-ingest. Returns True if all were loaded.
+    """
+    run_logs = Path(run_logs)
+    if ids is None or not run_logs.is_dir():
+        print(f"[DATA] No engine logs in {run_logs}")
+        return True
+    if etl.ingest_telemetry(cnxn, run_logs, ids):
+        shutil.rmtree(run_logs, ignore_errors=True)
+        print(f"[DATA] Telemetry loaded for experiment {ids['experiment']}.")
+        return True
+    print(f"[DATA] Log files preserved; retry with: python -m tests.tournament --retry-ingest {run_logs}")
+    return False
 
 
 def run_tournament(args, cnxn, engine_id):
     """Main entry point from release.py.
 
     Plays the pairings at each requested time control, stores them and refits ratings.
+    Returns [dict(category, time_control, experiment_id, run_dir, pairings)] of the time
+    controls played. A time control that cannot be completed raises (see the module doc).
     """
     etl.ensure_schema(cnxn)
     candidate_path = args.engine
-    fastchess = args.fastchess
-    book = getattr(args, "opening_book", None)
+    fastchess = getattr(args, "fastchess", None) or FASTCHESS
+    book_path = getattr(args, "opening_book", None) or DEFAULT_BOOK
     games_per_pair = getattr(args, "tournament_games", 20)
     tc_categories = getattr(args, "tournament_tc", ["blitz"])
     n_engines = getattr(args, "tournament_engines", 3)
-    listed_opponents = getattr(args, "opps", [])
-    concurrency = getattr(args, "concurrency")
+    listed_opponents = getattr(args, "opps", None) or []
+    concurrency = getattr(args, "concurrency", None)
     round_robin = getattr(args, "round_robin", False)
-    extra = tb_args(getattr(args, "tb", None), getattr(args, "tbpieces", None))
+    log = bool(getattr(args, "log", False))
+    extra = ["-maxmoves", str(MAX_MOVES)] + tb_args(getattr(args, "tb", None), getattr(args, "tbpieces", None))
 
     if len(listed_opponents) == 0:
         # one build of each of the latest earlier versions (never the candidate's own version)
@@ -311,102 +348,92 @@ def run_tournament(args, cnxn, engine_id):
         else:
             resolved = get_engines_by_names(cnxn, listed_opponents)
         opponents = [e for e in resolved if e["id"] != engine_id]
+    unique = {}
+    for e in opponents:
+        unique.setdefault(e["id"], e)  # a build plays once, under one name
+    opponents = list(unique.values())
 
     if not opponents:
         print("[TOURNAMENT] No opponents in database, skipping tournament.")
-        return
+        return []
 
     print(f"[TOURNAMENT] Found {len(opponents)} opponents: {[e['version'] for e in opponents]}")
-    names_to_ids = dict(zip(engine_names(opponents), [engine_id] + [o["id"] for o in opponents]))
+    names = engine_names(opponents)
+    paths = dict(zip(names, [candidate_path] + [o["path"] for o in opponents]))
+    engine_ids = dict(zip(names, [engine_id] + [o["id"] for o in opponents]))
+    pairs = pairs_per_pairing(games_per_pair)
+    book = OpeningBook(book_path, plies=BOOK_PLIES)  # one shuffle: each pairing and time control its own openings
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    # each run's games are kept (tests/mistakes.py mines <results_dir>/<category>.pgn)
+    results_dir = Path(getattr(args, "results_dir", None) or RESULTS_DIR) / stamp
+    logroot = Path(getattr(args, "logroot", None) or TOURNAMENT_LOG_DIR).resolve()
 
-    # Each game's own cpu, in the engines' Affinity order (if every engine reports it)
-    affinity = cpu_slots.fastchess_args(cpu_slots.plan(
-        [candidate_path] + [o["path"] for o in opponents], 1, concurrency,
-        enabled=not getattr(args, "no_pin", False)))
+    played, runs = [], {}
+    for tc_cat in tc_categories:
+        tc = TC_DEFAULTS.get(tc_cat, tc_cat)
+        actual_cat = classify_tc(tc)
+        runs[actual_cat] = runs.get(actual_cat, 0) + 1
+        run_name = f"{stamp}_{actual_cat}" + (f"_{runs[actual_cat]}" if runs[actual_cat] > 1 else "")
+        run_logs = logroot / run_name  # this run's engine logs only, one folder per engine
 
-    # Start experiment
-    experiment_id = etl.start_experiment(cnxn, "tournament", engine_id)
-    # each run's games are kept (tests/mistakes.py mines them); the log folder is cleared
-    results_dir = LOGS_DIR / "tournament_results" / datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-    results_dir.mkdir(parents=True, exist_ok=True)
+        print(f"\n[TOURNAMENT] === {actual_cat.upper()} (tc={tc}) ===")
+        print(f"[TOURNAMENT] Running: tc={tc}, {len(opponents)} opponents, {2 * pairs} games per pairing, "
+              f"{'round robin' if round_robin else 'gauntlet'}")
+        engines = [EngineSpec.from_path(name, path, {"log_dir": str(run_logs / name),
+                                                     "uci_logging": str(log).lower()})
+                   for name, path in paths.items()]
+        pairings = make_pairings(engines, pairs, round_robin)
+        meta = dict(tournament=stamp, category=actual_cat, time_control=tc, round_robin=round_robin,
+                    games_per_pairing=2 * pairs, book_seed=book.seed, engine_logs=str(run_logs) if log else None,
+                    engines={name: dict(id=engine_ids[name], path=str(path)) for name, path in paths.items()})
+        completed = False
+        try:
+            result = run_fixed_match(pairings, tc_args=tc_arguments(tc=tc), results_dir=results_dir,
+                                     run_name=run_name, book=book, plies=BOOK_PLIES, concurrency=concurrency,
+                                     pin=not getattr(args, "no_pin", False), fastchess=fastchess, extra_args=extra,
+                                     pairs_per_job=getattr(args, "pairs_per_job", None) or 4,
+                                     quiet=getattr(args, "quiet", False), label="TOURNAMENT", time_control=tc,
+                                     meta=meta)
+            completed = True
+        finally:
+            keep_pgn(results_dir / run_name, results_dir / f"{actual_cat}.pgn")
+            if not log:
+                shutil.rmtree(run_logs, ignore_errors=True)  # engines may create their log folder with logging off
+            if not completed:  # MatchStopped / MatchInterrupted (with .result) or a refused engine: re-raised
+                print(f"[TOURNAMENT] {actual_cat} (tc={tc}) was not completed: none of its results are stored"
+                      + (f"; engine logs kept in {run_logs}" if log and run_logs.is_dir() else ""))
 
-    try:
-        for tc_cat in tc_categories:
-            tc = TC_DEFAULTS.get(tc_cat, tc_cat)
-            actual_cat = classify_tc(tc)
+        print(f"\n[TOURNAMENT] {actual_cat} pairings this run (pentanomial Elo, 95% interval):")
+        print(format_pairings(result["pairings"]))
+        experiment_id = store_run(cnxn, result, engine_ids, engine_id, actual_cat, tc,
+                                  dict(meta, run=result["run_id"], pairs=result["pairs"], games=result["games"]))
+        # from here on the stored run's logs can always be loaded (--retry-ingest), even if the fit fails
+        ids = keep_telemetry_ids(run_logs, experiment_id, engine_ids, opponents_in(pairings),
+                                 result["run_dir"]) if log else None
 
-            print(f"\n[TOURNAMENT] === {actual_cat.upper()} (tc={tc}) ===")
-
-            output, names = run_fastchess_tournament(
-                candidate_path, opponents, tc, games_per_pair, fastchess, concurrency, book, affinity,
-                round_robin, extra, pgn_path=results_dir / f"{actual_cat}.pgn"
-            )
-            results = pairing_results(output, names)
-            for (a, b), r in results.items():
-                ratings.record_match(cnxn, source="tournament", engine_a=names_to_ids[a], engine_b=names_to_ids[b],
-                                     wins=r["wins"], draws=r["draws"], losses=r["losses"], penta=r["penta"],
-                                     tc_category=actual_cat, time_control=tc, experiment_id=experiment_id)
-
-            print(f"\n[TOURNAMENT] {actual_cat} pairings this run (pentanomial Elo, 95% interval):")
-            print(format_pairings(results, names_to_ids))
-
+        try:
             fit_id, _ = ratings.fit(cnxn, actual_cat)
-            if fit_id:
-                print()
-                print(ratings.format_history(cnxn, fit_id, highlight={engine_id}))
-    finally:
-        cpu_slots.release()
+        except BaseException:
+            if ids is not None:
+                print(f"[DATA] Engine logs kept; load them with: python -m tests.tournament --retry-ingest {run_logs}")
+            raise
+        if fit_id:
+            print()
+            print(ratings.format_history(cnxn, fit_id, highlight={engine_id}))
 
-    # Consolidate per-instance logs and upload, like SPRT
-    etl.consolidate_instance_logs(TOURNAMENT_LOG_DIR)
-
-    game_json = TOURNAMENT_LOG_DIR / "game.jsonl"
-    search_json = TOURNAMENT_LOG_DIR / "search.jsonl"
-    timing_json = TOURNAMENT_LOG_DIR / "timing.jsonl"
-    root_moves_json = TOURNAMENT_LOG_DIR / "root_moves.jsonl"
-
-    # every engine logs its version string; within a run each version is one build, so this
-    # attributes the logs exactly (a release's DEV and Prod builds share their version)
-    version_ids = {o["version"]: o["id"] for o in opponents if o.get("version")}
-    candidate_version = cnxn.execute("SELECT version FROM engines WHERE id = ?", (engine_id,)).fetchone()
-    if candidate_version and candidate_version[0]:
-        version_ids[candidate_version[0]] = engine_id
-
-    ingestion_ok = True
-    try:  # games and searches together, or neither: the kept logs can then be loaded again
-        game_map = {}
-        if game_json.exists():
-            game_map = etl.bulk_log_game(cnxn, game_json, experiment_id, commit=False,
-                                         engine_ids_by_version=version_ids)
-        if search_json.exists():
-            etl.bulk_log_search_and_timing(
-                cnxn,
-                search_json,
-                game_map,
-                timing_path=timing_json if timing_json.exists() else None,
-                root_moves_path=root_moves_json if root_moves_json.exists() else None,
-                commit=False,
-                engine_ids_by_version=version_ids,
-            )
-        cnxn.commit()
-    except Exception as e:
-        cnxn.rollback()
-        print(f"[DATA] Telemetry ingestion failed: {e}")
-        ingestion_ok = False
-
-    # finalize experiment
-    etl.update_experiment(cnxn, experiment_id, {"end_time_utc": datetime.now(timezone.utc).isoformat()})
-
-    # Only clear log directory if ingestion succeeded
-    if ingestion_ok:
-        etl.clear_log_dir(TOURNAMENT_LOG_DIR)
-    else:
-        print("[DATA] Log files preserved due to ingestion failure.")
+        if log:
+            load_telemetry(cnxn, run_logs, ids)
+        else:
+            print("[DATA] Engine logging was disabled, skipping JSONL ingestion.")
+        played.append(dict(category=actual_cat, time_control=tc, experiment_id=experiment_id,
+                           run_dir=result["run_dir"], pairings=result["pairings"]))
+    print(f"\n[TOURNAMENT] Results: {results_dir}")
+    return played
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Progression test: rate a new engine against earlier versions")
-    parser.add_argument("--engine", required=True, help="Candidate engine path")
+    parser.add_argument("--engine", help="Candidate engine path (required unless --retry-ingest)")
     parser.add_argument("--opps", nargs="+", default=[],
                         help="Explicit list of opponent engine version names "
                              "(e.g. --opps 1.0 0.9.3). Overrides --n_engines auto-selection.")
@@ -422,22 +449,37 @@ def main(argv=None):
     parser.add_argument("--games", type=int, default=100, help="Games per pairing per TC (rounded up to whole pairs)")
     parser.add_argument("--round-robin", action="store_true",
                         help="Also play the opponents against each other (default: candidate vs each opponent)")
-    parser.add_argument("--book", default=str(PROJECT_ROOT / "bin" / "opening_books" / "8moves_v3.pgn"))
-    parser.add_argument("--concurrency", default=2, type=int, help="Number of games to run simultaneously (uses 2*concurrency threads)")
+    parser.add_argument("--book", default=str(DEFAULT_BOOK), help=f"Opening book (.pgn or .epd), {BOOK_PLIES} plies")
+    parser.add_argument("--concurrency", default=None, type=int,
+                        help="Concurrent games (default: every physical core but one); each game runs on its own core")
     parser.add_argument("--fastchess",
                         default=str(FASTCHESS), help="Path to the fastchess executable")
-    parser.add_argument("--no-pin", action="store_true",
-                        help="Don't give each game its own cpu in the engines' Affinity order")
+    parser.add_argument("--no-pin", action="store_true", help="Leave the placement of games to the OS")
     parser.add_argument("--tb", default=None, help="Syzygy tablebase dir(s) for adjudication (WDL files are enough)")
     parser.add_argument("--tbpieces", type=int, default=None)
- 
+    parser.add_argument("--pairs-per-job", type=int, default=4,
+                        help="Opening pairs per fastchess process (amortizes engine start-up)")
+    parser.add_argument("--quiet", action="store_true", help="No per-game lines")
+    parser.add_argument("--log", action="store_true", help="Engine telemetry logging (uploaded to the database)")
+    parser.add_argument("--results-dir", default=RESULTS_DIR,
+                        help="Where each tournament's folder goes (default logs/tournament_results)")
+    parser.add_argument("--logroot", default=TOURNAMENT_LOG_DIR,
+                        help="Root of the engine telemetry logs (each run logs into <logroot>/<run>/<engine name>/)")
+    parser.add_argument("--retry-ingest", metavar="RUN_LOG_DIR",
+                        help="Only load the preserved telemetry of an earlier run (<logroot>/<run>) into the database")
+
     # Accept a pre-built Namespace (programmatic callers like release.py)
     # as well as a raw argv list / sys.argv (CLI callers).
     if isinstance(argv, argparse.Namespace):
         args = argv
     else:
         args = parser.parse_args(argv)
- 
+
+    if getattr(args, "retry_ingest", None):
+        return etl.retry_ingest(args.retry_ingest)
+    if not args.engine:
+        parser.error("--engine is required")
+
     # Validate --tc entries up front: either a known category name, or a
     # parseable explicit tc string (e.g. "15+0.15", "1:00+0.6").
     for tc_entry in args.tc:
@@ -450,32 +492,44 @@ def main(argv=None):
                 f"invalid --tc value '{tc_entry}': must be one of "
                 f"{list(TC_DEFAULTS.keys())} or a parseable tc string like '15+0.15'"
             )
- 
+
     cnxn = etl.connect_raw()
- 
-    # The candidate's build (binary + net hash), registered if new
-    engine_id = etl.resolve_engine(cnxn, args.engine)
- 
-    # Build namespace for run_tournament
-    ns = argparse.Namespace(
-        engine=args.engine,
-        fastchess=getattr(args, "fastchess"),
-        opening_book=args.book,
-        tournament_games=args.games,
-        tournament_tc=args.tc,
-        tournament_engines=args.n_engines,
-        first_engine=args.first_engine,
-        opps=args.opps,
-        concurrency=args.concurrency,
-        no_pin=getattr(args, "no_pin", False),
-        round_robin=getattr(args, "round_robin", False),
-        tb=getattr(args, "tb", None),
-        tbpieces=getattr(args, "tbpieces", None),
-    )
- 
-    run_tournament(ns, cnxn, engine_id)
-    cnxn.close()
- 
- 
+    try:
+        # The candidate's build (binary + net hash), registered if new
+        engine_id = etl.resolve_engine(cnxn, args.engine)
+
+        # Build namespace for run_tournament
+        ns = argparse.Namespace(
+            engine=args.engine,
+            fastchess=getattr(args, "fastchess"),
+            opening_book=args.book,
+            tournament_games=args.games,
+            tournament_tc=args.tc,
+            tournament_engines=args.n_engines,
+            first_engine=args.first_engine,
+            opps=args.opps,
+            concurrency=args.concurrency,
+            no_pin=getattr(args, "no_pin", False),
+            round_robin=getattr(args, "round_robin", False),
+            tb=getattr(args, "tb", None),
+            tbpieces=getattr(args, "tbpieces", None),
+            pairs_per_job=getattr(args, "pairs_per_job", 4),
+            quiet=getattr(args, "quiet", False),
+            log=getattr(args, "log", False),
+            results_dir=getattr(args, "results_dir", RESULTS_DIR),
+            logroot=getattr(args, "logroot", TOURNAMENT_LOG_DIR),
+        )
+
+        return run_tournament(ns, cnxn, engine_id)
+    finally:
+        cnxn.close()
+
+
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        sys.exit(130)
+    except Exception as e:
+        print(f"[TOURNAMENT] ERROR: {e}", file=sys.stderr)
+        sys.exit(1)

@@ -54,26 +54,23 @@ def drop_all_tables(db_path) -> None:
             "schema_migrations"
         ]
     else:
-        tables = [
-            "timing",
-            "searches_by_iteration",
-            "searches_by_tree_depth",
-            "searches",
-            "root_moves",
-            "games",
-            "sprt",
-            "sts",
-            "perft",
-            "experiments",
-            "engines",
-            "engine_ratings",
-            "schema_migrations"
-        ]
+        cur.execute("BEGIN IMMEDIATE")
+        # every table, including those later migrations added: init re-creates them all
+        tables = sorted((row[0] for row in cur.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'").fetchall()),
+            key=lambda name: name != "schema_migrations")  # the history first
 
     dropped = []
-    for table in tables:
-        cur.execute(f"DROP TABLE IF EXISTS {table};")
-        dropped.append(table)
+    try:
+        for table in tables:
+            cur.execute(f'DROP TABLE IF EXISTS "{table}";')
+            dropped.append(table)
+        if not is_duckdb:
+            cur.execute("COMMIT")
+    except Exception:
+        if not is_duckdb:
+            cur.execute("ROLLBACK")
+        raise
 
     if not is_duckdb: cur.execute("PRAGMA foreign_keys = ON;")
 
@@ -114,18 +111,12 @@ def clear_all_tables(db_path, exclude_engines=False) -> None:
             *AGG_TABLES,
         ] + (["engines", "engine_ratings"] if not exclude_engines else [])
     else:
-        tables = [
-            "timing",
-            "searches_by_iteration",
-            "searches_by_tree_depth",
-            "searches",
-            "root_moves",
-            "games",
-            "sprt",
-            "sts",
-            "perft",
-            "experiments"
-        ] + (["engines", "engine_ratings"] if not exclude_engines else [])
+        # every table but the migration history (the schema stays) and, if asked, the
+        # catalogue of engines and nets; tables later migrations add are cleared too
+        keep = {"schema_migrations"} | ({"engines", "engine_ratings", "nets"} if exclude_engines else set())
+        tables = [row[0] for row in cur.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'").fetchall()
+            if row[0] not in keep]
 
     total_deleted = 0
     deleted_info = []
@@ -138,6 +129,8 @@ def clear_all_tables(db_path, exclude_engines=False) -> None:
             """, [table]).fetchone()
             if not kind or kind[0] == 'VIEW':
                 continue
+        elif not cur.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (table,)).fetchone():
+            continue  # e.g. tables added by data/etl/schema.py, not created yet
         cur.execute(f"DELETE FROM {table};")
         count = cur.fetchone()[0] if is_duckdb else cur.rowcount
         total_deleted += count

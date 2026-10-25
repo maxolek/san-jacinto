@@ -151,12 +151,13 @@ class PairTally:
         return out
 
 class PentanomialSPRT:
-    """Consume consecutive opening pairs; freeze evidence at the first crossing.
+    """Consume opening pairs in a fixed order; freeze evidence at the first crossing.
 
     Game `n` belongs to pair (n - 1) // 2. The order of pairs must not depend on
-    their results (use start order, never finish order):
-    A pair may finish out of order, but it is not tested until all preceding
-    pairs are complete. Unknown/unfinished outcomes are never counted as draws.
+    their results (use start order, never finish order): a pair may finish out
+    of order, but it is not tested until all preceding pairs are complete or
+    voided. Otherwise short decisive games would be over-represented when the
+    test stops. Unknown/unfinished outcomes are never counted as draws.
     With sequential=False the bounds are never applied (result "fixed"): every
     pair is counted, for fixed-length matches that only estimate Elo.
     """

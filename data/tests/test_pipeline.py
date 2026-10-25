@@ -18,11 +18,11 @@ import duckdb
 
 from data import etl
 from data.databases.load_analytics import load, path_basename, replays_from_start
-from data.tests.test_schema import VIEW_COLUMNS, check_schema, validate_schema
+from data.databases.test_schema import VIEW_COLUMNS, check_schema, validate_schema
 from data.transforms import transform_positions as positions
 from data.transforms.aggregates import (AGG_COLUMNS, LOSS_BUCKETS, SAMPLE_SIZE, STOCKFISH_TABLES, allocate_sample,
                                         build_aggregates)
-from data.transforms.transform_search import ANALYTICS_VIEWS, build_analytics_views, PVS_RESEARCH_KINDS
+from data.transforms.transform_search import ANALYTICS_VIEWS, PVS_RESEARCH_KINDS, build_analytics_views
 from data.transforms.validate import run_validation
 
 from .fixtures import EPD_BOOK_OPENING, FALLBACK_OPENING, PVS_KIND_VERSIONS, analytics_fixture, write_logs
@@ -251,30 +251,32 @@ class PipelineTest(unittest.TestCase):
 
 
 def _pvs_researches(count, *kinds):
-    """the pvs-researches count of a row: logged (older builds), else the sum of the kinds newer
-    builds log when any was logged, else unknown"""
-    if count is not None: return count 
-    return sum(kind or 0 for kind in kinds) if any(kind is not None for kind in kinds) else None 
+    """The PVS re-search count of a row: logged (older builds), else the sum of the kinds newer
+    builds log when any was logged, else unknown."""
+    if count is not None:
+        return count
+    return sum(kind or 0 for kind in kinds) if any(kind is not None for kind in kinds) else None
+
 
 class PvsResearchesTest(unittest.TestCase):
-    """older builds log pvs_researches, newer ones (fixtures.PVS_KIND_VERSIONS) three kinds
-    
-    the views and aggregates use the count, else the kinds' sum, else NULL
+    """Older builds log pvs_researches, newer ones (fixtures.PVS_KIND_VERSIONS) three kinds instead.
 
-    analytics databases pre-date the kinds, so update opportunities there
+    The views and aggregates use the count, else the kinds' sum, else NULL (the public export:
+    see test_public_export), also on analytics databases whose tables predate the kinds.
     """
     KINDS = ", ".join(PVS_RESEARCH_KINDS)
-    # (fact_table, its key, view, the views key, the views count col)
+    # (fact table, its key, view, the view's key, the view's count column)
     VIEWS = (
         ("search_stats", "id", "search_metrics", "search_id", "total_pvs_researches"),
-        ("iterative_deepening_stats", "search_id, depth", "search_iteration_metrics", "search_id, depth", "pvs_researches"),
+        ("iterative_deepening_stats", "search_id, depth", "search_iteration_metrics", "search_id, depth",
+         "pvs_researches"),
         ("search_tree_stats", "search_id, depth", "search_tree_features", "search_id, depth", "pvs_researches"),
     )
 
     @classmethod
     def setUpClass(cls):
         _, _, cls.analytics, _ = analytics_fixture()
-        cls.db = duckdb.connect(str(cls.analytics, read_only=True))
+        cls.db = duckdb.connect(str(cls.analytics), read_only=True)
 
     @classmethod
     def tearDownClass(cls):
@@ -285,9 +287,100 @@ class PvsResearchesTest(unittest.TestCase):
         return [(*row[:width], _pvs_researches(*row[width:])) for row in cnxn.execute(
             f"SELECT {key}, pvs_researches, {self.KINDS} FROM {table} ORDER BY ALL").fetchall()]
 
-    def expected_rates(self, ncxn, table, key_sql):
-        
-                                
+    def expected_rates(self, cnxn, table, key_sql):
+        """{(engine, depth): sum(pvs re-searches) / sum(nodes)} of a per-depth fact table."""
+        sums = defaultdict(lambda: [0, 0, False])
+        for engine, depth, nodes, *counts in cnxn.execute(
+                f"SELECT s.engine_id, {key_sql}, t.nodes + t.qnodes, t.pvs_researches, "
+                f"{', '.join('t.' + k for k in PVS_RESEARCH_KINDS)} "
+                f"FROM {table} t JOIN search_stats s ON s.id = t.search_id").fetchall():
+            entry, value = sums[(engine, depth)], _pvs_researches(*counts)
+            entry[1] += nodes or 0
+            if value is not None:
+                entry[0] += value
+                entry[2] = True
+        return {key: (pvs / nodes if measured and nodes else None) for key, (pvs, nodes, measured) in sums.items()}
+
+    def assert_rates(self, cnxn, aggregate, where, table, key_sql):
+        actual = {(e, d): r for e, d, r in cnxn.execute(
+            f"SELECT engine_id, {'ply' if aggregate == 'agg_tree_ply' else 'depth'}, pvs_research_rate "
+            f"FROM {aggregate} {where}").fetchall()}
+        expected = self.expected_rates(cnxn, table, key_sql)
+        self.assertEqual(set(actual), set(expected))
+        for key, rate in expected.items():
+            if rate is None:
+                self.assertIsNone(actual[key], key)
+            else:
+                self.assertAlmostEqual(actual[key], rate, delta=1e-9 * rate, msg=key)
+
+    def test_the_fixture_has_both_generations(self):
+        rows = self.db.execute(f"""
+            SELECT e.version, count(*), count(s.pvs_researches),
+                   {', '.join(f'count(s.{k})' for k in PVS_RESEARCH_KINDS)}
+            FROM search_stats s JOIN engines e ON e.id = s.engine_id GROUP BY 1 ORDER BY 1""").fetchall()
+        self.assertTrue(set(PVS_KIND_VERSIONS) < {row[0] for row in rows})
+        for version, searches, count, *kinds in rows:
+            new = version in PVS_KIND_VERSIONS
+            self.assertEqual((count, kinds), (0, [searches] * 3) if new else (searches, [0] * 3), version)
+
+    def test_views_use_the_count_else_the_sum_of_the_kinds(self):
+        for table, key, view, view_key, column in self.VIEWS:
+            with self.subTest(view=view):
+                actual = self.db.execute(f"SELECT {view_key}, {column} FROM {view} ORDER BY ALL").fetchall()
+                self.assertEqual(actual, self.expected_views(self.db, table, key))
+                self.assertNotIn(None, {row[-1] for row in actual})   # every fixture build logs them
+
+    def test_aggregates_use_the_count_else_the_sum_of_the_kinds(self):
+        self.assert_rates(self.db, "agg_depth", "WHERE core_type = 'all'", "iterative_deepening_stats", "t.depth")
+        self.assert_rates(self.db, "agg_tree_ply", "", "search_tree_stats", "t.depth")
+        self.assertEqual(self.db.execute("SELECT count(*) FROM agg_tree_ply WHERE pvs_research_rate IS NULL")
+                         .fetchone()[0], 0)
+
+    def test_unmeasured_stays_null_and_older_tables_without_the_kinds_work(self):
+        new_engines = [row[0] for row in self.db.execute(
+            f"SELECT id FROM engines WHERE version IN ({', '.join('?' for _ in PVS_KIND_VERSIONS)})",
+            list(PVS_KIND_VERSIONS)).fetchall()]
+        marks = ", ".join("?" for _ in new_engines)
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            copy = Path(tmp) / "copy.duckdb"
+            shutil.copyfile(self.analytics, copy)
+            with duckdb.connect(str(copy)) as cnxn:
+                none, one = [row[0] for row in cnxn.execute(
+                    f"SELECT id FROM search_stats WHERE engine_id IN ({marks}) ORDER BY id LIMIT 2",
+                    new_engines).fetchall()]
+                # a search that logged no kind, and one that logged a single kind
+                cnxn.execute(f"UPDATE search_stats SET {', '.join(k + ' = NULL' for k in PVS_RESEARCH_KINDS)} "
+                             "WHERE id = ?", [none])
+                cnxn.execute("UPDATE search_stats SET pvs_researches_depth = 5, pvs_researches_full = NULL, "
+                             "pvs_researches_root = NULL WHERE id = ?", [one])
+                self.assertEqual(cnxn.execute("SELECT search_id, total_pvs_researches FROM search_metrics "
+                                              "WHERE search_id IN (?, ?) ORDER BY 1", [none, one]).fetchall(),
+                                 [(none, None), (one, 5)])
+
+                # an analytics database loaded before the raw database had the kinds
+                for table, *_ in self.VIEWS:
+                    for kind in PVS_RESEARCH_KINDS:
+                        cnxn.execute(f'ALTER TABLE "{table}" DROP COLUMN "{kind}"')
+                with contextlib.redirect_stdout(io.StringIO()):
+                    build_analytics_views(cnxn)
+                    build_aggregates(cnxn, verbose=False)
+                self.assertEqual(check_schema(cnxn, profile="analytics")[0], [])
+                for table, key, view, view_key, column in self.VIEWS:
+                    with self.subTest(view=view):
+                        self.assertEqual(
+                            cnxn.execute(f"SELECT {view_key}, {column} FROM {view} ORDER BY ALL").fetchall(),
+                            cnxn.execute(f"SELECT {key}, pvs_researches FROM {table} ORDER BY ALL").fetchall())
+                self.assertEqual(cnxn.execute(
+                    f"SELECT count(total_pvs_researches) FROM search_metrics WHERE engine_id IN ({marks})",
+                    new_engines).fetchone()[0], 0)   # the kinds are gone: not measured, not 0
+                self.assertEqual(cnxn.execute(
+                    f"SELECT count(pvs_research_rate) FROM agg_tree_ply WHERE engine_id IN ({marks})",
+                    new_engines).fetchone()[0], 0)
+                self.assertGreater(cnxn.execute(
+                    f"SELECT count(pvs_research_rate) FROM agg_tree_ply WHERE engine_id NOT IN ({marks})",
+                    new_engines).fetchone()[0], 0)
+
+
 class StockfishPipelineTest(unittest.TestCase):
     """The positions step with a (fake) Stockfish, then the views, aggregates and checks, on a copy."""
     LINES = 3

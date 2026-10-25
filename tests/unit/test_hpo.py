@@ -55,6 +55,7 @@ class Pieces(unittest.TestCase):
             self.assertEqual(evaluator.stages, 3)
 
             def fake_train(cmd, **kw):
+                self.assertIn("--no-register", cmd, "trial runs are deleted; they must not enter the net registry")
                 runs, net_id = Path(cmd[cmd.index("--output-dir") + 1]), cmd[cmd.index("--net-id") + 1]
                 for sb, loss in ((5, 0.9), (15, 0.25)):  # end of stage 1, end of the curriculum
                     ckpt = runs / net_id / f"{net_id}-{sb}"

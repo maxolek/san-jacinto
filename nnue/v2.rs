@@ -82,6 +82,8 @@ fn main() {
     // Bullet indexes LR by global superbatch, including after checkpoint loads.
     let lr_final_superbatch = env_usize("lr_final_superbatch", stage_end);
     assert!(lr_final_superbatch >= stage_end, "LR schedule must cover the entire stage");
+    // nnue/train.py reads its wdl_start, wdl_end and net_id defaults from these lines
+    // (keep them literals), so a run through it matches `cargo run --example v2`.
     let wdl_start           = env_f32("wdl_start", 0.25);
     let wdl_end             = env_f32("wdl_end", 0.25);
     // WDL taper spans whole cirriculum, like LR schedule
@@ -158,8 +160,8 @@ fn main() {
             start_superbatch: superbatch_start,
             end_superbatch: stage_end,
         },
-        wdl_scheduler: wdl::CirriculumWDL { 
-            start: wdl_start, 
+        wdl_scheduler: CurriculumWDL {
+            start: wdl_start,
             end: wdl_end,
             final_superbatch: wdl_final_superbatch
         },
@@ -176,7 +178,7 @@ fn main() {
 
     use loader::sfbinpack::SfBinpackLoader;
 
-    let train_filter: fn(&loader::sfbinpack::TrainingDataEntry) -> bool {
+    fn filter(entry: &loader::sfbinpack::TrainingDataEntry) -> bool {
         use loader::sfbinpack::{MoveType,PieceType,};
         entry.ply >= 16
             && !entry.pos.is_checked(entry.pos.side_to_move())
@@ -185,6 +187,9 @@ fn main() {
             && entry.pos.piece_at(entry.mv.to()).piece_type()== PieceType::None
     }
 
+    // trainer.run takes both loaders as one type, so both filters are plain fn pointers
+    // (a fn item and a closure would be two different types and fail to compile).
+    let train_filter: fn(&loader::sfbinpack::TrainingDataEntry) -> bool = filter;
     let val_filter: fn(&loader::sfbinpack::TrainingDataEntry) -> bool = |_| true;
 
     let train_loader =
@@ -192,7 +197,7 @@ fn main() {
             &train_path,
             1024,
             _threads,
-            train_filter
+            train_filter,
         );
 
     let val_loader =
@@ -200,7 +205,7 @@ fn main() {
             &val_path,
             256,
             _threads/2,
-            val_filter
+            val_filter,
         );
 
     // ========================================================
@@ -211,8 +216,8 @@ fn main() {
         threads: _threads,
         test_set: Some(
             TestDataset::at(&val_path)
-            .freq(0) // once per superbatch
-            .batches(1_000_000), // ~ 4 million validation positions (x * _batch_size)
+            .freq(0) // 0 = validate once, at the end of every superbatch
+            .positions(4_194_304), // validation sample (256 batches of 16_384), drawn once from val_data at startup
         ),
         output_directory: &output_dir,
         batch_queue_size: 64,
@@ -229,10 +234,7 @@ fn main() {
         let checkpoint = format!("{output_dir}/{net_id}-{}", superbatch_start - 1);
         if env_usize("reset_optimiser", 0) == 1 {
             println!("Loading weights (fresh optimiser state) from {checkpoint}");
-            trainer
-                .optimiser
-                .load_weights_from_file(&format!("{checkpoint}/optimiser_state/weights.bin"))
-                .unwrap_or_else(|e| panic!("could not load weights from {checkpoint}: {e:?}"));
+            trainer.load_weights_from_checkpoint(&checkpoint);
         } else {
             println!("Loading checkpoint {checkpoint}");
             trainer.load_from_checkpoint(&checkpoint);

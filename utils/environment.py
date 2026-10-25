@@ -361,7 +361,11 @@ class ClockSampler:
             self.reader.close()
 
     def window(self, cpu, start, end):
-        """dict(mhz_mean, mhz_min, mhz_max, util_mean, samples) over [start, end]."""
+        """dict(mhz_mean, mhz_min, mhz_max, util_mean, samples) over [start, end].
+
+        `cpu` is one logical CPU or several (a multi-threaded game's slot): their
+        samples are pooled.
+        """
         empty = dict(mhz_mean=None, mhz_min=None, mhz_max=None, util_mean=None, clock_samples=0)
         if cpu is None:
             return empty
@@ -369,13 +373,15 @@ class ClockSampler:
         for one in (cpu if isinstance(cpu, (list, tuple, set, frozenset)) else (cpu,)):
             with self.lock:
                 series = list(self.samples.get(one, ()))
-            if not series: continue 
+            if not series:
+                continue
             times = [s[0] for s in series]
-            # a sample at time t describes the interval ending at t 
+            # A sample at time t describes the interval ending at t.
             lo = bisect.bisect_left(times, start)
             hi = bisect.bisect_right(times, end + self.interval)
             chosen += series[lo:hi] or [series[min(lo, len(series) - 1)]]
-        if not chosen: return empty 
+        if not chosen:
+            return empty
         mhz = [s[1] for s in chosen if s[1] is not None]
         util = [s[2] for s in chosen if s[2] is not None]
         return dict(mhz_mean=round(sum(mhz) / len(mhz)) if mhz else None,

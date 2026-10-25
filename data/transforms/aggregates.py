@@ -124,7 +124,7 @@ ROOT_BEST_MOVES = 50      # agg_root_best keeps the most frequent moves per engi
 
 # Relations build_aggregates reads.
 REQUIRED_RELATIONS = (
-    "search_metrics", "game_stats", "position_features",
+    "search_metrics", "search_iteration_metrics", "search_tree_features", "game_stats", "position_features",
     "iterative_deepening_stats", "search_tree_stats", "search_timings", "root_moves",
 )
 
@@ -332,7 +332,7 @@ WITH it AS (
            LAG(i.eval) OVER w AS prev_eval,
            LAG(i.move) OVER w AS prev_move,
            SUM(i.time_ms) OVER (w ROWS UNBOUNDED PRECEDING) AS cum_time_ms
-    FROM search_iteration_metrics i -- iterative_deepening_stats with pvs_researches derived
+    FROM search_iteration_metrics i   -- iterative_deepening_stats with pvs_researches derived
     WINDOW w AS (PARTITION BY i.search_id ORDER BY i.depth)
 )
 SELECT
@@ -391,7 +391,7 @@ WITH t AS (
            CAST(sum(t.nmp) AS DOUBLE) AS nmp,
            CAST(sum(t.nmp_failhigh) AS DOUBLE) AS nmp_failhigh,
            CAST(sum(t.pvs_researches) AS DOUBLE) AS pvs_researches
-    FROM search_tree_stats t
+    FROM search_tree_features t   -- search_tree_stats with pvs_researches derived
     JOIN _agg_base b ON b.search_id = t.search_id
     GROUP BY b.engine_id, t.depth
 )

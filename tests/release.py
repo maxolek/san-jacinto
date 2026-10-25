@@ -102,9 +102,12 @@ def run_make(args, build_type):
 # SPRT
 # ============================================================
 
-def _sprt_namespace(
-        args, threads, params=None, 
-        tc=None, time=None, depth=None, nodes=None):
+def _sprt_namespace(args, threads, params=None, tc=None, time=None, depth=None, nodes=None):
+    """Arguments for tests/sprt.main (sprt.resolve_args fills in every flag not given here).
+
+    Exactly one per-move limit; `params` are UCI options for the candidate only (sprt's --param),
+    `threads` both engines' option.Threads (sprt's --threads).
+    """
     return argparse.Namespace(
         engine_a=args.prod_engine,
         engine_b=args.base_engine,
@@ -139,7 +142,7 @@ def run_sprt(args):
     accepted = True
     for threads in args.sprt_threads:
         print(f"[SPRT] {threads} thread(s)")
-        result = sprt.main(_sprt_namespace(args, threads, tc=args.sprt_tc, time=args.sprt_time, 
+        result = sprt.main(_sprt_namespace(args, threads, tc=args.sprt_tc, time=args.sprt_time,
                                            depth=args.sprt_depth, nodes=args.sprt_nodes))
         accepted = accepted and result["accepted"]
     return accepted
@@ -198,6 +201,7 @@ def run_tournament(args, cnxn, engine_id):
         round_robin=args.tournament_round_robin,
         tb=args.tb,
         tbpieces=args.tbpieces,
+        log=True,  # the engines' telemetry, as the release's SPRT collects it
     )
 
     tournament.run_tournament(tournament_args, cnxn, engine_id)
@@ -240,6 +244,7 @@ def run_perft(args):
 # ============================================================
 
 def run_tune(args):
+    """SPSA on the DEV build (tuning/spsa_tuner.py); returns the recommended values {option: value}."""
     print("[TUNING] Running SPSA")   
 
     # through the tuner's own parser, so every option it reads gets its default
@@ -247,7 +252,7 @@ def run_tune(args):
         "--engine", args.dev_engine,
         "--fastchess", args.fastchess,
         "--tc", "0:20+.2",
-        "--pairs", "10000", # 20k games (formerly 5k iterations * 4 games)
+        "--pairs", "10000",         # 20,000 games (formerly 5000 iterations x 4 games)
         "--concurrency", "4",
         "--output", os.path.join(LOGS_DIR, "dev_logs", "spsa_results.json"),
         "--plot",
@@ -267,7 +272,8 @@ def build_parser():
     parser.add_argument("--description", required=True)
     
     parser.add_argument("--fastchess", default=str(sprt.FASTCHESS), help="Path to the fastchess executable\nUsed for game testing")
-    parser.add_argument("--no-pin", action="store_true", help="Don't give each game its own cpus in the engines' Affinity order")
+    parser.add_argument("--no-pin", action="store_true",
+                        help="Leave the placement of games to the OS (default: each game on its own core)")
 
     # SPRT
     parser.add_argument("--sprt", action="store_true", help="Run SPRT")
@@ -331,8 +337,8 @@ def build_parser():
 
     # TUNING
     parser.add_argument("--tune", action="store_true", help="Run SPSA tuning on search parameters after release. Re-run SPRT to see if improvement.")
-
     return parser
+
 
 def main():
     args = build_parser().parse_args()
