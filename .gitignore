@@ -16,6 +16,9 @@ logs/
 /nnue/target/
 /nnue/hpo/
 
+# benchmark builds and results
+/benchmarks/out/
+
 # Virtual environments
 .venv/
 venv/
@@ -32,6 +35,3 @@ data/dashboard/public/data/
 
 # bin files (too large)
 bin/opening_books/UHO_Lichess_4852_v1.epd
-
-# defunct repos
-libs/cutechess/

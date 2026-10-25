@@ -1,0 +1,50 @@
+name: Checks
+
+on: 
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: checks-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  python:
+    name: Python tests (data pipeline, match tools, tuning, NNUE)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: 
+          python-verison: '3.12'
+          cache: pip
+          cache-dependency-path: requirements.txt
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt
+      - name: Run unit tests
+        env: 
+          MPLBACKEND: Agg
+        run: |
+          python -m unittest discover -s data -p "test_*.py" -v
+          python -m unittest discover -s tests/unit -t . -v
+
+  dashboard:
+    name: Dashboard tests
+    runs-on: ubuntu-latest
+    defaults: 
+      run:
+        working-directory: data/dashboard
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cach-dependency-path: data/dashboard/package-lock.json
+      - name: Install and test
+        run: |
+          npm ci
+          npm test

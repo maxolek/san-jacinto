@@ -1,0 +1,17 @@
+# Python dependencies of the data pipeline, the test/analysis tools and their tests
+#   pip install -r requirements.txt
+
+# required: analytics databases and public export (snapshots use DuckDB storage v1.2.0)
+duckdb>=1.2
+# required: python-chess, for openings, position features, and optional stockfish analysis
+chess>=1.10
+# Required: aggregates (correlations) and position features
+numpy>=1.26
+pandas>=2.1
+
+# Optional: statistical tests in data/transforms/stats_tests.py (falls back to summary statistics)
+scipy>=1.11
+#optional: plots (utils/plotting.py, util/sprt_plot.py, tuning/, nnue/plot.py)
+matplotlib>=3.8
+# opptional: CPU clock/utilization samling for the match runner (utils/environment.py, utils/cpu_topology.py)
+psutil>=5.9
