@@ -2,17 +2,22 @@
 """
 Plot Bullet NNUE training metrics.
 
-metrics.csv:
-    unix_time,superbatch,batch,split,loss
+Source: a net's output directory. The bullet fork (libs/bullet) saves each
+checkpoint as <output>/<net_id>-<superbatch>/ and writes the loss record of the
+running stage into it:
+    log.txt       training loss     "superbatch,batch,loss" (every 32 batches)
+    val_log.txt   validation loss   "superbatch,batch,loss" (every validation)
+(train.txt / val.txt are accepted too). A legacy metrics.csv
+(unix_time,superbatch,batch,split,loss) can still be plotted directly.
 
 Dashboard:
     1. Training loss
-    2. Validation loss / best validation
-    3. Learning-rate schedule
-    4. WDL schedule
-    5. Run / dataset information
+    2. Learning-rate schedule
+    3. Validation loss / best validation
+    4. Validation - training loss gap
 
-The plot can be used standalone or through python/train.py.
+The plot can be used standalone or through nnue/train.py. Losses appear when a
+checkpoint is saved (every --save-rate superbatches).
 """
 
 from __future__ import annotations
@@ -62,8 +67,6 @@ class PlotConfig:
     net_id: str | None = None
     train_data: str | None = None
     val_data: str | None = None
-    validation_frequency: int | None = None
-    validation_batches: int | None = None
 
     l1: int | None = None
     l2: int | None = None
@@ -140,12 +143,126 @@ def _moving_average(ys: List[float], k: int) -> List[float]:
     return out
 
 
+TRAIN_LOGS = ("log.txt", "train.txt")
+VAL_LOGS = ("val_log.txt", "val.txt")
+_LOG_CACHE: Dict[str, Tuple[Tuple[int, int], List[Tuple[int, int, float]]]] = {}
+
+
+def _read_loss_log(path: str) -> List[Tuple[int, int, float]]:
+    """(superbatch, batch, loss) rows of a checkpoint log, cached until the file changes."""
+    try:
+        stat = os.stat(path)
+    except OSError:
+        return []
+    key = (stat.st_mtime_ns, stat.st_size)
+    cached = _LOG_CACHE.get(path)
+    if cached and cached[0] == key:
+        return cached[1]
+    rows = []
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                parts = line.strip().split(",")
+                if len(parts) != 3:
+                    continue
+                try:
+                    loss = float(parts[2])
+                    if math.isfinite(loss):
+                        rows.append((int(parts[0]), int(parts[1]), loss))
+                except ValueError:
+                    continue
+    except OSError:  # the checkpoint was pruned between listing and reading
+        return []
+    _LOG_CACHE[path] = (key, rows)
+    return rows
+
+
+def checkpoint_dirs(directory: str) -> Dict[int, str]:
+    """{superbatch: path} of the `<net_id>-<superbatch>` checkpoints in a net's directory."""
+    out: Dict[int, str] = {}
+    try:
+        names = os.listdir(directory)
+    except OSError:
+        return out
+    for name in names:
+        _, sep, tail = name.rpartition("-")
+        path = os.path.join(directory, name)
+        if sep and tail.isdigit() and os.path.isdir(path):
+            out[int(tail)] = path
+    return out
+
+
+def _first_existing(directory: str, names) -> str | None:
+    for name in names:
+        path = os.path.join(directory, name)
+        if os.path.isfile(path):
+            return path
+    return None
+
+
+def load_checkpoint_logs(
+    directory: str,
+    batches_per_superbatch: int | None = None,
+    since: float | None = None,
+    start_superbatch: int = 1,
+) -> Series:
+    """Training and validation losses of a (multi-stage) run from its checkpoints.
+
+    Each process (one curriculum stage) rewrites its complete loss record into
+    every checkpoint it saves, so the newest checkpoint of a stage holds the
+    whole stage. Walk back from the newest checkpoint: read its logs, then the
+    newest checkpoint before the first superbatch they cover, and so on. That
+    is one file per stage. With `since` (the run's start time), checkpoints from
+    `start_superbatch` on that are older than the run are left-overs of an
+    earlier run with the same net id and are ignored.
+    """
+    rows: Dict[Tuple[str, int, int], float] = {}
+    covered_from = math.inf
+    for superbatch, path in sorted(checkpoint_dirs(directory).items(), reverse=True):
+        if superbatch >= covered_from:
+            continue
+        train_path = _first_existing(path, TRAIN_LOGS)
+        val_path = _first_existing(path, VAL_LOGS)
+        if train_path is None and val_path is None:
+            continue
+        if since is not None and superbatch >= start_superbatch:
+            newest = max(os.path.getmtime(p) for p in (train_path, val_path) if p)
+            if newest < since - 1:
+                continue
+        train = _read_loss_log(train_path) if train_path else []
+        val = _read_loss_log(val_path) if val_path else []
+        if not train and not val:
+            continue
+        for split, records in (("train", train), ("val", val)):
+            for sb, batch, loss in records:
+                if sb < covered_from:
+                    rows.setdefault((split, sb, batch), loss)
+        covered_from = min(covered_from, min(r[0] for r in train + val))
+        if covered_from <= 1:
+            break
+    if not rows:
+        return {}
+    batch_count = batches_per_superbatch or (max(batch for _, _, batch in rows) + 1)
+    series: Series = {}
+    for (split, sb, batch), loss in rows.items():
+        series.setdefault(split, []).append((sb + batch / batch_count, loss))
+    for points in series.values():
+        points.sort()
+    return series
+
+
 def load_metrics(
     path: str,
     include_archived: bool = False,
     batches_per_superbatch: int | None = None,
+    since: float | None = None,
+    start_superbatch: int = 1,
 ) -> Series:
-    """Load global superbatch coordinates, deduplicating stage copies."""
+    """Load global superbatch coordinates from a net directory (checkpoint logs)
+    or from a legacy metrics.csv, deduplicating stage copies."""
+
+    if os.path.isdir(path):
+        return load_checkpoint_logs(path, batches_per_superbatch, since, start_superbatch)
 
     paths = []
 
@@ -629,16 +746,17 @@ def _draw_wdl(ax, series: Series, config: PlotConfig | None, stages) -> None:
         else config.wdl_start
     )
 
+    def wdl_at(x: float) -> float:
+        # Same curriculum-wide taper as nnue/v2.rs and v3.rs (CurriculumWDL).
+        progress = min(1.0, max(0.0, (x - 1) / max(1.0, final_sb - 1)))
+        return config.wdl_start + (end - config.wdl_start) * progress
+
     xs = [
         final_sb * i / 100
         for i in range(101)
     ]
 
-    ys = [
-        config.wdl_start
-        + (end - config.wdl_start) * (x / final_sb)
-        for x in xs
-    ]
+    ys = [wdl_at(x) for x in xs]
 
     ax.plot(
         xs,
@@ -647,9 +765,7 @@ def _draw_wdl(ax, series: Series, config: PlotConfig | None, stages) -> None:
         label="WDL schedule",
     )
 
-    current = config.wdl_start + (
-        end - config.wdl_start
-    ) * min(1.0, max_x / final_sb)
+    current = wdl_at(max_x)
 
     ax.scatter(
         [max_x],
@@ -891,16 +1007,6 @@ def _draw_info(
                 f"Val: {os.path.basename(config.val_data)}"
             )
 
-        if config.validation_frequency is not None:
-            right_lines.append(
-                f"Val frequency: every {config.validation_frequency:,} batches"
-            )
-
-        if config.validation_batches is not None:
-            right_lines.append(
-                f"Val batches / eval: {config.validation_batches:,}"
-            )
-
     ax.text(
         0.01,
         0.92,
@@ -1029,6 +1135,8 @@ def render(
 
 
 def _title_for(path: str) -> str:
+    if os.path.isdir(path):
+        return f"Bullet training — {os.path.basename(os.path.abspath(path))}"
     parent = (
         os.path.basename(
             os.path.dirname(
@@ -1050,6 +1158,8 @@ def one_shot(
     config: PlotConfig | None = None,
     fig=None,
     axes=None,
+    since: float | None = None,
+    start_superbatch: int = 1,
 ) -> None:
     """Render a single static frame and save it to `out_png`.
 
@@ -1076,6 +1186,7 @@ def one_shot(
     series = load_metrics(
         path, include_archived=True,
         batches_per_superbatch=config.batches_per_superbatch if config else None,
+                since=since, start_superbatch=start_superbatch,
     )
 
     render(
@@ -1110,6 +1221,8 @@ def watch(
     fig=None,
     axes=None,
     close_on_exit: bool = True,
+    since: float | None = None,
+    start_superbatch: int = 1,
 ) -> None:
     """Live-refresh the dashboard until stop() returns True.
 
@@ -1143,6 +1256,7 @@ def watch(
                 path,
                 include_archived=True,
                 batches_per_superbatch=config.batches_per_superbatch if config else None,
+                since=since, start_superbatch=start_superbatch,
             )
 
             # Without a fixed batch count, inferred fractions can change.
@@ -1200,6 +1314,7 @@ def watch(
         loaded = load_metrics(
             path, include_archived=True,
             batches_per_superbatch=config.batches_per_superbatch if config else None,
+                since=since, start_superbatch=start_superbatch,
         )
         if config and config.batches_per_superbatch:
             history = _merge_series(history, loaded)
@@ -1241,7 +1356,7 @@ def main() -> None:
 
     p.add_argument(
         "metrics",
-        help="path to metrics.csv",
+        help="a net's output directory (checkpoint logs) or a legacy metrics.csv",
     )
 
     p.add_argument(
@@ -1279,14 +1394,10 @@ def main() -> None:
 
     args = p.parse_args()
 
-    out_png = (
-        args.output
-        or os.path.join(
-            os.path.dirname(
-                os.path.abspath(args.metrics)
-            ),
-            "loss.png",
-        )
+    out_png = args.output or os.path.join(
+        os.path.abspath(args.metrics) if os.path.isdir(args.metrics)
+        else os.path.dirname(os.path.abspath(args.metrics)),
+        "loss.png",
     )
 
     if args.watch:

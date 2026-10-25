@@ -13,6 +13,8 @@ logs/
 # nnue training
 /nnue/checkpoints/
 /nnue/training_data/
+/nnue/target/
+/nnue/hpo/
 
 # Virtual environments
 .venv/

@@ -1,42 +1,49 @@
 #!/usr/bin/env python3
 """
-Training wrapper around the bullet Rust trainer.
+Training wrapper around the bullet Rust trainer (the fork in libs/bullet).
 
 Primary purpose: make long training runs visual-friendly. It launches the
-chosen cargo example, tees its (colourful) output to your console and a log
-file, and shows a live-updating loss plot fed by the trainer's `metrics.csv`.
+training script, tees its (colourful) output to your console and a log file,
+and shows a live-updating loss plot fed by the loss logs bullet writes into
+every checkpoint (<net>/<net_id>-<superbatch>/log.txt and val_log.txt), so the
+plot advances each time a checkpoint is saved (--save-rate).
 
-Secondary purpose: light tuning control. Any of the tuning flags below are
-forwarded to the example via env variables (currently wired up in
-`examples/halfka_deep.rs`).
+Training scripts: --example NAME runs nnue/NAME.rs (v2, v3) through the small
+cargo package in nnue/Cargo.toml, which builds against libs/bullet; any other
+NAME is run as an example of the bullet workspace itself. Tuning flags are
+forwarded to the script as environment variables.
 
 Multi-dataset (curriculum) runs:
-    Pass --train-data with more than one path and each one is run as its own
-    sequential stage: stage 1 trains from scratch, stage 2+ advance
-    `superbatch_start` so the Rust side loads the checkpoint
-    left behind by the previous stage (same --output-dir / --net-id) and
-    continues training on the new dataset. Per-stage logs/metrics/plots are
-    archived as e.g. `train_stage2.log`, `metrics_stage2.csv`, `loss_stage2.png`
-    so nothing gets clobbered when the next stage starts writing metrics.csv.
+    Pass --train-data with more than one path (or a folder) and each dataset is
+    run as its own sequential stage: stage 1 trains from scratch, stage 2+
+    start at the next global superbatch and load the checkpoint the previous
+    stage saved at its last superbatch (same --output-dir / --net-id), then
+    continue on the new dataset. Before each stage the checkpoint is checked to
+    exist, and after it the stage's own final checkpoint, so a failed stage
+    stops the curriculum instead of silently training from random weights.
+    --reset-optimiser loads only the weights at each stage boundary (fresh
+    AdamW moments); by default the optimiser state carries over too.
 
-    LR scheduling across stages: Bullet indexes its cosine by the global
+    Schedules across stages: bullet indexes its cosine LR by the global
     superbatch number. Every stage receives the same `lr_start`, `lr_final`,
-    and `lr_final_superbatch` (the final superbatch of the curriculum).
-    `superbatches` accepts one shared length or one length per dataset stage. This gives one
-    global cosine matching the dashboard, without restarting or clamping
-    the decay at stage boundaries. Supported by nnue/v2.rs and nnue/v3.rs.
+    and `lr_final_superbatch` (the final superbatch of the curriculum), and the
+    WDL blend tapers over the same global range (`wdl_final_superbatch`), so
+    both follow one curve across all stages, matching the dashboard.
+    `superbatches` accepts one shared length or one length per dataset stage.
+    --superbatch-start N resumes a run from checkpoint N-1.
 
 Examples:
-    python python/train.py --example halfka_deep --features cuda
-    python python/train.py --example halfka_deep --superbatches 400 --lr_start 0.0008 \
-        --train-data data/train.binpack --val-data data/val.binpack
+    python nnue/train.py --example v3 --features cuda
+    python nnue/train.py --example v3 --superbatches 400 --lr_start 0.0008 \
+        --train-data train.binpack --val-data val.binpack
 
     # curriculum: three stages, one dataset each, checkpoints chained
-    python python/train.py --example halfka_deep --net-id my_net \
-        --train-data data/stage1.binpack data/stage2.binpack data/stage3.binpack \
-        --val-data data/val.binpack
+    python nnue/train.py --example v3 --net-id my_net \
+        --train-data stage1.binpack stage2.binpack stage3.binpack --superbatches 200 400 800 \
+        --val-data val.binpack
 
-    python python/train.py --example halfka_deep --no-plot        # headless
+    python nnue/train.py --example v3 --no-plot        # headless
+Dataset paths are taken as given, or else relative to libs/bullet/data.
 """
 from __future__ import annotations
 
@@ -44,21 +51,37 @@ import argparse
 import json
 import math
 import os
+import re
 import shutil
 import subprocess
 import sys
 import threading
+import time
 from datetime import datetime
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 # train.py lives in /san-jacinto/nnue/
 SAN_JACINTO_ROOT = os.path.dirname(HERE)
 NNUE_SJ_ROOT = os.path.join(SAN_JACINTO_ROOT, "nnue")
+NNUE_MANIFEST = os.path.join(NNUE_SJ_ROOT, "Cargo.toml")
 # Bullet lives in /san-jacinto/libs/bullet/
 BULLET_ROOT = os.path.join(SAN_JACINTO_ROOT, "libs", "bullet")
 DATA_ROOT = os.path.join(BULLET_ROOT, "data")
 
 DATASET_EXTENSIONS = (".binpack", ".bin")
+def resolve_dataset(entry: str, data_root: str) -> str:
+    """Absolute path of a dataset file/folder: as given, or else under `data_root`.
+
+    Paths are made absolute because cargo runs with libs/bullet as its working
+    directory, where a path relative to wherever train.py was started would
+    silently point somewhere else.
+    """
+    for candidate in (entry, os.path.join(data_root, entry)):
+        if os.path.exists(candidate):
+            return os.path.abspath(candidate)
+    raise FileNotFoundError(f"dataset not found: {entry} (also looked in {data_root})")
+
+
 def expand_train_data(entries: list[str], data_root: str) -> list[str]:
     """Resolve --train-data entries into a flat, ordered list of dataset
     file paths. Each entry can be:
@@ -75,12 +98,7 @@ def expand_train_data(entries: list[str], data_root: str) -> list[str]:
     expanded: list[str] = []
 
     for entry in entries:
-        candidate = entry
-
-        if not os.path.exists(candidate):
-            maybe = os.path.join(data_root, entry)
-            if os.path.exists(maybe):
-                candidate = maybe
+        candidate = resolve_dataset(entry, data_root)
 
         if os.path.isdir(candidate):
             files = sorted(
@@ -187,11 +205,36 @@ def build_plot_config(args, train_data, val_data, final_superbatch):
         qc=args.QC if args.QC is not None else 64,
     )
 
+def local_script(example: str) -> str | None:
+    """nnue/<example>.rs if the example is one of san-jacinto's training scripts."""
+    path = os.path.join(NNUE_SJ_ROOT, f"{example}.rs")
+    return path if os.path.isfile(path) and os.path.isfile(NNUE_MANIFEST) else None
+
+
 def build_command(args) -> list:
-    cmd = ["cargo", "run", "--release", "--example", args.example]
+    if local_script(args.example):
+        # nnue/Cargo.toml builds nnue/*.rs against libs/bullet. Seed its lock file from
+        # the fork's, so the dependencies are the versions the fork was tested with.
+        lock = os.path.join(NNUE_SJ_ROOT, "Cargo.lock")
+        bullet_lock = os.path.join(BULLET_ROOT, "Cargo.lock")
+        if not os.path.exists(lock) and os.path.exists(bullet_lock):
+            shutil.copy2(bullet_lock, lock)
+        cmd = ["cargo", "run", "--release", "--manifest-path", NNUE_MANIFEST, "--bin", args.example]
+    else:
+        cmd = ["cargo", "run", "--release", "--example", args.example]
     if args.features:
         cmd += ["--features", args.features]
     return cmd
+
+
+def checkpoint_path(out_dir: str, net_id: str, superbatch: int) -> str:
+    """Directory bullet saves the checkpoint of `superbatch` to."""
+    return os.path.join(out_dir, f"{net_id}-{superbatch}")
+
+
+def checkpoint_ready(out_dir: str, net_id: str, superbatch: int) -> bool:
+    return os.path.isfile(os.path.join(checkpoint_path(out_dir, net_id, superbatch),
+                                       "optimiser_state", "weights.bin"))
 
 
 def build_env(
@@ -215,11 +258,13 @@ def build_env(
         "lr_final_superbatch": final_superbatch,
         "wdl_start": args.wdl_start,
         "wdl_end": args.wdl_end,
+        "wdl_final_superbatch": final_superbatch,
+        "reset_optimiser": 1 if args.reset_optimiser else None,
 
         "net_id": args.net_id,
         "output_dir": out_dir,
         "train_data": train_data,
-        "val_data": os.path.join(DATA_ROOT, val_data) if val_data is not None else None,
+        "val_data": val_data,
 
         "save_rate": args.save_rate,
         "batch_size": args.batch_size,
@@ -244,16 +289,141 @@ def build_env(
     return env
 
 
-def stream_output(proc: subprocess.Popen, log_path: str) -> None:
-    """Tee subprocess stdout to our stdout and a log file."""
+def stream_output(proc: subprocess.Popen, log_path: str, on_line=None) -> None:
+    """Tee subprocess stdout to our stdout and a log file (and to `on_line`, if given)."""
     os.makedirs(os.path.dirname(log_path), exist_ok=True)
-    with open(log_path, "w", encoding="utf-8", errors="replace") as log:
-        assert proc.stdout is not None
+    with open(log_path, "w", encoding="utf-8", errors="replace") as log, proc.stdout:
         for line in proc.stdout:
             sys.stdout.write(line)
             sys.stdout.flush()
             log.write(line)
             log.flush()
+            if on_line is not None:
+                try:
+                    on_line(line)
+                except Exception as exc:  # never let bookkeeping kill the training output
+                    print(f"[train] best-checkpoint tracking error: {exc}")
+
+
+_ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+_SAVED = re.compile(r"Saved \[(.+)-(\d+)\]")
+
+
+def effective_wdl(args) -> tuple[float, float]:
+    """WDL start/end as the training scripts see them (their default is a constant 0.25)."""
+    start = args.wdl_start if args.wdl_start is not None else 0.25
+    end = args.wdl_end if args.wdl_end is not None else 0.25
+    return start, end
+
+
+class BestTracker:
+    """Keep the state with the lowest validation loss, at any superbatch.
+
+    bullet saves only every save_rate superbatches, and its run() has no hook,
+    so the trainer is run with save_rate=1 and this class does the rest from the
+    trainer's "Saved [<net>-<N>]" lines: it reads the validation loss measured
+    at the end of superbatch N (on exactly the weights saved in checkpoint N),
+    hard-links checkpoint N into <net>/best/ (with best.json) when it is the
+    lowest so far, and deletes the checkpoints nobody asked for: every
+    `keep_every`-th and each stage's last one are kept (curriculum chaining and
+    resuming need them). Deletion lags one checkpoint so the newest one always
+    exists for the live plot.
+
+    Only meaningful when the WDL blend is constant: validation loss is computed
+    against the current blend, so losses at different blends are not comparable.
+    One tracker per validation set; a new set starts a new best.
+    """
+
+    def __init__(self, out_dir: str, net_id: str, keep_every: int, val_data: str | None,
+                 wdl: tuple[float, float], best_dir: str | None = None):
+        self.out_dir, self.net_id, self.keep_every = out_dir, net_id, keep_every
+        self.val_data, self.wdl = val_data, wdl
+        self.best_dir = best_dir or os.path.join(out_dir, "best")
+        self.keep = set()          # superbatches that must survive (stage ends)
+        self.pending = None        # last processed superbatch, deleted when the next one arrives
+        self.best_loss, self.best_superbatch = math.inf, None
+        self._load_previous()
+
+    def _load_previous(self):
+        info_path = os.path.join(self.best_dir, "best.json")
+        if not os.path.isfile(info_path):
+            return
+        try:
+            with open(info_path, encoding="utf-8") as f:
+                info = json.load(f)
+        except (OSError, ValueError):
+            return
+        if info.get("val_data") == self.val_data and info.get("wdl") == list(self.wdl) \
+                and info.get("net_id") == self.net_id:
+            self.best_loss, self.best_superbatch = info["val_loss"], info["superbatch"]
+            print(f"[train] continuing best tracking: {self.best_loss:.6f} at superbatch {self.best_superbatch}")
+        else:
+            stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            os.replace(self.best_dir, f"{self.best_dir}_previous_{stamp}")
+            print(f"[train] earlier best/ was for other settings; kept as best_previous_{stamp}")
+
+    def on_line(self, line: str) -> None:
+        match = _SAVED.search(_ANSI.sub("", line))
+        if match and match.group(1) == self.net_id:
+            self.on_saved(int(match.group(2)))
+
+    def validation_loss(self, superbatch: int) -> float | None:
+        path = os.path.join(checkpoint_path(self.out_dir, self.net_id, superbatch), "val_log.txt")
+        loss, last_batch = None, -1
+        try:
+            with open(path, encoding="utf-8", errors="replace") as f:
+                for row in f:
+                    parts = row.strip().split(",")
+                    if len(parts) == 3 and parts[0] == str(superbatch) and int(parts[1]) > last_batch:
+                        last_batch, loss = int(parts[1]), float(parts[2])
+        except (OSError, ValueError):
+            return None
+        return loss if loss is not None and math.isfinite(loss) else None
+
+    def on_saved(self, superbatch: int) -> None:
+        loss = self.validation_loss(superbatch)
+        if loss is not None and loss < self.best_loss:
+            self._save_best(superbatch, loss)
+        if self.pending is not None and self.pending != superbatch:
+            self._prune(self.pending)
+        self.pending = superbatch
+
+    def _save_best(self, superbatch: int, loss: float) -> None:
+        source = checkpoint_path(self.out_dir, self.net_id, superbatch)
+        staging = self.best_dir + ".new"
+        shutil.rmtree(staging, ignore_errors=True)
+        for root, _, files in os.walk(source):
+            target = os.path.join(staging, os.path.relpath(root, source))
+            os.makedirs(target, exist_ok=True)
+            for name in files:
+                try:
+                    os.link(os.path.join(root, name), os.path.join(target, name))  # instant, no extra space
+                except OSError:
+                    shutil.copy2(os.path.join(root, name), os.path.join(target, name))
+        with open(os.path.join(staging, "best.json"), "w", encoding="utf-8") as f:
+            json.dump(dict(net_id=self.net_id, superbatch=superbatch, val_loss=loss, val_data=self.val_data,
+                           wdl=list(self.wdl), checkpoint=f"{self.net_id}-{superbatch}",
+                           saved=datetime.now().isoformat(timespec="seconds")), f, indent=2)
+        shutil.rmtree(self.best_dir, ignore_errors=True)
+        os.replace(staging, self.best_dir)
+        self.best_loss, self.best_superbatch = loss, superbatch
+
+    def _prune(self, superbatch: int) -> None:
+        if superbatch in self.keep or (self.keep_every and superbatch % self.keep_every == 0):
+            return
+        shutil.rmtree(checkpoint_path(self.out_dir, self.net_id, superbatch), ignore_errors=True)
+
+    def finish_stage(self, stage_end: int) -> None:
+        """Keep the stage's last checkpoint (the next stage continues from it)."""
+        self.keep.add(stage_end)
+        if self.pending is not None and self.pending != stage_end:
+            self._prune(self.pending)
+        self.pending = None
+
+    def report(self) -> None:
+        if self.best_superbatch is not None:
+            print(f"[train] best validation loss {self.best_loss:.6f} at superbatch {self.best_superbatch} "
+                  f"-> {self.best_dir}")
 
 
 def net_output_dir(args) -> str:
@@ -317,6 +487,49 @@ def archive_previous_plot(out_dir: str, history_dir: str) -> None:
     print(f"[train] previous plot history saved to {backup_dir}")
 
 
+def _wait_for_stage(args, proc, out_dir, out_png, train_data, val_data, final_superbatch,
+                    stage_boundaries, fig, axes, run_started) -> None:
+    """Block until the trainer exits, refreshing the live plot meanwhile (unless --no-plot)."""
+    if args.no_plot:
+        try:
+            proc.wait()
+        except KeyboardInterrupt:
+            proc.terminate()
+        return
+    try:
+        import plot  # local module (nnue/plot.py)
+
+        plot_config = build_plot_config(
+            args,
+            train_data,
+            val_data,
+            final_superbatch
+        )
+
+        # fig/axes is the one shared dashboard built once in main();
+        # close_on_exit=False keeps it alive for the next stage.
+        plot.watch(
+            out_dir,
+            out_png,
+            smooth=args.smooth,
+            log_y=args.log_y,
+            interval=args.interval,
+            stop=lambda: proc.poll() is not None,
+            stages=stage_boundaries,
+            config=plot_config,
+            fig=fig,
+            axes=axes,
+            close_on_exit=False,
+            since=run_started,
+            start_superbatch=args.superbatch_start,
+        )
+    except ImportError as e:
+        print(f"[train] matplotlib unavailable ({e}); running without live plot.")
+        print("[train] install with: pip install -r requirements.txt")
+    if proc.poll() is None:
+        proc.wait()
+
+
 def run_stage(
     args,
     train_data: str,
@@ -327,6 +540,8 @@ def run_stage(
     stage_boundaries: list[tuple[int, int, str]],
     fig=None,
     axes=None,
+    run_started: float | None = None,
+    tracker: BestTracker | None = None,
 ) -> int:
     """Launch one cargo training run and return its exit code."""
     out_dir = net_output_dir(args)
@@ -341,23 +556,34 @@ def run_stage(
         out_dir,
         final_superbatch=final_superbatch,
     )
+    if tracker is not None:
+        env["save_rate"] = "1"  # every superbatch reaches disk; BestTracker keeps what is needed
 
     metrics_csv = os.path.join(out_dir, "metrics.csv")
     out_png = os.path.join(out_dir, "loss.png")
     log_path = os.path.join(out_dir, f"train{stage_label}.log")
+    stage_end = start_superbatch + args.superbatches - 1
 
     if os.path.exists(metrics_csv):
         os.remove(metrics_csv)
+    if start_superbatch > 1 and not checkpoint_ready(out_dir, args.net_id, start_superbatch - 1):
+        print(f"[train] cannot start at superbatch {start_superbatch}: the checkpoint "
+              f"{checkpoint_path(out_dir, args.net_id, start_superbatch - 1)} it continues from "
+              "does not exist (did the previous stage finish?)")
+        return 3
 
     print(f"\n{'=' * 60}")
-    print(f"[train] stage{stage_label or ' (single run)'}: {train_data}")
-    print(f"[train] superbatch_start={env['superbatch_start']}")
+    print(f"[train] {stage_label.lstrip('_') or 'single run'}: {train_data}")
+    print(f"[train] superbatches {start_superbatch}-{stage_end}"
+          + (f", continuing from {checkpoint_path(out_dir, args.net_id, start_superbatch - 1)}"
+             + (" (weights only, fresh optimiser)" if args.reset_optimiser else "")
+             if start_superbatch > 1 else ", from scratch"))
     print(f"[train] lr_start={env.get('lr_start')} lr_final={env.get('lr_final')}")
-    print(f"[train] lr_final_superbatch={env['lr_final_superbatch']}")
+    print(f"[train] lr/wdl schedules end at superbatch {env['lr_final_superbatch']}")
     print(f"{'=' * 60}")
     print(f"Running: {' '.join(cmd)}")
     print(f"Working dir: {BULLET_ROOT}")
-    print(f"Metrics: {metrics_csv}\n")
+    print(f"Checkpoints and loss logs: {out_dir}\n")
 
     proc = subprocess.Popen(
         cmd,
@@ -369,49 +595,26 @@ def run_stage(
         bufsize=1,
     )
 
-    tee = threading.Thread(target=stream_output, args=(proc, log_path), daemon=True)
+    tee = threading.Thread(target=stream_output, args=(proc, log_path),
+                           kwargs=dict(on_line=tracker.on_line if tracker else None), daemon=True)
     tee.start()
 
-    if args.no_plot:
-        try:
-            proc.wait()
-        except KeyboardInterrupt:
+    try:
+        _wait_for_stage(args, proc, out_dir, out_png, train_data, val_data, final_superbatch,
+                        stage_boundaries, fig, axes, run_started)
+    finally:
+        # Whatever happened (normal end, failure, Ctrl+C): stop the trainer if it still runs,
+        # let the tee thread see its last "Saved" lines, then delete the temporary
+        # every-superbatch checkpoints so only the save-rate ones, the stage end and best/ remain.
+        if proc.poll() is None:
             proc.terminate()
-    else:
-        try:
-            import plot  # local module (python/plot.py)
-
-            plot_config = build_plot_config(
-                args,
-                train_data,
-                val_data,
-                final_superbatch
-            )
-
-            # fig/axes is the one shared dashboard built once in main();
-            # close_on_exit=False keeps it alive for the next stage.
-            plot.watch(
-                metrics_csv,
-                out_png,
-                smooth=args.smooth,
-                log_y=args.log_y,
-                interval=args.interval,
-                stop=lambda: proc.poll() is not None,
-                stages=stage_boundaries,
-                config=plot_config,
-                fig=fig,
-                axes=axes,
-                close_on_exit=False,
-            )
-        except ImportError as e:
-            print(f"[train] matplotlib unavailable ({e}); running without live plot.")
-            print("[train] install with: pip install -r python/requirements.txt")
-            proc.wait()
-        finally:
-            if proc.poll() is None:
-                proc.wait()
-
-    tee.join(timeout=5)
+            try:
+                proc.wait(timeout=60)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+        tee.join(timeout=5)
+        if tracker is not None:
+            tracker.finish_stage(stage_end)
 
     # (No separate final-render step here anymore -- plot.watch() already
     # does a fresh reload + render + save right before it returns, using
@@ -420,7 +623,7 @@ def run_stage(
     # at every stage boundary.)
 
     code = proc.returncode or 0
-    print(f"\n[train] stage{stage_label or ''} cargo exited with code {code}")
+    print(f"\n[train] stage{stage_label or 'run'} cargo exited with code {code}")
 
     # archive this stage's metrics/plot so the next stage's metrics.csv
     # (which the trainer will overwrite) doesn't clobber this one
@@ -433,17 +636,31 @@ def run_stage(
                     shutil.copy2(src, dst)
                 except OSError:
                     pass
+                
+    if code == 0 and not checkpoint_ready(out_dir, args.net_id, stage_end):
+        print(f"[train] the stage exited normally but its final checkpoint "
+              f"{checkpoint_path(out_dir, args.net_id, stage_end)} is missing")
+        return 4
+
+    # Keep a copy of the dashboard as it looked at the end of each stage.
+    if stage_label and os.path.exists(out_png):
+        try:
+            shutil.copy2(out_png, os.path.join(out_dir, f"loss{stage_label}.png"))
+        except OSError:
+            pass
 
     return code
 
 
 def main() -> int:
     p = argparse.ArgumentParser(description="Launch + visualise a bullet training run.")
-    p.add_argument("--example", default="halfka_deep", help="cargo example name to run")
+    p.add_argument("--example", default="v3",
+                   help="training script: nnue/<name>.rs (v2, v3) or a bullet workspace example")
     p.add_argument("--features", default=None, help="cargo features, e.g. cuda / rocm / metal")
 
     # tuning control
-    p.add_argument("--superbatch-start", type=int, default=1)
+    p.add_argument("--superbatch-start", type=int, default=1,
+                   help="first superbatch; > 1 resumes from checkpoint <net-id>-<start-1>")
     p.add_argument("--superbatches", type=int, nargs="+", default=[800], metavar="N",
                    help="one length for all stages or one per resolved dataset, "
                         "e.g. 200 400 800 (default: 800 per stage)")
@@ -451,6 +668,10 @@ def main() -> int:
     p.add_argument("--lr_final", type=float, default=None)
     p.add_argument("--wdl-start", type=float, default=None)
     p.add_argument("--wdl-end", type=float, default=None)
+    p.add_argument("--reset-optimiser", action="store_true",
+                   help="at each stage boundary / resume, load only the weights (fresh AdamW moments)")
+    p.add_argument("--no-best", action="store_true",
+                   help="do not keep the lowest-validation state in <net>/best/ (tracked only with a constant WDL)")
 
     # data
     p.add_argument("--net-id", default=os.environ.get("net_id", "1024x16x32_25wdl"))
@@ -516,15 +737,24 @@ def main() -> int:
     # Curriculum learning
 
     stage_boundaries = []
-    train_stages = (
-        expand_train_data(args.train_data, DATA_ROOT)
-        if args.train_data
-        else [None]
-    )
+    try:
+        train_stages = (
+            expand_train_data(args.train_data, DATA_ROOT)
+            if args.train_data
+            else [None]
+        )
+        val_resolved = [resolve_dataset(v, DATA_ROOT) for v in args.val_data] if args.val_data else None
+    except FileNotFoundError as exc:
+        print(f"[train] {exc}")
+        return 2
 
     if not train_stages:
         print("[train] no dataset files resolved from --train-data")
         return 2
+
+    if not local_script(args.example):
+        print(f"[train] nnue/{args.example}.rs not found; running '{args.example}' as a bullet "
+              "workspace example (it must be registered in libs/bullet)")
 
     # stage lengths
 
@@ -548,21 +778,29 @@ def main() -> int:
         f"[train] global LR schedule: {initial_lr:g} -> {final_lr:g} "
         f"over superbatches 1-{final_superbatch} (continuous across stages)"
     )
+    if args.wdl_start is not None or args.wdl_end is not None:
+        print(f"[train] global WDL taper: {args.wdl_start} -> {args.wdl_end} over superbatches 1-{final_superbatch}")
 
     val_stages: list
-    if args.val_data is None:
+    if val_resolved is None:
         val_stages = [None] * len(train_stages)
-    elif len(args.val_data) == 1:
-        val_stages = args.val_data * len(train_stages)
-    elif len(args.val_data) == len(train_stages):
-        val_stages = args.val_data
+    elif len(val_resolved) == 1:
+        val_stages = val_resolved * len(train_stages)
+    elif len(val_resolved) == len(train_stages):
+        val_stages = val_resolved
     else:
         print(
-            f"[train] --val-data has {len(args.val_data)} entries but "
+            f"[train] --val-data has {len(val_resolved)} entries but "
             f"--train-data has {len(train_stages)}; pass one val set total "
             f"or one per training stage."
         )
         return 2
+
+    out_dir = net_output_dir(args)
+    if start_superbatch > 1 and not checkpoint_ready(out_dir, args.net_id, start_superbatch - 1):
+        print(f"[train] --superbatch-start {start_superbatch} resumes from "
+              f"{checkpoint_path(out_dir, args.net_id, start_superbatch - 1)}, which does not exist")
+        return 3
 
     if not args.no_plot:
         try:
@@ -572,6 +810,19 @@ def main() -> int:
             print(f"[train] matplotlib unavailable ({e}); running without live plot.")
             args.no_plot = True
 
+    run_started = time.time()
+    wdl = effective_wdl(args)
+    trackers: dict = {}
+    if args.no_best:
+        print("[train] best-validation tracking off (--no-best)")
+    elif wdl[0] != wdl[1]:
+        print(f"[train] best-validation tracking off: the WDL blend changes ({wdl[0]} -> {wdl[1]}), so "
+              "validation losses at different superbatches are measured against different targets")
+    else:
+        keep_every = args.save_rate or 10
+        print(f"[train] keeping the lowest-validation state in {os.path.join(out_dir, 'best')} "
+              f"(trainer saves every superbatch; checkpoints kept every {keep_every} and at stage ends)")
+    distinct_val = len({v for v in val_stages})
     try:
         archive_previous_plot(
             net_output_dir(args),
@@ -590,6 +841,16 @@ def main() -> int:
                 f"{_cosine_lr(stage_end, initial_lr, final_lr, final_superbatch):.6g}"
             )
 
+            tracker = None
+            if not args.no_best and wdl[0] == wdl[1]:
+                if val_data not in trackers:
+                    # One best per validation set: losses on different sets are not comparable.
+                    name = "best" if distinct_val == 1 else \
+                        f"best_{os.path.splitext(os.path.basename(val_data or 'default'))[0]}"
+                    trackers[val_data] = BestTracker(out_dir, args.net_id, args.save_rate or 10, val_data, wdl,
+                                                     best_dir=os.path.join(out_dir, name))
+                tracker = trackers[val_data]
+
             code = run_stage(
                 stage_args,
                 train_data=train_data,
@@ -600,6 +861,8 @@ def main() -> int:
                 stage_boundaries=stage_boundaries,
                 fig=dashboard_fig,
                 axes=dashboard_axes,
+                run_started=run_started,
+                tracker=tracker,
             )
 
             if code != 0:
@@ -609,6 +872,8 @@ def main() -> int:
                 )
                 return code
 
+        for tracker in trackers.values():
+            tracker.report()
         register_checkpoints(args)
         return 0
     finally:

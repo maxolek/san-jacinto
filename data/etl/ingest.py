@@ -32,7 +32,6 @@ def _count_jsonl_rows(path):
     with open(path) as f:
         return sum(1 for line in f if line.strip())
 
-
 # ─────────────────────────────────────────────────────────────────────────────
 # Log fields -> columns
 # ─────────────────────────────────────────────────────────────────────────────
@@ -425,56 +424,111 @@ def log_engine_ratings(cnxn, engine_id, ratings) -> int:
     return cur.lastrowid
 
 def log_sprt(cnxn, experiment_id, candidate_engine_id, baseline_engine_id, **kwargs) -> int:
-    """Log an SPRT experiment result and return its row ID."""
+    """Log an SPRT experiment result and return its row ID.
+
+    kwargs are the run's arguments plus the final pentanomial snapshot of
+    utils.pentanomial / tests.sprt. Columns added later (pentanomial counts,
+    intervals, core-type summary, ...) are written only when the table has
+    them, so databases that were not migrated yet keep working.
+    """
     ensure_schema(cnxn)  # nodes_per_move, threads
-    cur = cnxn.execute(
-        """
-        INSERT INTO sprt (
-            experiment_id, baseline_engine_id, candidate_engine_id,
-            opening_book, book_depth, time_control, time_per_move,
-            depth_per_move, nodes_per_move, threads, elo0, elo1, alpha, beta, result, elo_diff,
-            llr, los, candidate_wins, candidate_losses, candidate_draws,
-            candidate_white_wins, candidate_white_losses, candidate_white_draws,
-            candidate_black_wins, candidate_black_losses, candidate_black_draws,
-            games_played, run_time_s
-        )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            experiment_id,
-            baseline_engine_id,
-            candidate_engine_id,
-            kwargs.get("book"),
-            kwargs.get("book_depth"),
-            kwargs.get("tc"),
-            kwargs.get("time"),
-            kwargs.get("depth"),
-            kwargs.get("nodes"),
-            kwargs.get("threads"),
-            kwargs.get("elo0"),
-            kwargs.get("elo1"),
-            kwargs.get("alpha"),
-            kwargs.get("beta"),
-            kwargs.get("result"),
-            kwargs.get("elo_diff"),
-            kwargs.get("llr"),
-            kwargs.get("los"),
-            kwargs.get("candidate_wins"),
-            kwargs.get("candidate_losses"),
-            kwargs.get("candidate_draws"),
-            kwargs.get("candidate_white_wins"),
-            kwargs.get("candidate_white_losses"),
-            kwargs.get("candidate_white_draws"),
-            kwargs.get("candidate_black_wins"),
-            kwargs.get("candidate_black_losses"),
-            kwargs.get("candidate_black_draws"),
-            kwargs.get("games_played"),
-            kwargs.get("runtime"),
-        )
+    penta = kwargs.get("pentanomial") or [None] * 5
+    detail = kwargs.get("pentanomial_detail") or {}
+
+    values = dict(
+        experiment_id=experiment_id,
+        baseline_engine_id=baseline_engine_id,
+        candidate_engine_id=candidate_engine_id,
+        opening_book=kwargs.get("book"),
+        book_depth=kwargs.get("book_depth"),
+        time_control=kwargs.get("tc"),
+        time_per_move=kwargs.get("time"),
+        depth_per_move=kwargs.get("depth"),
+        elo0=kwargs.get("elo0"),
+        elo1=kwargs.get("elo1"),
+        alpha=kwargs.get("alpha"),
+        beta=kwargs.get("beta"),
+        result=kwargs.get("result"),
+        elo_diff=kwargs.get("elo_diff"),
+        llr=kwargs.get("llr"),
+        los=kwargs.get("los"),
+        candidate_wins=kwargs.get("candidate_wins"),
+        candidate_losses=kwargs.get("candidate_losses"),
+        candidate_draws=kwargs.get("candidate_draws"),
+        candidate_white_wins=kwargs.get("candidate_white_wins"),
+        candidate_white_losses=kwargs.get("candidate_white_losses"),
+        candidate_white_draws=kwargs.get("candidate_white_draws"),
+        candidate_black_wins=kwargs.get("candidate_black_wins"),
+        candidate_black_losses=kwargs.get("candidate_black_losses"),
+        candidate_black_draws=kwargs.get("candidate_black_draws"),
+        games_played=kwargs.get("games_played"),
+        run_time_s=kwargs.get("runtime"),
+        # pentanomial model (newer columns)
+        pairs=kwargs.get("pairs"),
+        penta_ll=penta[0], penta_ld=penta[1],
+        penta_dd=detail.get("DD"), penta_wl=detail.get("WL"),
+        penta_wd=penta[3], penta_ww=penta[4],
+        score=kwargs.get("score"),
+        elo_low=kwargs.get("elo_low"),
+        elo_high=kwargs.get("elo_high"),
+        nelo=kwargs.get("nelo"),
+        nelo_low=kwargs.get("nelo_low"),
+        nelo_high=kwargs.get("nelo_high"),
+        draw_ratio=kwargs.get("draw_ratio"),
+        variance_ratio=kwargs.get("variance_ratio"),
+        concurrency=kwargs.get("slots") or kwargs.get("concurrency"),
+        core_summary=json.dumps({core: {k: s.get(k) for k in ("pairs", "elo_diff", "elo_low", "elo_high",
+                                                               "nelo", "pentanomial", "wins", "draws", "losses")}
+                                 for core, s in (kwargs.get("by_core") or {}).items()}) if kwargs.get("by_core") else None,
+        excluded_pairs=kwargs.get("voided_pairs"),
+        run_id=kwargs.get("run_id"),
+        book_seed=kwargs.get("book_seed"),
+        env_host=kwargs.get("env_host"),
+        env_cpu_model=kwargs.get("env_cpu_model"),
     )
+
+    columns = [c for c in values if c in _table_columns(cnxn, "sprt")]
+    cur = cnxn.execute(
+        f"INSERT INTO sprt ({', '.join(columns)}) VALUES ({', '.join('?' for _ in columns)})",
+        [values[c] for c in columns],
+    )
+    
     cnxn.commit()
     return cur.lastrowid
 
+def _table_columns(cnxn, table):
+    return {row[1] for row in cnxn.execute(f"PRAGMA table_info({table})").fetchall()}
+
+
+def bulk_log_match_games(cnxn, run_dir, experiment_id, engine_ids) -> dict:
+    """Insert one `games` row per game recorded by the match runner in `run_dir`.
+
+    These rows carry the authoritative result and termination (also for
+    adjudicated, resigned and time-forfeit games, which engines do not log),
+    the opening, the moves from the run's PGN, and the environment: logical cpu,
+    P/E core type, measured clock, host and CPU model. `engine_ids` maps the
+    engine names used in the run (e.g. Candidate, Baseline) to engine ids.
+    Returns {(run_id, run_game): games.id}.
+    """
+    from .match_games import game_rows
+
+    rows = game_rows(run_dir, engine_ids, experiment_id)
+    if not rows:
+        return {}
+    available = _table_columns(cnxn, "games")
+    columns = [c for c in rows[0] if c in available]
+    missing = sorted(set(rows[0]) - available)
+    if missing:
+        print(f"[DATA] games table lacks {len(missing)} newer column(s) ({', '.join(missing[:4])}...); "
+              "run data/databases/migrate_schema.py to keep the environment labels")
+    placeholders = ", ".join("?" for _ in columns)
+    mapping = {}
+    for row in rows:
+        cur = cnxn.execute(f"INSERT INTO games ({', '.join(columns)}) VALUES ({placeholders})",
+                           [row[c] for c in columns])
+        mapping[(row["run_id"], row["run_game"])] = cur.lastrowid
+    cnxn.commit()
+    return mapping
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Bulk logging

@@ -1,6 +1,7 @@
 """Database connection helpers and engine probing."""
 import sqlite3
 import os
+import sys
 import time
 import subprocess
 import platform
@@ -319,16 +320,19 @@ def probe_engine_metadata(engine_path, timeout=10.0):
     system = platform.system()
     engine_path = os.path.abspath(engine_path)
 
-    if system == "Windows" and not engine_path.lower().endswith(".exe"):
+    if system == "Windows" and not engine_path.lower().endswith((".exe", ".py")):
         if os.path.exists(engine_path + ".exe"):
             engine_path += ".exe"
 
     if not os.path.exists(engine_path):
         raise FileNotFoundError(f"Engine not found at path: {engine_path}")
 
+    # Python UCI engines (e.g. tests/unit/mock_uci_engine.py) run with this interpreter.
+    command_line = [sys.executable, engine_path] if engine_path.lower().endswith(".py") else [engine_path]
+
     def _run_probe(command):
         p = subprocess.Popen(
-            [engine_path],
+            command_line,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,

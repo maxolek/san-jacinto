@@ -24,7 +24,7 @@
 #include TB_STR(ENGINE_SRC/src/nnue.cpp)
 #include TB_STR(ENGINE_SRC/src/precomp.cpp)
 #include TB_STR(ENGINE_SRC/src/searcher.cpp)
-#include TB_STR(ENGINE_SRC/src/search_threads.cpp)
+#include TB_STR(ENGINE_SRC/src/threads.cpp)
 #include TB_STR(ENGINE_SRC/src/uci.cpp)
 #include TB_STR(ENGINE_SRC/src/affinity.cpp)
 

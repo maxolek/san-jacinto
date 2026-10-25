@@ -44,7 +44,7 @@ New-Item -ItemType Directory -Force -Path (Split-Path $Out) | Out-Null
 $fwd = { param($p) $p -replace '\\', '/' }
 
 $sources = @('board', 'book', 'engine', 'gamestate', 'helpers', 'magics', 'movegen', 'nnue', 'precomp',
-             'searcher', 'search_threads', 'uci', 'affinity', 'main') |
+             'searcher', 'threads', 'uci', 'affinity', 'main') |
            Where-Object { Test-Path (Join-Path $Src "src\$_.cpp") }
 if ($Kernelbench) {
     $main = & $fwd (Join-Path $bench 'kernelbench.cpp')

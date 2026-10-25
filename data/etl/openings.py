@@ -34,6 +34,7 @@ def _build_eco_trie():
             continue
         eco = entry.get("eco", "")
         name = entry.get("name", "")
+        variation = entry.get("variation", "")
 
         node = root
         for mv in moves_seq:
@@ -41,7 +42,7 @@ def _build_eco_trie():
         # Deeper/duplicate entries at the same exact position: last one
         # wins on load (or you could prefer the first — doesn't matter
         # much since exact-duplicate move sequences are rare).
-        node["_entry"] = (eco, name)
+        node["_entry"] = (eco, name, variation)
 
     return root
 
@@ -93,17 +94,17 @@ def _to_uci_moves(tokens):
 
 
 @lru_cache(maxsize=200_000)
-def get_opening_from_moves(moves):
+def get_opening_details(moves):
     """
-    Returns (eco, name) for the deepest/most specific opening position
-    reached by this game's move list. Single linear walk down the trie —
-    O(number of moves), independent of ECO database size.
+    Returns (eco, name, variation) for the deepest/most specific opening
+    position reached by this game's move list. Single linear walk down the
+    trie — O(number of moves), independent of ECO database size.
     """
     tokens = _normalize_tokens(moves)
     uci_moves = _to_uci_moves(tuple(tokens) if not isinstance(tokens, tuple) else tokens)
 
     node = _ECO_TRIE
-    last_match = ("", "")
+    last_match = ("", "", "")
 
     for mv in uci_moves:
         if mv not in node:
@@ -113,6 +114,11 @@ def get_opening_from_moves(moves):
             last_match = node["_entry"]
 
     return last_match
+
+
+def get_opening_from_moves(moves):
+    """(eco, name) of the most specific opening reached; see get_opening_details."""
+    return get_opening_details(moves)[:2]
 
 
 def get_opening_name(moves):

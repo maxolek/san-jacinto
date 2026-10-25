@@ -7,7 +7,7 @@ Usage:
 import sqlite3
 import argparse
 
-from .paths import RAW_DB
+from .paths import RAW_DB, connect_raw
 from .db import get_db, register_engine
 from .ingest import log_games_directory, ingest_log_dir
 
@@ -39,7 +39,7 @@ def main():
     # Resolve DB path
     raw_path = str(RAW_DB)
 
-    cnxn = sqlite3.connect(raw_path)
+    cnxn = connect_raw(raw_path)
 
     if args.register_engine:
         engine_data = {

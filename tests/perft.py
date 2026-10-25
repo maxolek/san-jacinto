@@ -121,18 +121,11 @@ def main(args=None):
     # -----------------------------
     # DB setup
     # -----------------------------
-    system = platform.system()
-    if system == "Windows": cnxn = sqlite3.connect('F:/databases/chess.db')
-    elif system == "Darwin": cnxn = sqlite3.connect(Path.home() / "Documents/databases/chess.db")
+    cnxn = etl.connect_raw()
     cnxn.row_factory = sqlite3.Row
 
-    engine_meta = etl.probe_engine_metadata(args.engine)
-    engine_id = etl.get_engine_id(cnxn, version=engine_meta["version"])
-
-    # auto-register if not found
-    if engine_id is None:
-        print(f"[PERFT] Engine {engine_meta['version']} not registered, registering now...")
-        engine_id = etl.register_engine(cnxn, {"engine_path": args.engine})
+    # the engine's build (binary + net hash), registered if new
+    engine_id = etl.resolve_engine(cnxn, args.engine)
 
     experiment_id = etl.start_experiment(
         cnxn,

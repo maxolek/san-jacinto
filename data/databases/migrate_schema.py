@@ -60,9 +60,60 @@ from pathlib import Path
 from ..etl.columns import MISMATCH, coerce
 from ..etl.paths import RAW_DB, ANALYTICS_DB, RAW_DB_TIMEOUT_S
 
+# ---------------------------------------------------------------------------
+# 1. COLUMN SETS (shared with the CREATE TABLE statements in init_raw_db.py)
+# ---------------------------------------------------------------------------
+# (column name, SQLite type). All of them are nullable.
+
+GAMES_MATCH_COLUMNS = [
+    ("source", "TEXT"),              # 'engine' (engine log) | 'match' (match-runner record, authoritative result)
+    ("run_id", "TEXT"),              # match-runner run directory name, e.g. 20260928_101129_354256
+    ("run_game", "INTEGER"),         # game number within the run (pairs = (1,2), (3,4), ...)
+    ("pair_index", "INTEGER"),       # 1-based opening pair within the run
+    ("env_host", "TEXT"),
+    ("env_cpu_model", "TEXT"),
+    ("env_os", "TEXT"),
+    ("env_cpu", "INTEGER"),          # logical CPU the game ran on
+    ("env_core_type", "TEXT"),       # 'P' | 'E' | '-' (not pinned)
+    ("env_cluster", "INTEGER"),      # L2 cluster id of the core
+    ("env_concurrency", "INTEGER"),  # games running at the same time on the machine
+    ("env_mhz_mean", "REAL"),        # measured clock of that CPU during the game
+    ("env_mhz_min", "REAL"),
+    ("env_mhz_max", "REAL"),
+    ("env_util_mean", "REAL"),       # CPU utilisation of that CPU during the game (%)
+    ("env_power_source", "TEXT"),    # 'ac' | 'battery'
+    ("env_core_mixed", "INTEGER"),   # 1 if an engine was found off its core (excluded from SPRT)
+]
+
+SPRT_PENTANOMIAL_COLUMNS = [
+    ("pairs", "INTEGER"),
+    ("penta_ll", "INTEGER"),
+    ("penta_ld", "INTEGER"),
+    ("penta_dd", "INTEGER"),
+    ("penta_wl", "INTEGER"),
+    ("penta_wd", "INTEGER"),
+    ("penta_ww", "INTEGER"),
+    ("score", "REAL"),
+    ("elo_low", "REAL"),
+    ("elo_high", "REAL"),
+    ("nelo", "REAL"),
+    ("nelo_low", "REAL"),
+    ("nelo_high", "REAL"),
+    ("draw_ratio", "REAL"),
+    ("variance_ratio", "REAL"),
+    ("concurrency", "INTEGER"),
+    ("core_summary", "TEXT"),        # JSON: {"P": {pairs, elo, elo_low, elo_high, pentanomial}, "E": {...}}
+    ("excluded_pairs", "INTEGER"),
+    ("run_id", "TEXT"),
+    ("book_seed", "INTEGER"),
+    ("env_host", "TEXT"),
+    ("env_cpu_model", "TEXT"),
+]
+
+
 
 # ---------------------------------------------------------------------------
-# 1. MIGRATIONS
+# 2. MIGRATIONS
 # ---------------------------------------------------------------------------
 # db:         "raw" or "analytics"
 # table:      table to add `columns` to (None: no fixed columns)
@@ -164,6 +215,20 @@ MIGRATIONS = [
         db="raw",
         table="searches",
         columns=[("completed_depth", "INTEGER", "NULL")],
+    ),
+    Migration(
+        id="2026_09_28_games_match_environment",
+        description="match-runner provenance and the environment each game ran in (host, cpu, core type, clock)",
+        db="raw",
+        table="games",
+        columns=_nullable(GAMES_MATCH_COLUMNS),
+    ),
+    Migration(
+        id="2026_09_28_sprt_pentanomial",
+        description="pentanomial SPRT statistics, per-core-type summary and machine of each SPRT run",
+        db="raw",
+        table="sprt",
+        columns=_nullable(SPRT_PENTANOMIAL_COLUMNS),
     ),
     Migration(
         id="2026_10_15_rename_nmp_fail",
@@ -361,7 +426,7 @@ MIGRATIONS = [
 
 
 # ---------------------------------------------------------------------------
-# 2. ENGINE ADAPTERS
+# 3. ENGINE ADAPTERS
 # ---------------------------------------------------------------------------
 
 class Adapter:
@@ -484,7 +549,7 @@ def _open_analytics(path, dry_run):
 
 
 # ---------------------------------------------------------------------------
-# 3. RUNNER
+# 4. RUNNER
 # ---------------------------------------------------------------------------
 
 def _short(statement):

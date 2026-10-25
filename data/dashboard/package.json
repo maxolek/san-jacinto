@@ -13,6 +13,7 @@
     "@duckdb/duckdb-wasm": "^1.29.0",
     "@uwdata/mosaic-core": "^0.13.0",
     "@uwdata/mosaic-inputs": "^0.13.0",
+    "@uwdata/mosaic-plot": "^0.13.0",
     "@uwdata/mosaic-sql": "^0.13.0",
     "@uwdata/vgplot": "^0.13.0"
   },
