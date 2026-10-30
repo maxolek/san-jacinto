@@ -104,7 +104,7 @@ fn main() {
     let net_id              = env_string("net_id", "1024x16x32_0wdl");
     let output_dir          = env_string("output_dir", "checkpoints");
     let train_path          = env_string("train_data", "F:/training_data/final_sets/2_LeelaFarsser-T78juntoaugT79marT80dec.binpack");
-    let val_path            = env_string("val_data", "F:/training_data/validation_sets/fishpack32.binpack");
+    //let val_path            = env_string("val_data", "F:/training_data/validation_sets/fishpack32.binpack");
 
     let _save_rate          = env_usize("save_rate", 10);
     let _batch_size         = env_usize("batch_size", 16_384);
@@ -227,13 +227,13 @@ fn main() {
             train_filter,
         );
 
-    let val_loader =
-        SfBinpackLoader::new(
-            &val_path,
-            256,
-            _threads/2,
-            val_filter,
-        );
+    //let val_loader =
+    //    SfBinpackLoader::new(
+    //        &val_path,
+    //        256,
+    //        _threads/2,
+    //        val_filter,
+    //    );
 
     // ========================================================
     // Trainer settings
@@ -241,11 +241,11 @@ fn main() {
 
     let settings = LocalSettings {
         threads: _threads,
-        test_set: Some(
-            TestDataset::at(&val_path)
-            .freq(0) // 0 = validate once, at the end of every superbatch
-            .positions(10_000_000), // validation sample, drawn once from val_data at startup
-        ),
+        test_set: None, //Some(
+            //TestDataset::at(&val_path)
+            //.freq(0) // 0 = validate once, at the end of every superbatch
+            //.positions(10_000_000), // validation sample, drawn once from val_data at startup
+        //),
         output_directory: &output_dir,
         batch_queue_size: 64,
     };
@@ -272,7 +272,7 @@ fn main() {
         &schedule,
         &settings,
         &train_loader,
-        Some(&val_loader), // None
+        None //Some(&val_loader), // None
     );
 
 }

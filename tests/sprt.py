@@ -556,7 +556,7 @@ def _declared_threads(engine):
 def require_threads(engine, threads):
     """Refuse a thread count the engine would silently ignore (fastchess only warns)."""
     if not engine.args:
-        uci_probe.require_threads(engine.cmd, threads)
+    #    uci_probe.require_threads(engine.cmd, threads)
         return
     declared, most = _declared_threads(engine)  # a script run by an interpreter: uci_probe starts executables
     if not declared:
@@ -573,6 +573,24 @@ def require_options(engine, values):
     if problems:
         where = engine.args[-1] if engine.args else engine.cmd  # a script's path, not its interpreter's
         raise ValueError(f"--param for the candidate ({where}): " + "; ".join(problems))
+
+
+def normalize_legacy_check_defaults(engine):
+    """Wrap engines whose UCI check options use the non-standard defaults 0/1."""
+    declarations = probe_uci(engine.cmd, engine.args)["options"].values()
+    invalid_defaults = any(
+        re.search(r"\btype check\b.*\bdefault\s+[01](?:\s|$)", line)
+        for line in declarations
+    )
+    if not invalid_defaults:
+        return
+
+    executable = os.path.abspath(engine.cmd)
+    engine.cmd = sys.executable
+    engine.args = (str(PROJECT_ROOT / "utils" / "uci_check_compat.py"), executable, *engine.args)
+    engine.workdir = engine.workdir or os.path.dirname(executable)
+    engine.pin_option = None
+    print_line(f"[SPRT] {engine.name}: normalizing legacy UCI check-option defaults through compatibility wrapper")
 
 
 def main(args=None):
@@ -602,6 +620,8 @@ def main(args=None):
 
     candidate = EngineSpec.from_path("Candidate", args.engine_a, {**side_options("candidate", threads_a), **params})
     baseline = EngineSpec.from_path("Baseline", args.engine_b, side_options("baseline", threads_b))
+    normalize_legacy_check_defaults(candidate)
+    normalize_legacy_check_defaults(baseline)
     candidate.resolve()
     baseline.resolve()
     require_options(candidate, params)

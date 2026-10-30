@@ -96,7 +96,7 @@ class LivePlotter:
             hi = max(self.elo1, max(s["elo_high"] for s in tail))
             pad = max(5, (hi - lo) * 0.08)
             self.ax_elo.set_ylim(lo - pad, hi + pad)
-        self.ax_elo.legend(loc="upper right", fontsize=8)
+        self.ax_elo.legend(loc="lower left", fontsize=8)
         self.ax_score.axhline(0.5, color=INK, alpha=0.35, linewidth=1)
         self.ax_score.yaxis.set_major_formatter(self.plt.matplotlib.ticker.PercentFormatter(1))
         if self.history:

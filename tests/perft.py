@@ -15,7 +15,7 @@ system = platform.system()
 # paths
 TESTS_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = TESTS_DIR.parent
-if system == "Windows": STOCKFISH = r"C:\Users\maxol\chess\engines\stockfish\stockfish-windows-x86-64-avx2.exe"
+if system == "Windows": STOCKFISH = r"..\tomahawk\engines\stockfish\stockfish-windows-x86-64-avx2.exe"
 elif system == "Darwin": STOCKFISH = "engines/stockfish/stockfish-macos-m1-apple-silicon"
 
 # -----------------------------

@@ -301,7 +301,7 @@ def run_search(args, study, space, evaluator):
         _brackets(args, study, proposer, evaluator, budgets)
     finally:
         importances = proposer.importances() if hasattr(proposer, "importances") else None
-        return report(args, study, budgets, importances)
+    return report(args, study, budgets, importances)
 
 
 def _brackets(args, study, proposer, evaluator, budgets):
