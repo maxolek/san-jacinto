@@ -21,7 +21,7 @@ The build reports "id version bench-<Name>" over UCI.
 .EXAMPLE
 .\build_ref.ps1 -Name current
 .\build_ref.ps1 -Name baseline -Ref dd04600
-.\build_ref.ps1 -Name verify -CMakeArgs '-DCMAKE_CXX_FLAGS=-DTOMAHAWK_VERIFY_NNUE'
+.\build_ref.ps1 -Name verify -CMakeArgs '-DCMAKE_CXX_FLAGS=-DVERIFY_NNUE'
 .\build_ref.ps1 -Name current-g -CMakeArgs '-DCMAKE_CXX_FLAGS=-g'   # symbols for sample_profile.py
 .\build_ref.ps1 -Name current -Repo D:\src\tomahawk
 #>

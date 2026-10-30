@@ -62,7 +62,7 @@ Practical tips: plug in the laptop, use the high-performance power plan, and clo
 | [smp.py](smp.py) | Lazy SMP: stability of multi-threaded searches, then NPS and time-to-depth scaling |
 | [affinity_check.py](affinity_check.py) | Where the search threads really run: the engine's announced placement vs. each thread's OS affinity mask |
 | [perft.py](perft.py) | Perft suite on 6 positions with known counts (move generation, make/unmake) |
-| [verify.py](verify.py) | Runs a `TOMAHAWK_VERIFY_NNUE` build: every accumulator update and evaluation is checked |
+| [verify.py](verify.py) | Runs a `VERIFY_NNUE` build: every accumulator update and evaluation is checked |
 | [sample_profile.py](sample_profile.py) | Sampling profiler without admin rights: hot functions, including inlined callees |
 | [disasm.py](disasm.py) | Annotated disassembly of one function (PDB builds) |
 | [kernelbench.cpp](kernelbench.cpp) | NNUE inference microbenchmark (`eval_simd`, L1, L2 kernels) plus a core-clock estimate |
@@ -78,7 +78,7 @@ Every Python tool has `--help`. Most accept `--only name1,name2` (position names
 .\build_ref.ps1 -Name new                                   # working tree, CMake Release
 .\build_ref.ps1 -Name base -Ref dd04600                     # any commit, branch or tag
 .\build_ref.ps1 -Name new-clang -CMakeArgs '-DCMAKE_CXX_COMPILER=clang++'
-.\build_ref.ps1 -Name verify -CMakeArgs '-DCMAKE_CXX_FLAGS=-DTOMAHAWK_VERIFY_NNUE'
+.\build_ref.ps1 -Name verify -CMakeArgs '-DCMAKE_CXX_FLAGS=-DVERIFY_NNUE'
 ```
 
 - The engine loads its NNUE weights from the source tree it was built from (`PROJECT_ROOT`). Keep `out\src-<Name>` while you use a `-Ref` build, and remove it later with `git -C <tomahawk> worktree remove <san-jacinto>\benchmarks\out\src-<Name>` (it is a worktree of the Tomahawk repository).
@@ -90,7 +90,7 @@ Every Python tool has `--help`. Most accept `--only name1,name2` (position names
 .\build_unity.ps1 -Out out\new.exe                          # g++ -O3 -ffast-math -march=native
 .\build_unity.ps1 -Out out\prof.exe -Symbols                # + -g (DWARF with GCC, PDB with zig)
 .\build_unity.ps1 -Out out\prof.exe -Compiler zig -Symbols  # zig must be on PATH or give its full path
-.\build_unity.ps1 -Out out\verify.exe -Extra '-DTOMAHAWK_VERIFY_NNUE'
+.\build_unity.ps1 -Out out\verify.exe -Extra '-DVERIFY_NNUE'
 .\build_unity.ps1 -Out out\kernelbench.exe -Kernelbench
 ```
 
@@ -106,7 +106,7 @@ python verify.py out\verify.exe        # after NNUE / accumulator changes (slow;
 python verify.py out\verify.exe --threads 4 --only sf_mid5
 ```
 
-`TOMAHAWK_VERIFY_NNUE` compiles checks into the search. After every move, the incrementally updated accumulators are compared with a full rebuild. Every evaluation is compared with the scalar reference `NNUE::evaluate()`. The first mismatch prints `info string NNUE VERIFY FAILED ...` and exits with code 3. Never benchmark this build.
+`VERIFY_NNUE` compiles checks into the search. After every move, the incrementally updated accumulators are compared with a full rebuild. Every evaluation is compared with the scalar reference `NNUE::evaluate()`. The first mismatch prints `info string NNUE VERIFY FAILED ...` and exits with code 3. Never benchmark this build.
 
 ### Speed
 
@@ -195,4 +195,4 @@ The clang rows come from `progress.py` over 20 positions with 2 repetitions. Aga
 
 - Linux support is untested.
 - `build_ref.ps1` was tested only with CMake's Debug configuration, with zig and with GCC 16.2. Neither toolchain available here can link the Release configuration's LTO: zig's LTO misses MinGW symbols, and the w64devkit GCC was built without LTO. The Release path runs the same `cmake` commands as the build in Tomahawk's README, which your normal GCC handles. The GCC measurements above use `build_unity.ps1` instead.
-- `kernelbench.cpp` and the `TOMAHAWK_VERIFY_NNUE` checks depend on engine internals, so update them with the NNUE code.
+- `kernelbench.cpp` and the `VERIFY_NNUE` checks depend on engine internals, so update them with the NNUE code.

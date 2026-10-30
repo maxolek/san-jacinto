@@ -17,7 +17,7 @@ disasm.py can read. The executable loads its NNUE weights from -Root.
 .EXAMPLE
 .\build_unity.ps1 -Out out\current.exe
 .\build_unity.ps1 -Out out\current-prof.exe -Compiler zig -Symbols
-.\build_unity.ps1 -Out out\verify.exe -Extra '-DTOMAHAWK_VERIFY_NNUE'
+.\build_unity.ps1 -Out out\verify.exe -Extra '-DVERIFY_NNUE'
 .\build_unity.ps1 -Out out\kernelbench.exe -Kernelbench
 .\build_unity.ps1 -Out out\other.exe -Src D:\src\tomahawk-experiment
 #>

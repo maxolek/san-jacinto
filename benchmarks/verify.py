@@ -1,6 +1,6 @@
 """Run a verification build over the benchmark positions.
 
-Build the engine with -DTOMAHAWK_VERIFY_NNUE (see README). That build checks, at
+Build the engine with -DVERIFY_NNUE (see README). That build checks, at
 every move made in search, the incrementally updated accumulators against a full
 rebuild, and every evaluation against the scalar reference NNUE::evaluate(); the
 first mismatch prints "NNUE VERIFY FAILED ..." and exits. It is slow, so the

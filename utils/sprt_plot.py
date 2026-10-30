@@ -72,7 +72,8 @@ class LivePlotter:
             (self.ax_elo, "elo_diff", "Estimated strength", "Logistic Elo", BLUE),
             (self.ax_score, "score", "Candidate score", "Score per game", TEAL),
         ):
-            line, = ax.plot(xs, [s[key] for s in self.history], color=color,
+            values = [s[key] for s in self.history]
+            line, = ax.plot(xs, values, color=color,
                             linewidth=2, label="Completed opening pairs")
             formatters[line] = tooltip
             ax.set(title=title, ylabel=ylabel, xlabel="Tested games")
@@ -106,6 +107,31 @@ class LivePlotter:
             self.ax_score.set_ylim(max(0, lo - pad), min(1, hi + pad))
         else:
             self.ax_score.set_ylim(.4, .6)
+
+        if self.history:
+            current = self.history[-1]
+            for ax, key, color, formatter in (
+                (self.ax_llr, "llr", TEAL, lambda value: f"{value:+.2f}"),
+                (self.ax_elo, "elo_diff", BLUE, lambda value: f"{value:+.1f} Elo"),
+                (self.ax_score, "score", TEAL, lambda value: f"{value:.1%}"),
+            ):
+                value = current[key]
+                ax.scatter([xs[-1]], [value], color=color, s=22, zorder=5)
+                low, high = ax.get_ylim()
+                near_top = value > low + (high - low) * 0.82
+                ax.annotate(
+                    formatter(value),
+                    xy=(xs[-1], value),
+                    xytext=(-7, -8 if near_top else 8),
+                    textcoords="offset points",
+                    ha="right",
+                    va="top" if near_top else "bottom",
+                    color=color,
+                    fontsize=9,
+                    fontweight="bold",
+                    bbox={"facecolor": "white", "edgecolor": "none", "alpha": 0.8, "pad": 1.5},
+                    zorder=6,
+                )
 
         counts = latest["pentanomial"] if latest else [0] * 5
         bars = self.ax_pairs.bar(range(5), counts, color=[RED, "#d9a39a", "#9caeb7", "#79b7b1", TEAL], width=0.62)
